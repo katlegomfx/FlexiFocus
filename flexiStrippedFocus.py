@@ -15,6 +15,7 @@ import uuid
 import queue
 from enum import Enum, IntEnum
 import shutil
+import gzip
 import pickle
 import threading
 import functools
@@ -24,6 +25,7 @@ import base64
 import hashlib
 import builtins
 import sqlite3
+import importlib
 from dataclasses import dataclass
 try:
     import readline
@@ -36,7 +38,7 @@ except ImportError:
         HISTORY_SUPPORT = False
 
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import List, Dict, Any, Optional
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -62,9 +64,17 @@ STATE_FILE = STATE_DIR / "state.json"
 GLOBALS_FILE = STATE_DIR / "globals.pkl"
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
 ARCHIVE_FILE = STATE_DIR / "full_archive.jsonl"
+# maximum size (bytes) before rotating/compressing the legacy JSONL archive
+ARCHIVE_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB by default
+
 EVOLUTION_LOG = STATE_DIR / "evolution_log.md"
 MAX_SNAPSHOTS = 5
 TOKEN_THRESHOLD = 92000 # Your specific requirement for summary trigger
+
+# automatic history summarisation parameters
+AUTO_SUMMARY_THRESHOLD = 2000  # if history entries exceed this
+AUTO_SUMMARY_KEEP = 500        # keep this many recent entries intact
+
 # Place config next to the logical agent root for discoverability
 CONFIG_FILE = (STATE_DIR.parent / "config.json") if STATE_DIR.name == "rlm_state" else (STATE_DIR / "config.json")
 
@@ -79,6 +89,45 @@ COMMON_HEADERS = {
     "Accept": "application/json",
 }
 
+# --- SKILL PLUGIN FRAMEWORK ---
+
+# global registry of skill classes, keyed by name
+skill_registry: dict[str, type] = {}
+
+def register_skill(name: str):
+    """Decorator for registering a `BaseSkill` subclass under a given name."""
+    def deco(cls):
+        skill_registry[name] = cls
+        return cls
+    return deco
+
+class BaseSkill:
+    """Base class for user-defined skills.
+
+    Skills may declare dependencies via the `dependencies()` classmethod, and
+    may provide configuration or prompt templates by overriding methods.
+    The agent will instantiate each skill once at startup and may call
+    `pre_tool`/`post_tool` hooks during execution.
+    """
+    def __init__(self, bot: 'FlexiBot'):
+        self.bot = bot
+
+    @classmethod
+    def dependencies(cls) -> list[str]:
+        return []
+
+    @classmethod
+    def config(cls) -> dict:
+        return {}
+
+    def prompt_templates(self) -> dict:
+        return {}
+
+    def pre_tool(self, tool_name: str, payload: str):
+        """Called before a tool executes.  Can modify payload or veto."""
+    def post_tool(self, tool_name: str, result: str):
+        """Called after a tool executes."""
+
 # --- WINDOWS AUTOMATION HELPERS ---
 class SystemAutomation:
     """Encapsulates cross-platform automation logic (Window listing, Capturing)."""
@@ -86,18 +135,47 @@ class SystemAutomation:
     @staticmethod
     def check_dependencies():
         missing = []
+        def _log(msg):
+            try:
+                with open("startup.log", "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now().isoformat()} DEPCHK: {msg}\n")
+            except Exception:
+                pass
         if os.name == 'nt':
-            try: import win32gui; import win32con; import win32process
-            except ImportError: missing.append("pywin32 (pip install pywin32)")
-            try: import psutil
-            except ImportError: missing.append("psutil (pip install psutil)")
+            # use find_spec to avoid executing module code that might crash
+            _log("checking win32gui spec")
+            if importlib.util.find_spec('win32gui') is None:
+                missing.append("pywin32 (pip install pywin32)")
+                _log("win32gui spec missing")
+            else:
+                _log("win32gui spec found")
+            _log("checking psutil spec")
+            if importlib.util.find_spec('psutil') is None:
+                missing.append("psutil (pip install psutil)")
+                _log("psutil spec missing")
+            else:
+                _log("psutil spec found")
         elif sys.platform == 'darwin':
-            try: from Quartz import CGWindowListCopyWindowInfo
-            except ImportError: missing.append("pyobjc-framework-Quartz (pip install pyobjc-framework-Quartz)")
+            _log("checking Quartz spec")
+            if importlib.util.find_spec('Quartz') is None:
+                missing.append("pyobjc-framework-Quartz (pip install pyobjc-framework-Quartz)")
+                _log("Quartz spec missing")
+            else:
+                _log("Quartz spec found")
         
-        try: from PIL import ImageGrab
-        except ImportError: missing.append("Pillow (pip install Pillow)")
+        _log("checking Pillow ImageGrab spec")
+        if importlib.util.find_spec('PIL') is None:
+            missing.append("Pillow (pip install Pillow)")
+            _log("Pillow spec missing")
+        else:
+            _log("Pillow spec found")
         return missing
+
+    @staticmethod
+    def warn_if_missing():
+        missing = SystemAutomation.check_dependencies()
+        if missing:
+            print(f"[System Warning]: Missing dependencies: {', '.join(missing)}")
 
     @staticmethod
     def get_open_windows(filter_text: str = None) -> List[Dict[str, Any]]:
@@ -341,24 +419,37 @@ class Colors:
             except Exception:
                 pass
 
+
     @staticmethod
     def print_logo():
-        print(f"""{Colors.CYAN}{Colors.BOLD}
+        # Attempt to render a fancy Unicode logo.  Some consoles (and
+        # redirected output) use encodings that can't handle the block
+        # characters; print() will raise UnicodeEncodeError in that case.
+        logo = f"""[96m[1m
     ███████╗██╗     ███████╗██╗  ██╗██╗
     ██╔════╝██║     ██╔════╝╚██╗██╔╝██║
     █████╗  ██║     █████╗   ╚███╔╝ ██║
-    ██╔══╝  ██║     ██╔══╝   ██╔██╗ ██║
+    ██╔══╝  ██║     █████╗   ╚███╔╝ ██║
+    ██╔══╝  ██║     █████╗   ╚███╔╝ ██║
     ██║     ███████╗███████╗██╔╝ ██╗██║
     ╚═╝     ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝
-        {Colors.DIM}Flexible Copilot Agent v4.2{Colors.ENDC}
-        """)
+        [90mFlexible Copilot Agent v4.2[0m
+        """
+        try:
+            print(logo)
+        except UnicodeEncodeError:
+            # fallback to simple text without blocks or colors
+            try:
+                print("Flexible Copilot Agent v4.2")
+            except Exception:
+                pass
+    # --- TOKEN TRACKING HELPER ---
+    # --- TOKEN TRACKING HELPER ---
+    def estimate_tokens(text: str) -> int:
+        """Heuristic for token estimation (roughly 4 chars per token)."""
+        return len(text) // 4
 
-# --- TOKEN TRACKING HELPER ---
-def estimate_tokens(text: str) -> int:
-    """Heuristic for token estimation (roughly 4 chars per token)."""
-    return len(text) // 4
-
-# --- ERROR HANDLING FRAMEWORK ---
+    # --- ERROR HANDLING FRAMEWORK ---
 class ErrorSeverity(Enum):
     RECOVERABLE = "RECOVERABLE"
     CRITICAL = "CRITICAL"
@@ -373,6 +464,8 @@ class ErrorCode(Enum):
 
 class ErrorHandler:
     ERROR_LOG = STATE_DIR / "error_log.jsonl"
+    ERROR_LOG_MAX_BYTES = 2 * 1024 * 1024  # rotate at 2MiB by default
+    _error_counts: dict = {}
     
     @staticmethod
     def register_global_handler():
@@ -413,6 +506,33 @@ class ErrorHandler:
             with open(ErrorHandler.ERROR_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception: pass
+        
+        # rotate error log if needed
+        try:
+            if ErrorHandler.ERROR_LOG.exists() and ErrorHandler.ERROR_LOG.stat().st_size > ErrorHandler.ERROR_LOG_MAX_BYTES:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                dest = ErrorHandler.ERROR_LOG.with_name(f"{ErrorHandler.ERROR_LOG.name}.{ts}.gz")
+                with open(ErrorHandler.ERROR_LOG, "rb") as fin, gzip.open(dest, "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+                ErrorHandler.ERROR_LOG.unlink()
+                print(f"[System]: Error log rotated to {dest.name}")
+        except Exception:
+            pass
+        
+        # also append a brief alert to the evolution log for visibility
+        try:
+            alert = f"\n**Error Alert:** [{severity.value} {code.value}] {context}: {str(error)}\n"
+            with open(EVOLUTION_LOG, "a", encoding="utf-8") as lf:
+                lf.write(alert)
+        except Exception:
+            pass
+        
+        # track repeated errors
+        key = (code.value, type(error).__name__)
+        cnt = ErrorHandler._error_counts.get(key, 0) + 1
+        ErrorHandler._error_counts[key] = cnt
+        if cnt > 5:
+            print(f"[System]: Warning - {cnt} occurrences of {key} have been logged.")
 
     @staticmethod
     def handle(func=None, *, severity=ErrorSeverity.RECOVERABLE, code=ErrorCode.SYS_GENERIC):
@@ -762,11 +882,54 @@ class DiffLogger:
         header = "# FlexiBot Evolution Log\n\nTrack the logical state changes and recursive turns.\n\n---\n"
         self.log_path.write_text(header, encoding="utf-8")
 
-    def log_turn(self, turn_num: int, thought: str, diff_summary: str, tools: List[str]):
+    def _summarize_thought(self, thought: str) -> str:
+        # If the thought is extremely long or contains large code/tool sections,
+        # collapse them so the log stays readable. We remove the body of <bash>
+        # and <python> tags, leaving only a placeholder, and truncate overall
+        # length if necessary.
+        # collapse code blocks first
+        def collapse_tag(tag: str, text: str) -> str:
+            pattern = re.compile(rf"<{tag}>(.*?)</{tag}>", re.S)
+            def repl(m):
+                content = m.group(1)
+                if len(content) > 100:
+                    return f"<{tag}>…[{len(content)} chars]…</{tag}>"
+                return m.group(0)
+            return pattern.sub(repl, text)
+
+        short = collapse_tag('bash', thought)
+        short = collapse_tag('python', short)
+        # truncate overall if still huge
+        MAX = 1000
+        if len(short) > MAX:
+            return short[:400] + "\n... [TRUNCATED] ...\n" + short[-400:]
+        return short
+
+    def log_user(self, user_text: str):
+        """Record a user input event in the evolution log with metadata."""
+        try:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            entry = f"\n## User Input - {timestamp}\n**Meta:** user_prompt:true\n> {user_text}\n---\n"
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception:
+            pass
+
+    def log_turn(self, turn_num: int, thought: str, diff_summary: str, tools: List[str], duration: float | None = None, meta: List[str] | None = None):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         tool_list = ", ".join(tools) if tools else "None"
         try:
-            entry = f"\n## Turn {turn_num} - {timestamp}\n**Tools:** `{tool_list}`\n### Thought\n> {thought}\n### State\n```yaml\n{diff_summary}\n```\n---\n"
+            safe_thought = self._summarize_thought(thought)
+            dur_line = f"- **Duration:** {duration:.2f}s\n" if duration is not None else ""
+            meta_line = f"**Meta:** {', '.join(meta)}\n" if meta else ""
+            entry = (
+                f"\n## Turn {turn_num} - {timestamp}\n"
+                f"{meta_line}"
+                f"**Tools:** `{tool_list}`\n"
+                f"{dur_line}"
+                f"### Thought\n> {safe_thought}\n"
+                f"### State\n```yaml\n{diff_summary}\n```\n---\n"
+            )
             with self.log_path.open("a", encoding="utf-8") as f: f.write(entry)
         except Exception as e:
             print(f"Warning: Logging failed: {e}")
@@ -787,6 +950,9 @@ class AgentState:
     """
     Async AgentState using SQLite backend with legacy API compatibility.
     Replaces the old JSON-monolith state system.
+
+    The state object now exposes a lightweight history API with tags so callers
+    can query for specific events (plans, tool outputs, user prompts, etc.).
     """
     def __init__(self, state_file: Path, globals_file: Path, snapshot_dir: Path, max_snapshots: int = 5):
         self.state_file = state_file # Kept for path ref, but we use brain.db
@@ -859,7 +1025,7 @@ class AgentState:
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute('''CREATE TABLE IF NOT EXISTS history 
-                         (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, timestamp REAL)''')
+                         (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, tags TEXT DEFAULT '', timestamp REAL)''')
             c.execute('''CREATE TABLE IF NOT EXISTS knowledge 
                          (key TEXT PRIMARY KEY, value TEXT, tags TEXT, updated_at REAL)''')
             c.execute('''CREATE TABLE IF NOT EXISTS evolution 
@@ -879,7 +1045,7 @@ class AgentState:
                 c = conn.cursor()
                 
                 # History (Limit 500 for context window)
-                c.execute("SELECT role, content, timestamp FROM history ORDER BY id ASC")
+                c.execute("SELECT role, content, tags, timestamp FROM history ORDER BY id ASC")
                 self._history_cache = [dict(row) for row in c.fetchall()]
                 
                 # Knowledge / Processes
@@ -901,8 +1067,10 @@ class AgentState:
                 op, d = task
                 try:
                     if op == "history":
-                        conn.execute("INSERT INTO history (role, content, timestamp) VALUES (?, ?, ?)", 
-                                   (d['role'], d['content'], d['timestamp']))
+                        # include tags JSON string if present
+                        tags_str = json.dumps(d.get('tags', [])) if 'tags' in d else ''
+                        conn.execute("INSERT INTO history (role, content, tags, timestamp) VALUES (?, ?, ?, ?)", 
+                                   (d['role'], d['content'], tags_str, d['timestamp']))
                     elif op == "kv":
                         conn.execute("INSERT OR REPLACE INTO knowledge (key, value, tags, updated_at) VALUES (?, ?, ?, ?)",
                                    (d['key'], json.dumps(d['value']), '[]', time.time()))
@@ -931,17 +1099,134 @@ class AgentState:
             proc_copy = self._active_processes.copy()
         self._write_queue.put(("kv", {"key": "active_processes", "value": proc_copy}))
 
-    def log_event(self, role: str, content: str):
+    # --- structured history API ------------------------------------------------
+    def _sanitize_content(self, text: str) -> str:
+        # strip control characters and limit length
+        if not isinstance(text, str):
+            return str(text)
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", "", text)
+        if len(cleaned) > 2000:
+            return cleaned[:2000] + "..."
+        return cleaned
+
+    def append_history(self, role: str, content: str, tags: list[str] | None = None):
+        """Add an entry to the history cache and legacy archive.
+
+        Tags are arbitrary strings that can later be used to query the history
+        (e.g. "plan", "tool:bash", "user_prompt" etc.).
+        """
+        tags = tags or []
+        clean_content = self._sanitize_content(content)
+        entry = {
+            "id": str(uuid.uuid4()),
+            "role": role,
+            "content": clean_content,
+            "tags": tags,
+            "timestamp": time.time()
+        }
         with self._cache_lock:
-            entry = {"role": role, "content": content, "timestamp": time.time()}
             self._history_cache.append(entry)
         self._write_queue.put(("history", entry))
-        
-        # Legacy JSONL Archive
+        # legacy archive for backwards compatibility
         try:
-             with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+            with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except: pass
+        self._rotate_archive_if_needed()
+
+    def query_history(self, *, role: str = None, tag: str = None,
+                      regex: str = None, exclude_tags: list[str] | None = None,
+                      since: float = None, until: float = None, limit: int = 20) -> list[dict]:
+        """Return history entries matching filters; queries DB if dataset is large.
+
+        Supported filters:
+        - role: exact match
+        - tag: entry.tags contains this tag
+        - regex: regex applied to content
+        - exclude_tags: list of tags that must NOT appear
+        - since/until: timestamp window
+        - limit: return at most this many (from newest)
+        """
+        # if history size is small, filter in-memory for speed
+        if len(self._history_cache) < 1000:
+            results = list(self._history_cache)
+            if role:
+                results = [e for e in results if e.get("role") == role]
+            if tag:
+                results = [e for e in results if tag in e.get("tags", [])]
+            if exclude_tags:
+                for t in exclude_tags:
+                    results = [e for e in results if t not in e.get("tags", [])]
+            if since is not None:
+                results = [e for e in results if e.get("timestamp", 0) >= since]
+            if until is not None:
+                results = [e for e in results if e.get("timestamp", 0) <= until]
+            if regex:
+                pat = re.compile(regex)
+                results = [e for e in results if pat.search(e.get("content", ""))]
+            return results[-limit:]
+
+        # otherwise run a SQL query for scalability
+        query = "SELECT role, content, tags, timestamp FROM history"
+        conds = []
+        params = []
+        if role:
+            conds.append("role=?")
+            params.append(role)
+        if since is not None:
+            conds.append("timestamp>=?")
+            params.append(since)
+        if until is not None:
+            conds.append("timestamp<=?")
+            params.append(until)
+        if tag:
+            conds.append("tags LIKE ?")
+            params.append(f"%{tag}%")
+        if exclude_tags:
+            for t in exclude_tags:
+                conds.append("tags NOT LIKE ?")
+                params.append(f"%{t}%")
+        if regex:
+            conds.append("content REGEXP ?")
+            params.append(regex)
+        if conds:
+            query += " WHERE " + " AND ".join(conds)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        results = []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # register regexp function
+                conn.create_function("REGEXP", 2, lambda pat, val: 1 if re.search(pat, val or "") else 0)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                for row in c.execute(query, params):
+                    results.append(dict(row))
+        except Exception:
+            pass
+        return results
+
+    # keep legacy log_event for compatibility
+    def log_event(self, role: str, content: str):
+        # simply append without tags
+        self.append_history(role, content)
+
+    def _rotate_archive_if_needed(self):
+        """If the archive exceeds the maximum bytes, compress and rotate it.
+        The old file is gzipped with a timestamp suffix and a new empty archive is created.
+        """
+        try:
+            if ARCHIVE_FILE.exists() and ARCHIVE_FILE.stat().st_size > ARCHIVE_MAX_BYTES:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                dest = ARCHIVE_FILE.with_name(f"{ARCHIVE_FILE.name}.{timestamp}.gz")
+                # compress
+                with open(ARCHIVE_FILE, "rb") as fin, gzip.open(dest, "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+                ARCHIVE_FILE.unlink()
+                print(f"[System]: Archive rotated to {dest.name}")
+        except Exception as e:
+            print(f"[System]: Archive rotation failed: {e}")
+
 
     def remember(self, key: str, value: Any):
         with self._cache_lock:
@@ -953,8 +1238,22 @@ class AgentState:
             return self._kv_cache.get(key)
             
     def take_snapshot(self, label: str = "auto"):
-        # Snapshots now just verify DB integrity or backup the DB file
-        pass # Database is persistent. Maybe implement DB file copy later.
+        # Create a copy of the SQLite database as a snapshot and rotate old ones.
+        try:
+            if self.db_path.exists():
+                timestamp = int(time.time())
+                dest = self.snapshot_dir / f"snapshot_{label}_{timestamp}.db"
+                shutil.copy(self.db_path, dest)
+                # maintain only MAX_SNAPSHOTS files
+                snaps = sorted(self.snapshot_dir.glob("snapshot_*.db"), key=lambda p: p.stat().st_mtime)
+                while len(snaps) > self.max_snapshots:
+                    try:
+                        snaps[0].unlink()
+                    except Exception:
+                        pass
+                    snaps.pop(0)
+        except Exception:
+            pass
 
     def calculate_diff(self, old_data, new_data):
         return "Async State - Diffing disabled"
@@ -1391,22 +1690,153 @@ class SubagentManager:
             self.agents[agent_id].terminate()
 
 # --- THE FlexiBot CORE ---
+class Brain:
+    """Simple façade over AgentState for external use.
+
+    Skills and subagents can import and use this to read/write memory without
+    touching the internal state implementation.
+    """
+    def __init__(self, state: AgentState):
+        self._s = state
+
+    def remember(self, key: str, value: Any):
+        self._s.remember(key, value)
+
+    def recall(self, key: str):
+        return self._s.recall(key)
+
+    def add(self, role: str, content: str, tags: list[str] | None = None):
+        self._s.append_history(role, content, tags)
+
+    def query(self, **kwargs):
+        return self._s.query_history(**kwargs)
+
+
+class BotContext:
+    """Helper for constructing prompt messages from a FlexiBot instance.
+
+    This class encapsulates the common patterns used when assembling the
+    message list to send to the LLM, e.g. including the system prompt, the
+    most recent user messages, previous plans, facts, tool outputs, etc.
+    """
+    def __init__(self, bot: 'FlexiBot'):
+        self.bot = bot
+
+    def build_prompt(self,
+                     max_user: int = 3,
+                     max_assistant: int = 3,
+                     include_tags: list[str] | None = None,
+                     since: float | None = None) -> list[dict]:
+        """Return a list of messages suitable for passing to `client.chat()`.
+
+        - `max_user`, `max_assistant` limit the number of user/assistant turns.
+        - `include_tags` if provided limits entries to those containing any of
+          the specified tags.
+        - `since` restricts to history entries after the given timestamp.
+        """
+        prompt = []
+        prompt.append({"role": "system", "content": self.bot.get_system_prompt()})
+
+        # get filtered history from state
+        hist = self.bot.state.query_history(since=since, limit=1000)
+        if include_tags:
+            hist = [e for e in hist if any(t in e.get("tags", []) for t in include_tags)]
+
+        # split into recent user/assistant sequences
+        user_msgs = [e for e in hist if e.get("role") == "user"]
+        asst_msgs = [e for e in hist if e.get("role") == "assistant"]
+
+        for msg in user_msgs[-max_user:]:
+            prompt.append({"role": "user", "content": msg.get("content", "")})
+        for msg in asst_msgs[-max_assistant:]:
+            prompt.append({"role": "assistant", "content": msg.get("content", "")})
+        return prompt
+
+    def recent_by_tag(self, tag: str, limit: int = 10) -> list[dict]:
+        """Shortcut for getting history entries with a particular tag."""
+        return self.bot.state.query_history(tag=tag, limit=limit)
+
+    def all_facts(self) -> list[dict]:
+        return self.recent_by_tag("fact", limit=100)
+
+
 class FlexiBot:
     def __init__(self):
+        # simple startup logger to help diagnose crashes inside constructor
+        def _log(msg):
+            try:
+                with open("startup.log", "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now().isoformat()} BOT_INIT: {msg}\n")
+            except Exception:
+                pass
+
+        _log("init start")
+        # check platform dependencies and warn
+        SystemAutomation.warn_if_missing()
+        print("[DEBUG] returned from warn_if_missing")
+        _log("returned from warn_if_missing")
+        _log("warned dependencies")
+        
         self.state = AgentState(STATE_FILE, GLOBALS_FILE, SNAPSHOT_DIR, MAX_SNAPSHOTS)
+        _log("state created")
+        self.brain = Brain(self.state)
+        _log("brain created")
         self.logger = DiffLogger(EVOLUTION_LOG)
+        _log("logger created")
+        # context helper exposes convenient prompt-building utilities
+        self.context = BotContext(self)
+        _log("context helper created")
+        # per-instance summarisation settings (can be overridden)
+        self.auto_summary_threshold = AUTO_SUMMARY_THRESHOLD
+        self.auto_summary_keep = AUTO_SUMMARY_KEEP
+        # skill instances loaded at startup
+        self.skills: dict[str, BaseSkill] = {}
+        _log("loading skills")
+        self._load_skills()
+        _log("skills loaded")
+        _log("setting up client")
         self._setup_client()
+        _log("client setup complete")
         self.subagent_manager = SubagentManager(self)
+        _log("subagent manager created")
         self._state_lock = threading.Lock()
+        _log("state lock created")
         
         # Runtime temp state
         self.last_turn_resp = None
         self.repetition_count = 0
         self.last_tools = {} # Track tool usage for loop detection
+        # persistent turn counter used for logging; increments across handle_turn calls
+        self.turn_counter = 0
+
+        _log("initialized runtime temp state")
 
         # Control flag: If True, the agent must explicitly acknowledge the last observation
         # using the token <ack_observation> before a <consensus> will be accepted.
         self.must_wait_for_observation = False
+        _log("constructor complete")
+
+    # --- event hooks --------------------------------------------------------
+    def on_user_input(self, text: str):
+        # example: simple fact extraction from user statements
+        for m in re.findall(r"I (?:am|have) ([\w ]+)", text, re.I):
+            self.brain.remember(m.strip(), True)
+        # tag a general fact for later querying
+        self.state.append_history("system", f"fact:{text}", tags=["fact"])
+
+    def on_tool_output(self, tool_name: str, output: str):
+        # store raw tool output with a tool-specific tag for retrieval
+        self.state.append_history("system", output, tags=[f"tool:{tool_name}"])
+
+    # --- convenient getters for prompt assembly ----------------------------
+    def recent_user_messages(self, n: int = 3):
+        return [e["content"] for e in self.state.query_history(role="user", limit=n)]
+
+    def recent_plans(self, n: int = 5):
+        return [e["content"] for e in self.state.query_history(tag="plan", limit=n)]
+
+    def facts_matching(self, pattern: str):
+        return [e for e in self.state.query_history(tag="fact") if pattern in e["content"]]
 
     def _setup_client(self):
         config = {}
@@ -1427,6 +1857,44 @@ class FlexiBot:
         else:
             print("[System]: Using GitHub Copilot Provider")
             self.client = CopilotClient()
+
+    def _load_skills(self):
+        """Import all Python files in SKILLS_DIR and instantiate registered skills."""
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        # load any modules placed in the skills directory
+        for path in SKILLS_DIR.glob("*.py"):
+            try:
+                spec = importlib.util.spec_from_file_location(path.stem, path)
+                module = importlib.util.module_from_spec(spec)
+                # make BaseSkill available to skill modules during import
+                module.BaseSkill = BaseSkill
+                spec.loader.exec_module(module)  # type: ignore
+            except Exception as e:
+                print(f"[System]: Failed to import skill {path.name}: {e}")
+        # instantiate registered skill classes
+        for name, cls in skill_registry.items():
+            deps = []
+            try:
+                deps = cls.dependencies()
+            except Exception:
+                pass
+            for dep in deps:
+                try:
+                    __import__(dep)
+                except Exception:
+                    print(f"[System]: Skill '{name}' missing dependency '{dep}'")
+            try:
+                self.skills[name] = cls(self)
+            except Exception as e:
+                print(f"[System]: Error instantiating skill {name}: {e}")
+
+    async def chat_async(self, messages: list[dict]) -> dict:
+        """Asynchronous wrapper around the LLM client.
+        Currently spins the synchronous client in a thread pool.
+        """
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(self.client.chat, messages)
+            return future.result()
 
     def compress_context(self):
         """Performs context summary when token limit is hit."""
@@ -1452,18 +1920,44 @@ class FlexiBot:
             print(f"[System]: ⚠ LLM Summary failed ({e}). Performing hard reset.")
             summary = "Context reset due to overflow. Check archive for details."
 
-        # Commit Reduction
-        self.state.data["compressed_summary"] = summary
-        self.state.data["history"] = [
-            {"role": "system", "content": f"Previous Conversation Summary: {summary}"}
-        ]
-        
-        # Clean state metrics to avoid immediate re-trigger
-        self.state.data['total_tokens'] = 0 
-        self.state.save()
-        
-        self.logger.log_summary_event(old_token_count, self.state.data['total_tokens'])
-        print(f"[System]: Context compressed and reset.")
+    def auto_summarize_history(self):
+        """Automatic summarisation of old conversation turns when history grows.
+
+        Moves everything prior to the last `AUTO_SUMMARY_KEEP` entries into a
+        single summary system message. This keeps the prompt window small while
+        retaining a summarized record of earlier discussion.
+        """
+        with self.state._cache_lock:
+            total = len(self.state._history_cache)
+        if total <= getattr(self, "auto_summary_threshold", AUTO_SUMMARY_THRESHOLD):
+            return
+
+        # pick entries to summarise
+        keep = getattr(self, "auto_summary_keep", AUTO_SUMMARY_KEEP)
+        with self.state._cache_lock:
+            old_entries = self.state._history_cache[: total - keep]
+            remaining = self.state._history_cache[total - keep :]
+
+        if not old_entries:
+            return
+
+        text = "\n".join(f"{e['role']}: {str(e['content'])}" for e in old_entries)
+        prompt = f"Condense the following earlier conversation into a brief summary:\n{text[:2000]}"
+        try:
+            res = self.client.chat([{"role": "user", "content": prompt}])
+            summary = res["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"[System]: auto_summarize_history LLM error: {e}")
+            summary = "[Summary failed - see full archive]"
+
+        # rewrite history cache
+        summary_entry = {"role": "system", "content": f"Earlier summary: {summary}", "tags": ["summary"], "timestamp": time.time()}
+        with self.state._cache_lock:
+            self.state._history_cache = [summary_entry] + remaining
+
+        # also append summary as a formal event so it's persisted
+        self.state.append_history("system", f"Earlier summary: {summary}", tags=["summary"])
+        print(f"[System]: Auto-summarized old history ({total - self.auto_summary_keep} entries collapsed)")
 
     def summarize_observation(self, obs: str, max_len: int = 300) -> str:
         """Produce a short JSON summary for observations to inject into system messages.
@@ -1536,9 +2030,25 @@ class FlexiBot:
             ErrorHandler.log(e, context="verify_and_report")
             return {"success": False, "summary": f"Verification failed: {e}", "errors": [str(e)]}
 
+    def _run_tool_hook(self, stage: str, tool_name: str, payload: str):
+        """Internal helper to call skill hooks before/after tool execution."""
+        for skill in getattr(self, 'skills', {}).values():
+            try:
+                if stage == 'pre':
+                    skill.pre_tool(tool_name, payload)
+                else:
+                    skill.post_tool(tool_name, payload)
+            except Exception:
+                pass
+
     def run_bash(self, cmd: str) -> str:
         """Run a shell command with smart platform translations and flexible executor selection.
         Returns a string containing STDOUT and STDERR."""
+        # pre-tool hook
+        try:
+            self._run_tool_hook('pre', 'bash', cmd)
+        except Exception:
+            pass
         if not cmd or not cmd.strip():
             return "No command provided."
 
@@ -1600,7 +2110,13 @@ class FlexiBot:
                     suggestion = f"Suggestion: use platform-native commands or verify the path. Current executor: {executor}"
                     return translation_note + f"STDOUT: {stdout}\nSTDERR: {stderr}\n{suggestion}"
 
-                return translation_note + f"STDOUT: {stdout}\nSTDERR: {stderr}"
+                result = translation_note + f"STDOUT: {stdout}\nSTDERR: {stderr}"
+                # post-tool hook
+                try:
+                    self._run_tool_hook('post', 'bash', result)
+                except Exception:
+                    pass
+                return result
 
             except subprocess.TimeoutExpired as e:
                 attempt += 1
@@ -1702,14 +2218,6 @@ class FlexiBot:
     def tool_run_verification(self, target_script: str = "flexi_temp.py"):
         """Generates and runs an advanced controller verification suite."""
         script_content = f"""import subprocess
-import sys
-import time
-import json
-import threading
-import queue
-import os
-
-class AgentController:
     def __init__(self, script_path):
         self.script_path = script_path
         self.process = None
@@ -2149,6 +2657,8 @@ if __name__ == "__main__":
 
     def _check_code_safety(self, code: str) -> str:
         """Evaluates code safety using heuristics and LLM audit."""
+        if not isinstance(code, str):
+            code = repr(code)
         # 1. Static Heuristics (Fast path for common automation ops that are risky)
         risky_keywords = ["os.system", "subprocess", "shutil.rmtree", "exec(", "eval("]
         is_risky = any(k in code for k in risky_keywords)
@@ -2187,74 +2697,73 @@ if __name__ == "__main__":
             # If audit fails, default to warning user
             return f"UNSAFE: Safety audit failed ({e})"
 
+    PYTHON_EXEC_TIMEOUT = 60  # seconds default
+
     def run_python(self, code: str) -> str:
-        # --- SAFETY CHECK ---
-        if not self.state.data.get("safety_always_allow", False):
-            safety_res = self._check_code_safety(code)
-            if safety_res.upper() != "SAFE":
-                print(f"\n{Colors.RED}[Safety Check] Warning: Code flagged as potential risk.{Colors.ENDC}")
-                print(f"Reason: {safety_res}")
-                print(f"{Colors.DIM}Code Start:\n{code[:300]}...{Colors.ENDC}")
-                
-                # We need to capture input from the main thread's input queue if possible?
-                # run_python runs in the thread pool if called by `handle_turn`. 
-                # Blocking on `input()` here might work if it's the main process or attached terminal.
-                try:
-                    print(f"{Colors.YELLOW}Allow execution? (y/n/always): {Colors.ENDC}", end="", flush=True)
-                    # Note: built-in input() works if we are in the main console thread or if stdin is shared.
-                    # Since handle_turn runs sequentially in main thread (mostly), this is fine.
-                    choice = input().lower().strip()
-                except EOFError:
-                    return "Execution blocked (No Input)."
-                
-                if choice == RestartPolicy.ALWAYS:
-                    self.state.data["safety_always_allow"] = True
-                    self.state.save()
-                    print(f"{Colors.GREEN}Always-allow enabled for this session.{Colors.ENDC}")
-                elif choice != "y":
-                    return "Execution blocked by user."
-        
-        with self._state_lock:
-            # Refresh globals from state in case another thread updated them
-            current_globals = self.state.globals.copy()
+        # pre-tool hook
+        try:
+            self._run_tool_hook('pre', 'python', code)
+        except Exception:
+            pass
+
+        def _execute():
+            orig_code = code
+            # keep a mutable copy for possible AST transformation
+            exec_code = code
+            # --- SAFETY CHECK ---
+            if not self.state.data.get("safety_always_allow", False):
+                safety_res = self._check_code_safety(orig_code)
+                if safety_res.upper() != "SAFE":
+                    print(f"\n{Colors.RED}[Safety Check] Warning: Code flagged as potential risk.{Colors.ENDC}")
+                    print(f"Reason: {safety_res}")
+                    print(f"{Colors.DIM}Code Start:\n{orig_code[:300]}...{Colors.ENDC}")
+                    
+                    try:
+                        print(f"{Colors.YELLOW}Allow execution? (y/n/always): {Colors.ENDC}", end="", flush=True)
+                        choice = input().lower().strip()
+                    except EOFError:
+                        return "Execution blocked (No Input)."
+                    
+                    if choice == RestartPolicy.ALWAYS:
+                        self.state.data["safety_always_allow"] = True
+                        self.state.save()
+                        print(f"{Colors.GREEN}Always-allow enabled for this session.{Colors.ENDC}")
+                    elif choice != "y":
+                        return "Execution blocked by user."
             
-        stdout_buf = io.StringIO()
-        
-        # Helper to bridge subagent capability
-        def _bridge_subagent(task, priority=2, agent_type="generic"):
-            return self.subagent(task, priority=priority, agent_type=agent_type)
-        
-        # Helper for registration
-        def _register_subagent(name, cls, description, capabilities=[]):
-            return self.subagent_manager.register_agent_type(name, cls, description, capabilities)
+            with self._state_lock:
+                current_globals = self.state.globals.copy()
+            
+            stdout_buf = io.StringIO()
+            
+            def _bridge_subagent(task, priority=2, agent_type="generic"):
+                return self.subagent(task, priority=priority, agent_type=agent_type)
+            
+            def _register_subagent(name, cls, description, capabilities=[]):
+                return self.subagent_manager.register_agent_type(name, cls, description, capabilities)
 
-        # Bridge to instance methods
-        def _load_skill_shim(name): return self.tool_load_skill(name, env)
+            def _load_skill_shim(name): return self.tool_load_skill(name, env)
 
-        def guarded_print(*args, **kwargs):
-            if "file" in kwargs: builtins.print(*args, **kwargs); return
-            sep = kwargs.get('sep', ' '); end = kwargs.get('end', '\n')
-            stdout_buf.write(sep.join(map(str, args)) + end)
+            def guarded_print(*args, **kwargs):
+                if "file" in kwargs: builtins.print(*args, **kwargs); return
+                sep = kwargs.get('sep', ' '); end = kwargs.get('end', '\n')
+                stdout_buf.write(sep.join(map(str, args)) + end)
 
-        # Inject RLM helpers and standard modules
-        env = {
-            "print": guarded_print,
-            # Injected Globals from Pickle
-            **current_globals,
-            # Core State
-            "memory": self.state.data["memory"],
-            # Structured Memory
-            "remember": self.tool_remember,
-            "recall": self.tool_recall,
-            "search_memory": self.tool_search_memory,
-            # Skills
-            "save_skill": self.tool_save_skill,
-            "load_skill": _load_skill_shim,
-            "register_subagent": _register_subagent,
-            "verify_work": self.tool_run_verification,
-            "see_image": self.tool_see_image,
-            "see": self.tool_see_image,
-            "see_window": self.tool_see_window,
+            env = {
+                "print": guarded_print,
+                **current_globals,
+                "memory": self.state.data.get("memory", {}),
+                "remember": self.tool_remember,
+                "recall": self.tool_recall,
+                "search_memory": self.tool_search_memory,
+                "save_skill": self.tool_save_skill,
+                "load_skill": _load_skill_shim,
+                # remaining original execution code continues...
+                "register_subagent": _bridge_subagent,
+                "verify_work": self.tool_run_verification,
+                "see_image": self.tool_see_image,
+                "see": self.tool_see_image,
+                "see_window": self.tool_see_window,
             "see_screen": self.tool_see_screen,
             "capture_window": self.tool_capture_window,
             "capture_window_advanced": self.tool_capture_window_advanced,
@@ -2292,18 +2801,16 @@ if __name__ == "__main__":
             "subagent": _bridge_subagent,
             "Subagent": Subagent, # Export base class for subclassing
             "ThreadPoolExecutor": ThreadPoolExecutor, # For async patterns
-            # Standard Libs
-            "re": re,
-            "os": os,
+            # Export core helpers for skill writing
+            "BaseSkill": BaseSkill,
             "json": json,
             "shutil": shutil,
             "pickle": pickle
         }
-        
-        try:
-            # AST Magic to auto-print the last expression (REPL-like behavior)
+            
+            # AST Magic to auto-print the last expression (REPL-like behavior) 
             try:
-                tree = ast.parse(code)
+                tree = ast.parse(exec_code)
                 if tree.body and isinstance(tree.body[-1], ast.Expr):
                     # Wrap the last expression in print()
                     last_expr = tree.body[-1]
@@ -2316,45 +2823,50 @@ if __name__ == "__main__":
                     )
                     ast.fix_missing_locations(print_call)
                     tree.body[-1] = print_call
-                    code = compile(tree, filename="<string>", mode="exec")
+                    exec_code = compile(tree, filename="<string>", mode="exec")     
             except Exception:
-                # If AST parsing fails, just execute original code (might be syntax error, let exec handle it)
-                pass
+                    # If AST parsing fails, just execute original code (might be syntax error, let exec handle it)
+                    pass
 
-            # Threaded execution with timeout (30s) to prevent hanging
-            exec_error = []
-            def _target():
-                try: exec(code, env, env)
-                except Exception as e: exec_error.append(e)
-
-            t = threading.Thread(target=_target, daemon=True)
-            t.start()
-            t.join(timeout=30)
-            
-            if t.is_alive():
-                return f"{stdout_buf.getvalue()}\n[System] Error: Code execution timed out (30s). Infinite loop suspected."
-            
-            if exec_error: raise exec_error[0]
-            
+            # execute the user code and capture any exception
+            try:
+                exec(exec_code, env, env)
+            except Exception as e:
+                # re-raise so the outer executor can catch and report
+                raise
             # Persist globals using Pickle, filtering out non-pickleable injected functions
-            # CRITICAL: Lock state updates to prevent race conditions from subagents
             with self._state_lock:
                 new_globals = {}
                 for k, v in env.items():
                     if k in ["re", "os", "json", "shutil", "pickle", "__builtins__"]: continue
-                    
                     try:
                         pickle.dumps(v)
                         new_globals[k] = v
                     except (pickle.PicklingError, TypeError, AttributeError):
-                        # Silently skip unpickleables for now inside logic
                         pass
-                
                 self.state.globals = new_globals
                 self.state.save()
-
             return stdout_buf.getvalue()
-        except Exception: return traceback.format_exc()
+            # end of _execute
+        # run with timeout in executor
+        result = ""
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_execute)
+            try:
+                result = future.result(timeout=self.PYTHON_EXEC_TIMEOUT)
+            except Exception as e:
+                if isinstance(e, TimeoutError):
+                    result = f"[System] Error: Python execution timed out ({self.PYTHON_EXEC_TIMEOUT}s)"
+                else:
+                    # propagate other exceptions
+                    result = f"[System] Execution failed: {e}"
+        # post-tool hook
+        try:
+            self._run_tool_hook('post', 'python', result)
+        except Exception:
+            pass
+        return result
+        # end of run_python
 
     def get_system_prompt(self) -> str:
         summary_block = f"\nTECHNICAL BACKGROUND (SUMMARY): {self.state.data['compressed_summary']}" if self.state.data['compressed_summary'] else ""
@@ -2418,6 +2930,14 @@ if __name__ == "__main__":
                 f"{summary_block}{mem_hint}")
 
     def handle_turn(self, user_input: str):
+        # convenience getters for skills/prompts
+        def recent_user(n=3):
+            return [e["content"] for e in self.state.query_history(role="user", limit=n)]
+        def recent_plans(n=5):
+            return [e["content"] for e in self.state.query_history(tag="plan", limit=n)]
+        def facts_matching(pattern):
+            return [e for e in self.state.query_history(tag="fact") if pattern in e["content"]]
+
         try:
             # Periodic Summary Check
             if self.state.data.get("total_tokens", 0) > TOKEN_THRESHOLD:
@@ -2425,8 +2945,19 @@ if __name__ == "__main__":
 
             self.state.take_snapshot(label="pre_turn")
             self.state.log_event("user", user_input)
+            # also record the user prompt in the evolution log with metadata
+            self.logger.log_user(user_input)
+            # trigger any hooks for incoming user text
+            try:
+                self.on_user_input(user_input)
+            except Exception:
+                pass
 
-            for i in range(24):
+            for _ in range(24):
+                # increment global turn counter so each log entry gets a unique number
+                self.turn_counter += 1
+                turn_num = self.turn_counter
+                turn_start = time.time()
                 try:
                     turn_start_data = json.loads(json.dumps(self.state.data))
                     
@@ -2491,7 +3022,11 @@ if __name__ == "__main__":
                             # Valid pure consensus
                             draft = re.search(r"<consensus>(.*?)</consensus>", resp, re.S).group(1).strip()
                             self.state.log_event("assistant", draft)
-                            self.logger.log_turn(i+1, resp, self.state.calculate_diff(turn_start_data, self.state.data), ["consensus"])
+                            # log consensus turn with metadata
+                            dur = time.time() - turn_start
+                            meta = ["consensus"]
+                            # no tools used for pure consensus
+                            self.logger.log_turn(turn_num, resp, self.state.calculate_diff(turn_start_data, self.state.data), ["consensus"], duration=dur, meta=meta)
                             return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{draft}"
                     else:
                         obs_prefix = ""
@@ -2507,6 +3042,10 @@ if __name__ == "__main__":
                         res = self.run_bash(b)
                         print(f"{Colors.DIM}  -> Tool exit OK.{Colors.ENDC}")
                         obs += f"Bash: {res}\n"
+                        try:
+                            self.on_tool_output("bash", res)
+                        except Exception:
+                            pass
                     
                     for p in py:
                         print(f"{Colors.GREEN}🐍 Python:{Colors.ENDC} {p}")
@@ -2516,6 +3055,10 @@ if __name__ == "__main__":
                         if "Traceback (most recent call last)" in out or "Error:" in out:
                             print(f"{Colors.RED}❌ Tool Error detected.{Colors.ENDC}")
                             obs += "\nSYSTEM ALERT: ⚠️ An error occurred. Analyze and FIX the code.\n"
+                        try:
+                            self.on_tool_output("python", out)
+                        except Exception:
+                            pass
                     
                     if obs_prefix: obs = obs_prefix + obs
 
@@ -2555,8 +3098,26 @@ if __name__ == "__main__":
 
                     # 6. Log and Continue
                     self.state.log_event("assistant", resp)
-                    self.logger.log_turn(i+1, resp, self.state.calculate_diff(turn_start_data, self.state.data), [f"bash:{len(bash)}", f"python:{len(py)}", f"ack:{int(ack)}"])
-                
+                    # log with the persistent turn number and include turn duration
+                    dur = time.time() - turn_start
+                    # build metadata tags
+                    meta = []
+                    if bash:
+                        meta.append("tool:bash")
+                    if py:
+                        meta.append("tool:python")
+                    if ack:
+                        meta.append("ack:true")
+                    if "consensus" in resp:
+                        meta.append("consensus")
+                    else:
+                        meta.append("action")
+                    self.logger.log_turn(turn_num, resp, self.state.calculate_diff(turn_start_data, self.state.data), [f"bash:{len(bash)}", f"python:{len(py)}", f"ack:{int(ack)}"], duration=dur, meta=meta)
+                    # after recording the turn, maybe summarise old history
+                    try:
+                        self.auto_summarize_history()
+                    except Exception:
+                        pass
                 except Exception as inner_e:
                     print(f"{Colors.RED}⚠️ Critical Turn Error: {inner_e}{Colors.ENDC}")
                     traceback.print_exc()
@@ -2581,27 +3142,81 @@ def clear_console():
         pass
 
 
-# ---------------------------------------------------------------------------
-# QA TESTER  — runs the test plan against a candidate script via subprocess
-# ---------------------------------------------------------------------------
+def check_for_upgrades():
+    """No-op in stripped build (self-evolution removed)."""
+    pass
+
 
 def main():
-    check_for_upgrades()
-    Colors.fix_windows_console()
-    clear_console()
-    
-    Colors.print_logo()
-    
-    if not HISTORY_SUPPORT and os.name == 'nt':
-        print(f"{Colors.DIM}Tip: Run `pip install pyreadline3` to enable Up-Arrow command history.{Colors.ENDC}")
+    # helper for debugging in non-interactive environments
+    def log_step(msg):
+        try:
+            with open("startup.log", "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().isoformat()} {msg}\n")
+        except Exception:
+            pass
 
-    # Register Global Error Hooks
-    ErrorHandler.register_global_handler()
+    try:
+        log_step("enter main")
+        check_for_upgrades()
+        log_step("after check_for_upgrades")
+        Colors.fix_windows_console()
+        log_step("after fix_windows_console")
+        clear_console()
+        log_step("after clear_console")
+        
+        Colors.print_logo()
+        log_step("after print_logo")
+        # debug visibility of stdin
+        print(f"[DEBUG] stdin.isatty() -> {sys.stdin.isatty()}")
+        log_step(f"stdin isatty {sys.stdin.isatty()}")
+    except Exception as e:
+        log_step(f"startup exception: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # initial startup completed
+    log_step("startup complete")
+
+    log_step("before non-tty check")
+    # When running in a non-interactive environment (e.g. launched by
+    # double-click or via a non-tty PowerShell invocation) stdin will
+    # immediately return EOF.  In that case the original input loop
+    # would exit immediately and the window would close.  Detect this
+    # condition and keep the process alive so the user can read any
+    # startup messages.
+    if not sys.stdin.isatty():
+        log_step("non-tty detected")
+        print(f"{Colors.YELLOW}[System] Warning: stdin is not a TTY; interactive mode disabled.{Colors.ENDC}")
+        print(f"{Colors.YELLOW}[System] Press Ctrl+C to quit.{Colors.ENDC}")
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            # nothing to clean up, just exit
+            pass
+        return
+    else:
+        log_step("tty confirmed")
+    
+        log_step("before history support check")
+        if not HISTORY_SUPPORT and os.name == 'nt':
+            log_step("history support missing")
+            print(f"{Colors.DIM}Tip: Run `pip install pyreadline3` to enable Up-Arrow command history.{Colors.ENDC}")
+        else:
+            log_step("history support ok")
+    
+        log_step("before registering global error hooks")
+        # Register Global Error Hooks
+        ErrorHandler.register_global_handler()
+        log_step("after registering global error hooks")
 
     try:
         bot = FlexiBot()
+        log_step("bot instantiated")
         
         print(f"{Colors.DIM}System initialized. Auto-Summary threshold: {TOKEN_THRESHOLD}{Colors.ENDC}")
+        log_step("after bot init print")
         
         # Idle Timer Config
         IDLE_TIMEOUT = 300 # 5 minutes
@@ -2620,27 +3235,44 @@ def main():
         t.daemon = True
         t.start()
 
+        stdin_closed = False
+        log_step("enter input loop")
         while True:
+            log_step("loop iteration start")
             print(f"\n{Colors.GREEN}{Colors.BOLD}👤 You:{Colors.ENDC} ", end="", flush=True)
             
             last_activity = time.time()
             user_input = None
 
-            while True:
-                try:
-                    # Check for input with short timeout
-                    user_input = input_queue.get(timeout=0.5)
-                    break
-                except queue.Empty:
-                    # Check for idle timeout
-                    if time.time() - last_activity > IDLE_TIMEOUT:
-                        print(f"\n\n{Colors.YELLOW}[System]: User idle for {IDLE_TIMEOUT}s. Resuming...{Colors.ENDC}")
-                        
-                        # Reset timer and re-print prompt
-                        last_activity = time.time()
-                        print(f"\n{Colors.GREEN}{Colors.BOLD}👤 You:{Colors.ENDC} ", end="", flush=True)
-            
-            if user_input is None: break # EOF
+            # gather input; if stdin has been closed earlier, skip waiting
+            if not stdin_closed:
+                while True:
+                    try:
+                        # Check for input with short timeout
+                        user_input = input_queue.get(timeout=0.5)
+                        break
+                    except queue.Empty:
+                        # Check for idle timeout
+                        if time.time() - last_activity > IDLE_TIMEOUT:
+                            print(f"\n\n{Colors.YELLOW}[System]: User idle for {IDLE_TIMEOUT}s. Resuming...{Colors.ENDC}")
+                            
+                            # Reset timer and re-print prompt
+                            last_activity = time.time()
+                            print(f"\n{Colors.GREEN}{Colors.BOLD}👤 You:{Colors.ENDC} ", end="", flush=True)
+            else:
+                # stdin already closed; avoid blocking forever
+                user_input = None
+
+            if user_input is None:
+                log_step("user_input is None")
+                if not stdin_closed:
+                    stdin_closed = True
+                    log_step("stdin_closed flag set")
+                    print(f"\n{Colors.DIM}[System]: stdin closed, continuing to run. Type 'exit' or press Ctrl+C to quit.{Colors.ENDC}")
+                # simply loop back after a short pause, keep the agent alive
+                time.sleep(0.5)
+                continue
+
             if user_input.strip() == "__STATUS__":
                 print(f"\n{Colors.CYAN}[STATUS PROBE]{Colors.ENDC}")
                 print(json.dumps(bot.get_runtime_status(), indent=2))
@@ -2661,8 +3293,9 @@ def main():
     except KeyboardInterrupt:
         print(f"\n\n{Colors.YELLOW}👋 Gracefully shutting down... (Ctrl+C detected){Colors.ENDC}")
         sys.exit(0)
+    except Exception as e:
+        log_step(f"main exception: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__": main()
-
-
-
