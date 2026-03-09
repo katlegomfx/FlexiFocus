@@ -81,7 +81,7 @@ ARCHIVE_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB by default
 
 EVOLUTION_LOG = STATE_DIR / "evolution_log.md"
 MAX_SNAPSHOTS = 5
-TOKEN_THRESHOLD = 92000 # Your specific requirement for summary trigger
+TOKEN_THRESHOLD = 368000 # Your specific requirement for summary trigger
 
 # automatic history summarisation parameters
 AUTO_SUMMARY_THRESHOLD = 2000  # if history entries exceed this
@@ -6539,7 +6539,7 @@ if __name__ == "__main__":
                         continue
 
                     # --- CONTEXT OVERFLOW PROTECTION ---
-                    if len(obs) > 4000:
+                    if len(obs) > 92000:
                         print(f"{Colors.YELLOW}[System]: Observation too large ({len(obs)} chars). Truncating for history safety...{Colors.ENDC}")
                         truncated_obs = obs[:2000] + "\n... [TRUNCATED DUE TO SIZE] ...\n" + obs[-1000:]
                         self.last_observation = truncated_obs
