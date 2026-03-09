@@ -1,6 +1,7 @@
 import urllib.request
 import urllib.parse
 import urllib.error
+import signal
 import time
 import sys
 import platform
@@ -17,6 +18,8 @@ from enum import Enum, IntEnum
 import shutil
 import gzip
 import pickle
+import py_compile
+import difflib
 import threading
 import functools
 import random
@@ -28,7 +31,10 @@ import builtins
 import sqlite3
 import importlib
 import importlib.util
+import tokenize
+import html
 from dataclasses import dataclass
+from html.parser import HTMLParser
 try:
     import readline
     HISTORY_SUPPORT = True
@@ -65,7 +71,11 @@ else:
 STATE_FILE = STATE_DIR / "state.json"
 GLOBALS_FILE = STATE_DIR / "globals.pkl"
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
+BG_TASK_LOG_DIR = STATE_DIR / "bg_task_logs"
+DB_PROFILES_FILE = STATE_DIR / "db_profiles.json"
+NOTEBOOK_SESSION_FILE = STATE_DIR / "notebook_sessions.json"
 ARCHIVE_FILE = STATE_DIR / "full_archive.jsonl"
+RESPONSE_TRACE_FILE = STATE_DIR / "response_trace.jsonl"
 # maximum size (bytes) before rotating/compressing the legacy JSONL archive
 ARCHIVE_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB by default
 
@@ -870,18 +880,21 @@ class ExecutionPolicyLayer:
         "python": True,
         "spawn_background": True,
         "run_python_bg": True,
+        "install_python_package": True,
     }
     DEFAULT_TIMEOUTS = {
         "bash": 45,
         "python": 60,
         "spawn_background": 30,
         "run_python_bg": 30,
+        "install_python_package": 120,
     }
     DEFAULT_TIMEOUT_OVERRIDES = {
         "bash": 120,
         "python": 180,
         "spawn_background": 300,
         "run_python_bg": 300,
+        "install_python_package": 600,
     }
     DEFAULT_RESOURCE_CEILINGS = {
         "default": {
@@ -901,6 +914,9 @@ class ExecutionPolicyLayer:
         "run_python_bg": {
             "max_input_chars": 12000,
         },
+        "install_python_package": {
+            "max_input_chars": 200,
+        },
     }
     DEFAULT_ENVIRONMENT_ISOLATION = {
         "inherit_environment": False,
@@ -916,6 +932,11 @@ class ExecutionPolicyLayer:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
         },
+        "working_directory": ".",
+        "readable_roots": ["."],
+        "writable_roots": ["."],
+        "network_access": "inherit",
+        "blocked_command_patterns": [],
         "tool_overrides": {},
     }
     DEFAULT_AUDIT_LOGGING = {
@@ -973,6 +994,11 @@ class ExecutionPolicyLayer:
             "allowed_vars": list(tool_overrides.get("allowed_vars", base_rules.get("allowed_vars", [])) or []),
             "blocked_vars": list(tool_overrides.get("blocked_vars", base_rules.get("blocked_vars", [])) or []),
             "set_vars": {**dict(base_rules.get("set_vars", {}) or {}), **dict(tool_overrides.get("set_vars", {}) or {})},
+            "working_directory": str(tool_overrides.get("working_directory", base_rules.get("working_directory", ".")) or "."),
+            "readable_roots": list(tool_overrides.get("readable_roots", base_rules.get("readable_roots", ["."])) or ["."]),
+            "writable_roots": list(tool_overrides.get("writable_roots", base_rules.get("writable_roots", ["."])) or ["."]),
+            "network_access": tool_overrides.get("network_access", base_rules.get("network_access", "inherit")),
+            "blocked_command_patterns": list(tool_overrides.get("blocked_command_patterns", base_rules.get("blocked_command_patterns", [])) or []),
         }
         source_env = dict(os.environ) if rules["inherit_environment"] else {}
         if rules["allowed_vars"]:
@@ -981,6 +1007,24 @@ class ExecutionPolicyLayer:
             source_env.pop(name, None)
         source_env.update({str(k): str(v) for k, v in rules["set_vars"].items()})
         return source_env, rules
+
+    def _payload_block_reason(self, tool_name: str, payload: str, rules: dict[str, Any]) -> str | None:
+        text = str(payload or "")
+        for pattern in rules.get("blocked_command_patterns", []):
+            try:
+                if re.search(pattern, text, re.IGNORECASE):
+                    return f"Payload matches blocked execution policy pattern '{pattern}' for '{tool_name}'."
+            except re.error:
+                if pattern.lower() in text.lower():
+                    return f"Payload matches blocked execution policy pattern '{pattern}' for '{tool_name}'."
+        return None
+
+    def subprocess_kwargs(self, decision: ExecutionPolicyDecision) -> dict[str, Any]:
+        cwd = decision.isolation_rules.get("working_directory", ".") or "."
+        return {
+            "env": decision.environment,
+            "cwd": str(Path(cwd)),
+        }
 
     def evaluate(self, tool_name: str, payload: str, *, requested_timeout: int | None = None,
                  active_background_processes: int = 0) -> ExecutionPolicyDecision:
@@ -998,9 +1042,22 @@ class ExecutionPolicyLayer:
             )
 
         ceilings = self._tool_ceilings(tool_name)
+        env, rules = self._build_environment(tool_name)
+        blocked_reason = self._payload_block_reason(tool_name, payload, rules)
+        if blocked_reason:
+            return ExecutionPolicyDecision(
+                tool_name=tool_name,
+                allowed=False,
+                reason=blocked_reason,
+                timeout_seconds=0,
+                resource_ceilings=ceilings,
+                environment=env,
+                isolation_rules=rules,
+                audit_format=copy.deepcopy(self.audit_logging),
+            )
+
         max_input = int(ceilings.get("max_input_chars", 100000))
         if len(payload or "") > max_input:
-            env, rules = self._build_environment(tool_name)
             return ExecutionPolicyDecision(
                 tool_name=tool_name,
                 allowed=False,
@@ -1014,7 +1071,6 @@ class ExecutionPolicyLayer:
 
         max_bg = int(ceilings.get("max_background_processes", self.resource_ceilings.get("default", {}).get("max_background_processes", 8)))
         if tool_name in {"spawn_background", "run_python_bg"} and active_background_processes >= max_bg:
-            env, rules = self._build_environment(tool_name)
             return ExecutionPolicyDecision(
                 tool_name=tool_name,
                 allowed=False,
@@ -1029,7 +1085,6 @@ class ExecutionPolicyLayer:
         default_timeout = int(self.timeout_defaults.get(tool_name, 30))
         max_timeout = int(self.timeout_overrides.get(tool_name, default_timeout))
         timeout_seconds = default_timeout if requested_timeout is None else min(int(requested_timeout), max_timeout)
-        env, rules = self._build_environment(tool_name)
         return ExecutionPolicyDecision(
             tool_name=tool_name,
             allowed=True,
@@ -1076,6 +1131,767 @@ class ExecutionPolicyLayer:
             ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="ExecutionPolicyLayer.audit", code=ErrorCode.IO_ERROR)
 
 # --- HELPER FUNCTIONS (RLM STYLE) ---
+
+def _rlm_collect_files(root: str = ".", pattern: str = "*") -> list[Path]:
+    root_path = Path(root)
+    if not root_path.exists():
+        return []
+    return [path for path in root_path.rglob(pattern) if path.is_file() and not any(part.startswith('.') for part in path.parts)]
+
+
+def _rlm_collect_files_multi(root: str = ".", patterns: list[str] | None = None) -> list[Path]:
+    seen: set[Path] = set()
+    collected: list[Path] = []
+    for pattern in patterns or ["*"]:
+        for path in _rlm_collect_files(root, pattern):
+            if path in seen:
+                continue
+            seen.add(path)
+            collected.append(path)
+    return collected
+
+
+def _rlm_result(tool: str, ok: bool = True, *, data: Any = None,
+                warnings: list[Any] | None = None, errors: list[Any] | None = None,
+                **extra) -> str:
+    payload = {
+        "ok": bool(ok),
+        "tool": tool,
+        "data": data if data is not None else {},
+        "warnings": list(warnings or []),
+        "errors": list(errors or []),
+    }
+    payload.update(extra)
+    return json.dumps(payload, indent=2)
+
+
+def _rlm_parse_pattern_list(patterns: str | list[str] | None, default: list[str]) -> list[str]:
+    if patterns is None:
+        return list(default)
+    if isinstance(patterns, str):
+        parts = [part.strip() for part in patterns.split(",")]
+        return [part for part in parts if part] or list(default)
+    return [str(part).strip() for part in patterns if str(part).strip()] or list(default)
+
+
+def _rlm_python_files(root: str = ".", filepath: str = "") -> list[Path]:
+    if filepath:
+        path = Path(filepath)
+        return [path] if path.exists() and path.is_file() else []
+    return _rlm_collect_files_multi(root, ["*.py"])
+
+
+def _rlm_read_text(path: Path) -> str:
+    return path.read_text(encoding='utf-8', errors='replace')
+
+
+def _rlm_python_symbol_matches(target: str, name: str, qualname: str) -> bool:
+    return target == name or target == qualname
+
+
+def _rlm_infer_simple_annotation(node: ast.AST | None) -> str | None:
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if value is None:
+            return "None"
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int) and not isinstance(value, bool):
+            return "int"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, bytes):
+            return "bytes"
+    if isinstance(node, ast.List):
+        inner = {_rlm_infer_simple_annotation(item) for item in node.elts}
+        inner.discard(None)
+        if len(inner) == 1:
+            return f"list[{next(iter(inner))}]"
+        return "list[Any]"
+    if isinstance(node, ast.Tuple):
+        inner = [_rlm_infer_simple_annotation(item) or "Any" for item in node.elts]
+        return f"tuple[{', '.join(inner)}]" if inner else "tuple[Any, ...]"
+    if isinstance(node, ast.Set):
+        inner = {_rlm_infer_simple_annotation(item) for item in node.elts}
+        inner.discard(None)
+        if len(inner) == 1:
+            return f"set[{next(iter(inner))}]"
+        return "set[Any]"
+    if isinstance(node, ast.Dict):
+        key_types = {_rlm_infer_simple_annotation(item) for item in node.keys if item is not None}
+        value_types = {_rlm_infer_simple_annotation(item) for item in node.values if item is not None}
+        key_types.discard(None)
+        value_types.discard(None)
+        key_type = next(iter(key_types)) if len(key_types) == 1 else "Any"
+        value_type = next(iter(value_types)) if len(value_types) == 1 else "Any"
+        return f"dict[{key_type}, {value_type}]"
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        ctor = node.func.id
+        if ctor in {"str", "int", "float", "bool", "list", "dict", "set", "tuple"}:
+            return ctor
+    return None
+
+
+def _rlm_collect_python_returns(func_node: ast.AST) -> list[ast.AST | None]:
+    returns: list[ast.AST | None] = []
+
+    class _Collector(ast.NodeVisitor):
+        def visit_Return(self, node):
+            returns.append(node.value)
+
+        def visit_FunctionDef(self, node):
+            return
+
+        def visit_AsyncFunctionDef(self, node):
+            return
+
+        def visit_ClassDef(self, node):
+            return
+
+    collector = _Collector()
+    for stmt in getattr(func_node, "body", []):
+        collector.visit(stmt)
+    return returns
+
+
+def _rlm_resolve_python_module(module: str, current_file: Path, root: Path, level: int = 0) -> str | None:
+    try:
+        root = root.resolve()
+        if level > 0:
+            base = current_file.parent.resolve()
+            for _ in range(max(0, level - 1)):
+                base = base.parent
+            rel_parts = module.split('.') if module else []
+            candidate_base = base.joinpath(*rel_parts) if rel_parts else base
+            candidates = [candidate_base.with_suffix('.py'), candidate_base / '__init__.py']
+        else:
+            if not module:
+                return None
+            parts = module.split('.')
+            candidate_base = root.joinpath(*parts)
+            candidates = [candidate_base.with_suffix('.py'), candidate_base / '__init__.py']
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            if candidate.exists() and str(resolved).startswith(str(root)):
+                return str(resolved)
+    except Exception:
+        return None
+    return None
+
+
+def rlm_search_workspace(query: str, root: str = ".", pattern: str = "*", is_regex: bool = False,
+                         case_sensitive: bool = False, max_results: int = 50, context_lines: int = 1):
+    results = []
+    try:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        regex = re.compile(query if is_regex else re.escape(query), flags)
+        for path in _rlm_collect_files(root, pattern):
+            try:
+                lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+            except Exception:
+                continue
+            for idx, line in enumerate(lines, start=1):
+                if regex.search(line):
+                    start = max(1, idx - context_lines)
+                    end = min(len(lines), idx + context_lines)
+                    snippet = "\n".join(lines[start - 1:end])
+                    results.append({
+                        "file": str(path),
+                        "line": idx,
+                        "match": line[:300],
+                        "context": snippet[:1200],
+                    })
+                    if len(results) >= max_results:
+                        return json.dumps(results, indent=2)
+        return json.dumps(results, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"Workspace search error: {e}"})
+
+
+def rlm_find_symbol(symbol_name: str, root: str = ".", pattern: str = "*.py", max_results: int = 50):
+    results = []
+    try:
+        py_patterns = [pattern] if pattern else ["*.py"]
+        search_patterns = py_patterns if py_patterns != ["*"] else ["*.py", "*.js", "*.jsx", "*.ts", "*.tsx"]
+        compiled = [
+            re.compile(rf"^\s*def\s+{re.escape(symbol_name)}\b"),
+            re.compile(rf"^\s*class\s+{re.escape(symbol_name)}\b"),
+            re.compile(rf"^\s*(?:async\s+def)\s+{re.escape(symbol_name)}\b"),
+            re.compile(rf"^\s*(?:export\s+)?(?:const|let|var|function)\s+{re.escape(symbol_name)}\b"),
+            re.compile(rf"^\s*(?:export\s+)?(?:interface|type|enum)\s+{re.escape(symbol_name)}\b"),
+            re.compile(rf"^\s*(?:export\s+default\s+)?class\s+{re.escape(symbol_name)}\b"),
+        ]
+        seen = set()
+        for search_pattern in search_patterns:
+            for path in _rlm_collect_files(root, search_pattern):
+                if path in seen:
+                    continue
+                seen.add(path)
+                try:
+                    lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+                except Exception:
+                    continue
+                for idx, line in enumerate(lines, start=1):
+                    if any(rx.search(line) for rx in compiled):
+                        results.append({"file": str(path), "line": idx, "definition": line.strip()[:300]})
+                        if len(results) >= max_results:
+                            return json.dumps(results, indent=2)
+        return json.dumps(results, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"Find symbol error: {e}"})
+
+
+def rlm_python_symbol_doc(symbol_name: str, filepath: str = "", root: str = ".", max_results: int = 10):
+    results = []
+    try:
+        for path in _rlm_python_files(root=root, filepath=filepath):
+            source = _rlm_read_text(path)
+            try:
+                tree = ast.parse(source, filename=str(path))
+            except SyntaxError:
+                continue
+            lines = source.splitlines()
+
+            class _Visitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.stack: list[str] = []
+
+                def _record(self, node: ast.AST, name: str, kind: str):
+                    qualname = ".".join(self.stack + [name]) if self.stack else name
+                    if not _rlm_python_symbol_matches(symbol_name, name, qualname):
+                        return
+                    line_text = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
+                    results.append({
+                        "file": str(path),
+                        "line": getattr(node, "lineno", 1),
+                        "kind": kind,
+                        "name": name,
+                        "qualname": qualname,
+                        "signature": line_text,
+                        "docstring": (ast.get_docstring(node) or "")[:2000],
+                    })
+
+                def visit_ClassDef(self, node):
+                    self._record(node, node.name, "class")
+                    self.stack.append(node.name)
+                    self.generic_visit(node)
+                    self.stack.pop()
+
+                def visit_FunctionDef(self, node):
+                    self._record(node, node.name, "function")
+                    self.stack.append(node.name)
+                    self.generic_visit(node)
+                    self.stack.pop()
+
+                def visit_AsyncFunctionDef(self, node):
+                    self._record(node, node.name, "async_function")
+                    self.stack.append(node.name)
+                    self.generic_visit(node)
+                    self.stack.pop()
+
+            _Visitor().visit(tree)
+            if len(results) >= max_results:
+                break
+        return _rlm_result("python_symbol_doc", data={"matches": results[:max_results]}, match_count=len(results[:max_results]))
+    except Exception as e:
+        return _rlm_result("python_symbol_doc", ok=False, errors=[str(e)])
+
+
+def rlm_python_import_graph(filepath: str, root: str = "."):
+    path = Path(filepath)
+    if not path.exists():
+        return _rlm_result("python_import_graph", ok=False, errors=[f"File not found: {filepath}"])
+    try:
+        source = _rlm_read_text(path)
+        tree = ast.parse(source, filename=str(path))
+        root_path = Path(root).resolve()
+        imports = []
+        local_dependencies = []
+        stdlib_modules = set()
+        external_modules = set()
+        local_set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = alias.name
+                    top_level = module_name.split('.')[0]
+                    resolved = _rlm_resolve_python_module(module_name, path, root_path, 0)
+                    record = {
+                        "line": node.lineno,
+                        "kind": "import",
+                        "module": module_name,
+                        "alias": alias.asname,
+                        "resolved_path": resolved,
+                    }
+                    imports.append(record)
+                    if resolved:
+                        local_set.add(resolved)
+                    elif top_level in getattr(sys, "stdlib_module_names", set()):
+                        stdlib_modules.add(top_level)
+                    else:
+                        external_modules.add(top_level)
+            elif isinstance(node, ast.ImportFrom):
+                module_name = node.module or ""
+                for alias in node.names:
+                    target_name = f"{module_name}.{alias.name}".strip('.') if module_name else alias.name
+                    resolved = _rlm_resolve_python_module(module_name or alias.name, path, root_path, node.level)
+                    record = {
+                        "line": node.lineno,
+                        "kind": "from",
+                        "module": module_name,
+                        "name": alias.name,
+                        "alias": alias.asname,
+                        "level": node.level,
+                        "resolved_path": resolved,
+                    }
+                    imports.append(record)
+                    top_level = (module_name or alias.name or "").split('.')[0]
+                    if resolved:
+                        local_set.add(resolved)
+                    elif top_level in getattr(sys, "stdlib_module_names", set()):
+                        stdlib_modules.add(top_level)
+                    elif top_level:
+                        external_modules.add(top_level)
+        local_dependencies = sorted(local_set)
+        return _rlm_result(
+            "python_import_graph",
+            data={
+                "file": str(path),
+                "imports": imports,
+                "local_dependencies": local_dependencies,
+                "stdlib_modules": sorted(stdlib_modules),
+                "external_modules": sorted(external_modules),
+            },
+            import_count=len(imports),
+        )
+    except SyntaxError as e:
+        return _rlm_result("python_import_graph", ok=False, errors=[f"SyntaxError: {e}"])
+    except Exception as e:
+        return _rlm_result("python_import_graph", ok=False, errors=[str(e)])
+
+
+def rlm_validate_python_snippet(code: str, mode: str = "exec"):
+    try:
+        ast.parse(code, mode=mode)
+        return _rlm_result("validate_python_snippet", data={"mode": mode, "valid": True})
+    except SyntaxError as e:
+        return _rlm_result(
+            "validate_python_snippet",
+            ok=False,
+            data={
+                "mode": mode,
+                "valid": False,
+                "line": e.lineno,
+                "offset": e.offset,
+                "text": (e.text or "").rstrip(),
+            },
+            errors=[f"SyntaxError: {e.msg}"],
+        )
+    except Exception as e:
+        return _rlm_result("validate_python_snippet", ok=False, errors=[str(e)])
+
+
+def rlm_python_refactor_symbol(filepath: str, old_name: str, new_name: str, apply: bool = False):
+    path = Path(filepath)
+    if not path.exists():
+        return _rlm_result("python_refactor_symbol", ok=False, errors=[f"File not found: {filepath}"])
+    if not old_name.isidentifier() or not new_name.isidentifier():
+        return _rlm_result("python_refactor_symbol", ok=False, errors=["Both old_name and new_name must be valid Python identifiers."])
+    try:
+        source = _rlm_read_text(path)
+        token_stream = list(tokenize.generate_tokens(io.StringIO(source).readline))
+        replacements = []
+        rewritten = []
+        for tok in token_stream:
+            if tok.type == tokenize.NAME and tok.string == old_name:
+                replacements.append({"line": tok.start[0], "column": tok.start[1] + 1})
+                tok = tokenize.TokenInfo(tok.type, new_name, tok.start, tok.end, tok.line)
+            rewritten.append(tok)
+        new_source = tokenize.untokenize(rewritten)
+        diff_text = "".join(difflib.unified_diff(
+            source.splitlines(keepends=True),
+            new_source.splitlines(keepends=True),
+            fromfile=str(path),
+            tofile=str(path),
+            n=2,
+        ))
+        if apply and replacements:
+            path.write_text(new_source, encoding='utf-8')
+        return _rlm_result(
+            "python_refactor_symbol",
+            data={
+                "file": str(path),
+                "old_name": old_name,
+                "new_name": new_name,
+                "occurrences": len(replacements),
+                "locations": replacements[:200],
+                "applied": bool(apply and replacements),
+                "diff_preview": diff_text[:4000],
+            },
+            warnings=[] if replacements else [f"No Python identifier tokens named '{old_name}' were found."],
+        )
+    except Exception as e:
+        return _rlm_result("python_refactor_symbol", ok=False, errors=[str(e)])
+
+
+def rlm_python_cleanup_unused_imports(filepath: str, apply: bool = False):
+    path = Path(filepath)
+    if not path.exists():
+        return _rlm_result("python_cleanup_unused_imports", ok=False, errors=[f"File not found: {filepath}"])
+    try:
+        source = _rlm_read_text(path)
+        tree = ast.parse(source, filename=str(path))
+        lines = source.splitlines(keepends=True)
+        used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+        operations = []
+        unused_imports = []
+        warnings = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                alias_info = []
+                for alias in node.names:
+                    bound_name = alias.asname or alias.name.split('.')[0]
+                    alias_info.append((alias, bound_name))
+                unused = [alias for alias, bound_name in alias_info if bound_name not in used_names]
+                if not unused:
+                    continue
+                unused_imports.extend(alias.name for alias in unused)
+                kept = [alias for alias, bound_name in alias_info if bound_name in used_names]
+                indent = re.match(r"\s*", lines[node.lineno - 1]).group(0)
+                replacement = None if not kept else indent + "import " + ", ".join(
+                    f"{alias.name} as {alias.asname}" if alias.asname else alias.name for alias in kept
+                ) + "\n"
+                operations.append((node.lineno, getattr(node, "end_lineno", node.lineno), replacement))
+            elif isinstance(node, ast.ImportFrom):
+                if any(alias.name == "*" for alias in node.names):
+                    warnings.append(f"Skipped wildcard import at line {node.lineno} in {filepath}.")
+                    continue
+                alias_info = []
+                for alias in node.names:
+                    bound_name = alias.asname or alias.name
+                    alias_info.append((alias, bound_name))
+                unused = [alias for alias, bound_name in alias_info if bound_name not in used_names]
+                if not unused:
+                    continue
+                unused_imports.extend(f"{node.module or ''}.{alias.name}".strip('.') for alias in unused)
+                kept = [alias for alias, bound_name in alias_info if bound_name in used_names]
+                indent = re.match(r"\s*", lines[node.lineno - 1]).group(0)
+                if kept:
+                    module_prefix = "." * getattr(node, "level", 0)
+                    module_name = node.module or ""
+                    replacement = indent + f"from {module_prefix}{module_name} import " + ", ".join(
+                        f"{alias.name} as {alias.asname}" if alias.asname else alias.name for alias in kept
+                    ) + "\n"
+                else:
+                    replacement = None
+                operations.append((node.lineno, getattr(node, "end_lineno", node.lineno), replacement))
+
+        if not operations:
+            return _rlm_result(
+                "python_cleanup_unused_imports",
+                data={"file": str(path), "unused_imports": [], "applied": False, "diff_preview": ""},
+                warnings=warnings,
+            )
+
+        new_lines = list(lines)
+        for start, end, replacement in sorted(operations, key=lambda item: item[0], reverse=True):
+            new_lines[start - 1:end] = [] if replacement is None else [replacement]
+        new_source = "".join(new_lines)
+        diff_text = "".join(difflib.unified_diff(
+            source.splitlines(keepends=True),
+            new_source.splitlines(keepends=True),
+            fromfile=str(path),
+            tofile=str(path),
+            n=2,
+        ))
+        if apply:
+            path.write_text(new_source, encoding='utf-8')
+        return _rlm_result(
+            "python_cleanup_unused_imports",
+            data={
+                "file": str(path),
+                "unused_imports": sorted(set(unused_imports)),
+                "applied": bool(apply),
+                "diff_preview": diff_text[:4000],
+            },
+            warnings=warnings,
+        )
+    except SyntaxError as e:
+        return _rlm_result("python_cleanup_unused_imports", ok=False, errors=[f"SyntaxError: {e}"])
+    except Exception as e:
+        return _rlm_result("python_cleanup_unused_imports", ok=False, errors=[str(e)])
+
+
+def rlm_python_type_annotation_assist(filepath: str):
+    path = Path(filepath)
+    if not path.exists():
+        return _rlm_result("python_type_annotation_assist", ok=False, errors=[f"File not found: {filepath}"])
+    try:
+        tree = ast.parse(_rlm_read_text(path), filename=str(path))
+        suggestions = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                positional_args = list(getattr(node.args, "posonlyargs", [])) + list(node.args.args)
+                defaults = list(node.args.defaults)
+                default_offset = len(positional_args) - len(defaults)
+                for index, arg in enumerate(positional_args):
+                    if arg.annotation is not None:
+                        continue
+                    default_node = defaults[index - default_offset] if index >= default_offset and index - default_offset < len(defaults) else None
+                    inferred = _rlm_infer_simple_annotation(default_node)
+                    if inferred:
+                        suggestions.append({
+                            "file": str(path),
+                            "line": arg.lineno,
+                            "kind": "parameter",
+                            "target": f"{node.name}.{arg.arg}",
+                            "suggested_annotation": inferred,
+                        })
+                if node.returns is None:
+                    return_types = {_rlm_infer_simple_annotation(ret) for ret in _rlm_collect_python_returns(node)}
+                    return_types.discard(None)
+                    if len(return_types) == 1:
+                        suggestions.append({
+                            "file": str(path),
+                            "line": node.lineno,
+                            "kind": "return",
+                            "target": node.name,
+                            "suggested_annotation": next(iter(return_types)),
+                        })
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                inferred = _rlm_infer_simple_annotation(node.value)
+                if inferred:
+                    suggestions.append({
+                        "file": str(path),
+                        "line": node.lineno,
+                        "kind": "variable",
+                        "target": node.targets[0].id,
+                        "suggested_annotation": inferred,
+                    })
+        return _rlm_result(
+            "python_type_annotation_assist",
+            data={"file": str(path), "suggestions": suggestions[:200]},
+            suggestion_count=len(suggestions),
+        )
+    except SyntaxError as e:
+        return _rlm_result("python_type_annotation_assist", ok=False, errors=[f"SyntaxError: {e}"])
+    except Exception as e:
+        return _rlm_result("python_type_annotation_assist", ok=False, errors=[str(e)])
+
+
+def rlm_find_references(symbol_name: str, root: str = ".", patterns: str | list[str] | None = None,
+                        max_results: int = 100, case_sensitive: bool = False):
+    try:
+        search_patterns = _rlm_parse_pattern_list(patterns, ["*.py", "*.js", "*.jsx", "*.ts", "*.tsx"])
+        flags = 0 if case_sensitive else re.IGNORECASE
+        regex = re.compile(rf"\b{re.escape(symbol_name)}\b", flags)
+        results = []
+        for path in _rlm_collect_files_multi(root, search_patterns):
+            try:
+                for idx, line in enumerate(_rlm_read_text(path).splitlines(), start=1):
+                    if regex.search(line):
+                        results.append({"file": str(path), "line": idx, "match": line.strip()[:300]})
+                        if len(results) >= max_results:
+                            return _rlm_result("find_references", data={"references": results}, match_count=len(results))
+            except Exception:
+                continue
+        return _rlm_result("find_references", data={"references": results}, match_count=len(results))
+    except Exception as e:
+        return _rlm_result("find_references", ok=False, errors=[str(e)])
+
+
+def rlm_find_implementations(symbol_name: str, root: str = ".", patterns: str | list[str] | None = None,
+                             max_results: int = 100):
+    try:
+        search_patterns = _rlm_parse_pattern_list(patterns, ["*.py", "*.js", "*.jsx", "*.ts", "*.tsx"])
+        matchers = [
+            re.compile(rf"^\s*class\s+\w+\s*\((?:[^\)]*\b{re.escape(symbol_name)}\b[^\)]*)\)"),
+            re.compile(rf"^\s*(?:export\s+)?class\s+\w+\s+(?:extends|implements)\s+[^{{\n;]*\b{re.escape(symbol_name)}\b"),
+            re.compile(rf"^\s*class\s+\w+\s+implements\s+[^{{\n;]*\b{re.escape(symbol_name)}\b"),
+        ]
+        results = []
+        for path in _rlm_collect_files_multi(root, search_patterns):
+            try:
+                for idx, line in enumerate(_rlm_read_text(path).splitlines(), start=1):
+                    if any(rx.search(line) for rx in matchers):
+                        results.append({"file": str(path), "line": idx, "implementation": line.strip()[:300]})
+                        if len(results) >= max_results:
+                            return _rlm_result("find_implementations", data={"implementations": results}, match_count=len(results))
+            except Exception:
+                continue
+        return _rlm_result("find_implementations", data={"implementations": results}, match_count=len(results))
+    except Exception as e:
+        return _rlm_result("find_implementations", ok=False, errors=[str(e)])
+
+
+def rlm_preview_symbol_rename(symbol_name: str, new_name: str, root: str = ".",
+                              patterns: str | list[str] | None = None, max_results: int = 200):
+    if not symbol_name:
+        return _rlm_result("preview_symbol_rename", ok=False, errors=["symbol_name is required."])
+    if not new_name:
+        return _rlm_result("preview_symbol_rename", ok=False, errors=["new_name is required."])
+    try:
+        search_patterns = _rlm_parse_pattern_list(patterns, ["*.py", "*.js", "*.jsx", "*.ts", "*.tsx"])
+        regex = re.compile(rf"\b{re.escape(symbol_name)}\b")
+        matches = []
+        file_totals: dict[str, int] = {}
+        for path in _rlm_collect_files_multi(root, search_patterns):
+            try:
+                for idx, line in enumerate(_rlm_read_text(path).splitlines(), start=1):
+                    count = len(regex.findall(line))
+                    if not count:
+                        continue
+                    file_totals[str(path)] = file_totals.get(str(path), 0) + count
+                    if len(matches) < max_results:
+                        matches.append({
+                            "file": str(path),
+                            "line": idx,
+                            "before": line.strip()[:300],
+                            "after": regex.sub(new_name, line.strip())[:300],
+                            "occurrences": count,
+                        })
+            except Exception:
+                continue
+        return _rlm_result(
+            "preview_symbol_rename",
+            data={
+                "symbol_name": symbol_name,
+                "new_name": new_name,
+                "file_totals": file_totals,
+                "matches": matches,
+            },
+            match_count=sum(file_totals.values()),
+            warnings=["Preview only; no files were modified."],
+        )
+    except Exception as e:
+        return _rlm_result("preview_symbol_rename", ok=False, errors=[str(e)])
+
+
+def rlm_read_range(filepath, start_line=1, end_line=100):
+    try:
+        path = Path(filepath)
+        if not path.exists():
+            return f"File not found: {filepath}"
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        start = max(1, int(start_line))
+        end = max(start, int(end_line))
+        selected = lines[start - 1:end]
+        numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=start))
+        return numbered
+    except Exception as e:
+        return f"Read range error: {e}"
+
+
+def rlm_create_file(filepath, content="", overwrite=False):
+    try:
+        path = Path(filepath)
+        if path.exists() and not overwrite:
+            return f"Create error: File already exists at {filepath}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding='utf-8')
+        return f"Successfully created {filepath}"
+    except Exception as e:
+        return f"Create error: {e}"
+
+
+def rlm_delete_file(filepath, missing_ok=True):
+    try:
+        path = Path(filepath)
+        if not path.exists():
+            return f"Delete skipped: File not found at {filepath}" if missing_ok else f"Delete error: File not found at {filepath}"
+        if path.is_dir():
+            return f"Delete error: {filepath} is a directory"
+        path.unlink()
+        return f"Successfully deleted {filepath}"
+    except Exception as e:
+        return f"Delete error: {e}"
+
+
+def rlm_move_file(src, dst, overwrite=False):
+    try:
+        src_path = Path(src)
+        dst_path = Path(dst)
+        if not src_path.exists():
+            return f"Move error: Source not found at {src}"
+        if dst_path.exists() and not overwrite:
+            return f"Move error: Destination already exists at {dst}"
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_path), str(dst_path))
+        return f"Successfully moved {src} to {dst}"
+    except Exception as e:
+        return f"Move error: {e}"
+
+
+def rlm_validate_python(filepath: str = "", code: str = ""):
+    try:
+        if filepath:
+            path = Path(filepath)
+            if not path.exists():
+                return json.dumps({"ok": False, "tool": "validate_python", "errors": [f"File not found: {filepath}"]}, indent=2)
+            py_compile.compile(str(path), doraise=True)
+            return json.dumps({"ok": True, "tool": "validate_python", "target": str(path), "errors": []}, indent=2)
+        ast.parse(code)
+        return json.dumps({"ok": True, "tool": "validate_python", "target": "inline", "errors": []}, indent=2)
+    except Exception as e:
+        return json.dumps({"ok": False, "tool": "validate_python", "errors": [str(e)]}, indent=2)
+
+
+def rlm_validate_json(filepath: str = "", content: str = ""):
+    try:
+        if filepath:
+            path = Path(filepath)
+            if not path.exists():
+                return json.dumps({"ok": False, "tool": "validate_json", "errors": [f"File not found: {filepath}"]}, indent=2)
+            json.loads(path.read_text(encoding='utf-8'))
+            return json.dumps({"ok": True, "tool": "validate_json", "target": str(path), "errors": []}, indent=2)
+        json.loads(content)
+        return json.dumps({"ok": True, "tool": "validate_json", "target": "inline", "errors": []}, indent=2)
+    except Exception as e:
+        return json.dumps({"ok": False, "tool": "validate_json", "errors": [str(e)]}, indent=2)
+
+
+def rlm_inspect_python_environment():
+    try:
+        info = {
+            "ok": True,
+            "tool": "inspect_python_environment",
+            "python_executable": sys.executable,
+            "python_version": sys.version,
+            "prefix": sys.prefix,
+            "base_prefix": getattr(sys, "base_prefix", sys.prefix),
+            "cwd": os.getcwd(),
+            "venv_active": sys.prefix != getattr(sys, "base_prefix", sys.prefix),
+            "env": {
+                "VIRTUAL_ENV": os.environ.get("VIRTUAL_ENV", ""),
+                "CONDA_PREFIX": os.environ.get("CONDA_PREFIX", ""),
+                "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            },
+            "site_paths": list(getattr(sys, "path", [])[:20]),
+        }
+        return json.dumps(info, indent=2)
+    except Exception as e:
+        return json.dumps({"ok": False, "tool": "inspect_python_environment", "errors": [str(e)]}, indent=2)
+
+
+def rlm_list_python_packages(limit: int = 500):
+    try:
+        cmd = [sys.executable, "-m", "pip", "list", "--format=json"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, encoding='utf-8', errors='replace')
+        if res.returncode != 0:
+            return json.dumps({"ok": False, "tool": "list_python_packages", "errors": [res.stderr.strip() or res.stdout.strip() or "pip list failed"]}, indent=2)
+        data = json.loads(res.stdout or "[]")
+        return json.dumps({"ok": True, "tool": "list_python_packages", "count": len(data), "packages": data[: int(limit)]}, indent=2)
+    except Exception as e:
+        return json.dumps({"ok": False, "tool": "list_python_packages", "errors": [str(e)]}, indent=2)
 
 def get_terminal_environment() -> Dict[str, Any]:
     """Detects the current terminal execution environment."""
@@ -1317,6 +2133,1134 @@ def rlm_project_summary(root: str = "."):
 
     return "\n".join(summary)
 
+
+def _rlm_run_git(repo_path: str, args: list[str], timeout: int = 30) -> tuple[bool, str]:
+    repo = Path(repo_path)
+    cmd = ["git", "-C", str(repo), *args]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding='utf-8', errors='replace')
+        output = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
+        return res.returncode == 0, output.strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def _rlm_git_repo_meta(repo_path: str = ".") -> tuple[bool, dict[str, Any], list[str]]:
+    repo = Path(repo_path)
+    ok_root, root_out = _rlm_run_git(str(repo), ["rev-parse", "--show-toplevel"])
+    if not ok_root:
+        return False, {}, [f"Not a git repository: {repo}"]
+    ok_branch, branch_out = _rlm_run_git(str(repo), ["rev-parse", "--abbrev-ref", "HEAD"])
+    ok_head, head_out = _rlm_run_git(str(repo), ["rev-parse", "--short", "HEAD"])
+    full_head_ok, full_head_out = _rlm_run_git(str(repo), ["rev-parse", "--verify", "HEAD"])
+    meta = {
+        "repo_path": str(repo.resolve()),
+        "repo_root": root_out.splitlines()[0].strip() if root_out else str(repo.resolve()),
+        "branch": branch_out.splitlines()[0].strip() if ok_branch and branch_out and "fatal:" not in branch_out.lower() else "UNKNOWN",
+        "head": head_out.splitlines()[0].strip() if ok_head and head_out and "fatal:" not in head_out.lower() else "UNBORN",
+        "has_head": bool(full_head_ok),
+    }
+    warnings = []
+    if not ok_branch and branch_out and "fatal:" not in branch_out.lower():
+        warnings.append(branch_out)
+    if not ok_head and head_out and "fatal:" not in head_out.lower():
+        warnings.append(head_out)
+    return True, meta, [w for w in warnings if w]
+
+
+def rlm_git_changed_files(repo_path: str = ".", include_untracked: bool = True):
+    ok_meta, meta, warnings = _rlm_git_repo_meta(repo_path)
+    if not ok_meta:
+        return _rlm_result("git_changed_files", ok=False, errors=warnings)
+    ok, output = _rlm_run_git(repo_path, ["status", "--short"])
+    if not ok:
+        return _rlm_result("git_changed_files", ok=False, errors=[output], warnings=warnings, data=meta)
+    files = []
+    counts = {"staged": 0, "unstaged": 0, "untracked": 0, "conflicts": 0}
+    for raw_line in output.splitlines():
+        if not raw_line.strip():
+            continue
+        line = raw_line.rstrip("\n")
+        if len(line) < 3:
+            continue
+        x_status = line[0]
+        y_status = line[1]
+        path_text = line[3:].strip()
+        if x_status == "?" and y_status == "?" and not include_untracked:
+            continue
+        record = {
+            "path": path_text,
+            "index_status": x_status,
+            "worktree_status": y_status,
+            "staged": x_status not in {" ", "?"},
+            "unstaged": y_status not in {" ", "?"},
+            "untracked": x_status == "?" and y_status == "?",
+            "conflict": x_status == "U" or y_status == "U" or (x_status == "A" and y_status == "A"),
+        }
+        if record["staged"]:
+            counts["staged"] += 1
+        if record["unstaged"]:
+            counts["unstaged"] += 1
+        if record["untracked"]:
+            counts["untracked"] += 1
+        if record["conflict"]:
+            counts["conflicts"] += 1
+        files.append(record)
+    return _rlm_result("git_changed_files", data={**meta, "files": files, "counts": counts}, warnings=warnings)
+
+
+def rlm_git_diff_analysis(repo_path: str = ".", src: str = "HEAD", dst: str = "", max_patch_chars: int = 4000):
+    ok_meta, meta, warnings = _rlm_git_repo_meta(repo_path)
+    if not ok_meta:
+        return _rlm_result("git_diff_analysis", ok=False, errors=warnings)
+    empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    base_src = src
+    if src == "HEAD" and not meta.get("has_head", False):
+        base_src = empty_tree
+    ref_args = [base_src] + ([dst] if dst else [])
+    ok_numstat, numstat = _rlm_run_git(repo_path, ["diff", "--numstat", *ref_args])
+    if not ok_numstat:
+        return _rlm_result("git_diff_analysis", ok=False, errors=[numstat], warnings=warnings, data=meta)
+    ok_stat, stat_out = _rlm_run_git(repo_path, ["diff", "--stat", *ref_args])
+    ok_patch, patch_out = _rlm_run_git(repo_path, ["diff", "--", *([] if src == "HEAD" and not dst else ref_args)]) if False else (True, "")
+    # keep patch retrieval independent to avoid ambiguous argument placement
+    ok_patch, patch_out = _rlm_run_git(repo_path, ["diff", *ref_args])
+    files = []
+    total_additions = 0
+    total_deletions = 0
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        added_raw, deleted_raw, path_text = parts[0], parts[1], parts[2]
+        additions = 0 if added_raw == "-" else int(added_raw)
+        deletions = 0 if deleted_raw == "-" else int(deleted_raw)
+        total_additions += additions
+        total_deletions += deletions
+        files.append({
+            "path": path_text,
+            "additions": additions,
+            "deletions": deletions,
+            "binary": added_raw == "-" or deleted_raw == "-",
+        })
+    files.sort(key=lambda item: (item["additions"] + item["deletions"]), reverse=True)
+    summary = {
+        **meta,
+        "range": {"src": src, "dst": dst},
+        "files_changed": len(files),
+        "additions": total_additions,
+        "deletions": total_deletions,
+        "files": files,
+        "stat": stat_out if ok_stat else "",
+        "patch_preview": patch_out[:max_patch_chars] if ok_patch else "",
+    }
+    return _rlm_result("git_diff_analysis", data=summary, warnings=warnings + ([] if ok_patch else [patch_out]))
+
+
+def rlm_git_blame_context(filepath: str, line: int, repo_path: str = "."):
+    """Retrieves blame metadata and the commit message associated with a specific line of code."""
+    ok_meta, meta, warnings = _rlm_git_repo_meta(repo_path)
+    if not ok_meta:
+        return _rlm_result("git_blame_context", ok=False, errors=warnings)
+    if not meta.get("has_head", False):
+        return _rlm_result("git_blame_context", ok=False, errors=["No commits available for blame context."], warnings=warnings, data=meta)
+    try:
+        ok, blame_out = _rlm_run_git(repo_path, ["blame", "-L", f"{line},{line}", "--porcelain", filepath])
+        if not ok:
+            return _rlm_result("git_blame_context", ok=False, errors=[blame_out], warnings=warnings, data=meta)
+        lines = blame_out.splitlines()
+        if not lines:
+            return _rlm_result("git_blame_context", ok=False, errors=["No blame output returned."], warnings=warnings, data=meta)
+        commit_hash = lines[0].split()[0]
+        info = {"commit": commit_hash, "author": "", "author_time": "", "summary": "", "line": int(line), "file": filepath}
+        code_line = ""
+        for item in lines[1:]:
+            if item.startswith("author "):
+                info["author"] = item[len("author "):]
+            elif item.startswith("author-time "):
+                try:
+                    info["author_time"] = datetime.fromtimestamp(int(item[len("author-time "):])).isoformat()
+                except Exception:
+                    info["author_time"] = item[len("author-time "):]
+            elif item.startswith("summary "):
+                info["summary"] = item[len("summary "):]
+            elif item.startswith("\t"):
+                code_line = item[1:]
+                break
+        ok_msg, msg_out = _rlm_run_git(repo_path, ["show", "-s", "--format=%B", commit_hash])
+        info["message"] = msg_out.strip() if ok_msg else ""
+        info["code"] = code_line
+        return _rlm_result("git_blame_context", data={**meta, **info}, warnings=warnings + ([] if ok_msg else [msg_out]))
+    except Exception as e:
+        return _rlm_result("git_blame_context", ok=False, errors=[str(e)], warnings=warnings, data=meta if ok_meta else {})
+
+
+def rlm_git_commit_message_draft(repo_path: str = ".", src: str = "HEAD", dst: str = ""):
+    diff_data = json.loads(rlm_git_diff_analysis(repo_path=repo_path, src=src, dst=dst))
+    if not diff_data.get("ok"):
+        return _rlm_result("git_commit_message_draft", ok=False, errors=diff_data.get("errors", []), warnings=diff_data.get("warnings", []))
+    changed = diff_data.get("data", {})
+    files = changed.get("files", [])
+    if not files:
+        return _rlm_result("git_commit_message_draft", data={**changed, "title": "chore: no changes detected", "body": "No diff content found."}, warnings=diff_data.get("warnings", []))
+    extensions = [Path(item.get("path", "")).suffix.lower() for item in files]
+    ext_counts: dict[str, int] = {}
+    for ext in extensions:
+        ext_counts[ext or "[no extension]"] = ext_counts.get(ext or "[no extension]", 0) + 1
+    dominant_ext = max(ext_counts.items(), key=lambda item: item[1])[0]
+    area = "project"
+    if dominant_ext in {".py"}:
+        area = "python"
+    elif dominant_ext in {".ts", ".tsx", ".js", ".jsx"}:
+        area = "web"
+    elif dominant_ext in {".md"}:
+        area = "docs"
+    top_files = [item["path"] for item in files[:3]]
+    title = f"feat({area}): update {', '.join(Path(path).stem for path in top_files[:2])}" if top_files else f"chore({area}): update repository"
+    bullet_lines = []
+    for item in files[:6]:
+        bullet_lines.append(f"- {item['path']}: +{item['additions']} / -{item['deletions']}")
+    body = "\n".join([
+        f"Files changed: {changed.get('files_changed', 0)}",
+        f"Additions: {changed.get('additions', 0)}",
+        f"Deletions: {changed.get('deletions', 0)}",
+        "",
+        "Highlights:",
+        *bullet_lines,
+    ])
+    return _rlm_result(
+        "git_commit_message_draft",
+        data={**changed, "title": title[:72], "body": body, "top_files": top_files},
+        warnings=diff_data.get("warnings", []),
+    )
+
+
+def _rlm_config_inventory(root: str = ".") -> list[dict[str, Any]]:
+    root_path = Path(root)
+    config_names = [
+        "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json",
+        "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "poetry.lock",
+        "Dockerfile", "docker-compose.yml", "docker-compose.yaml", ".env", ".env.example",
+        "README.md", "Makefile", ".github/workflows",
+    ]
+    inventory = []
+    for name in config_names:
+        path = root_path / name
+        if path.exists():
+            inventory.append({
+                "path": str(path),
+                "type": "directory" if path.is_dir() else "file",
+                "size": path.stat().st_size if path.is_file() else 0,
+            })
+    return inventory
+
+
+def _rlm_detect_entrypoints(root: str = ".") -> list[dict[str, Any]]:
+    root_path = Path(root)
+    entrypoints = []
+    candidate_names = {
+        "main.py", "app.py", "manage.py", "server.py", "index.js", "index.ts", "main.ts",
+        "main.js", "vite.config.ts", "next.config.js", "wsgi.py", "asgi.py",
+    }
+    for path in _rlm_collect_files_multi(root, ["*.py", "*.js", "*.ts", "*.tsx", "*.jsx"]):
+        if path.name in candidate_names:
+            entrypoints.append({"path": str(path), "reason": f"well-known filename '{path.name}'"})
+            continue
+        try:
+            text = _rlm_read_text(path)
+        except Exception:
+            continue
+        if path.suffix == ".py" and re.search(r"if\s+__name__\s*==\s*['\"]__main__['\"]", text):
+            entrypoints.append({"path": str(path), "reason": "python __main__ guard"})
+        elif path.suffix in {".js", ".jsx", ".ts", ".tsx"} and re.search(r"(createServer|app\.listen|ReactDOM\.createRoot|new\s+Vue|bootstrapApplication)", text):
+            entrypoints.append({"path": str(path), "reason": "startup/bootstrap pattern"})
+    package_json = root_path / "package.json"
+    if package_json.exists():
+        try:
+            pkg = json.loads(package_json.read_text(encoding='utf-8'))
+            scripts = pkg.get("scripts", {}) if isinstance(pkg, dict) else {}
+            for name, command in scripts.items():
+                if name in {"start", "dev", "build", "test"}:
+                    entrypoints.append({"path": str(package_json), "reason": f"package.json script '{name}'", "command": command})
+        except Exception:
+            pass
+    return entrypoints
+
+
+def _rlm_detect_languages(root: str = ".") -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for path in _rlm_collect_files_multi(root, ["*.py", "*.js", "*.jsx", "*.ts", "*.tsx", "*.json", "*.md", "*.toml", "*.yml", "*.yaml"]):
+        ext = path.suffix.lower() or "[no extension]"
+        counts[ext] = counts.get(ext, 0) + 1
+    return counts
+
+
+def rlm_project_relationships(root: str = ".", max_nodes: int = 120):
+    try:
+        nodes = []
+        edges = []
+        root_path = Path(root).resolve()
+        files = _rlm_collect_files_multi(root, ["*.py", "*.js", "*.jsx", "*.ts", "*.tsx"])
+        for path in files[:max_nodes]:
+            nodes.append(str(path))
+            ext = path.suffix.lower()
+            try:
+                if ext == ".py":
+                    graph = json.loads(rlm_python_import_graph(str(path), root=str(root_path)))
+                    for dep in graph.get("data", {}).get("local_dependencies", []):
+                        edges.append({"from": str(path), "to": dep, "kind": "imports"})
+                else:
+                    for dep in rlm_map_dependencies(str(path)) if isinstance(rlm_map_dependencies(str(path)), list) else []:
+                        edges.append({"from": str(path), "to": dep, "kind": "imports"})
+            except Exception:
+                continue
+        grouped: dict[str, dict[str, Any]] = {}
+        for edge in edges:
+            parent = Path(edge["from"]).parent.name or "."
+            grouped.setdefault(parent, {"module": parent, "outbound": 0, "targets": set()})
+            grouped[parent]["outbound"] += 1
+            grouped[parent]["targets"].add(Path(edge["to"]).parent.name or ".")
+        modules = []
+        for item in grouped.values():
+            modules.append({
+                "module": item["module"],
+                "outbound_edges": item["outbound"],
+                "target_modules": sorted(item["targets"]),
+            })
+        return _rlm_result("project_relationships", data={"nodes": nodes, "edges": edges[:300], "modules": sorted(modules, key=lambda m: m["outbound_edges"], reverse=True)})
+    except Exception as e:
+        return _rlm_result("project_relationships", ok=False, errors=[str(e)])
+
+
+def rlm_project_map(root: str = "."):
+    try:
+        root_path = Path(root).resolve()
+        configs = _rlm_config_inventory(root)
+        entrypoints = _rlm_detect_entrypoints(root)
+        languages = _rlm_detect_languages(root)
+        structure = []
+        for item in sorted(root_path.iterdir()):
+            if item.name.startswith('.') or item.name == '__pycache__':
+                continue
+            structure.append({
+                "name": item.name,
+                "type": "directory" if item.is_dir() else "file",
+            })
+        relationships = json.loads(rlm_project_relationships(root))
+        return _rlm_result(
+            "project_map",
+            data={
+                "root": str(root_path),
+                "configs": configs,
+                "entrypoints": entrypoints,
+                "language_counts": languages,
+                "top_level": structure,
+                "relationships": relationships.get("data", {}),
+            },
+            warnings=relationships.get("warnings", []),
+            errors=relationships.get("errors", []),
+            ok=relationships.get("ok", True),
+        )
+    except Exception as e:
+        return _rlm_result("project_map", ok=False, errors=[str(e)])
+
+
+class _RLMHTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.title = ""
+        self._in_title = False
+        self._chunks: list[str] = []
+        self._capture_href = ""
+        self._current_link_text: list[str] = []
+        self.headings: list[dict[str, Any]] = []
+        self.links: list[dict[str, Any]] = []
+        self.paragraphs: list[str] = []
+        self._current_paragraph: list[str] = []
+        self._heading_tag = ""
+        self._heading_buffer: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        attrs_dict = dict(attrs)
+        if tag == "title":
+            self._in_title = True
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._heading_tag = tag
+            self._heading_buffer = []
+        elif tag == "a":
+            self._capture_href = attrs_dict.get("href", "")
+            self._current_link_text = []
+        elif tag in {"p", "li", "article", "section"}:
+            self._current_paragraph = []
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "title":
+            self._in_title = False
+        elif tag == self._heading_tag and self._heading_buffer:
+            heading_text = " ".join(self._heading_buffer).strip()
+            if heading_text:
+                self.headings.append({"level": tag, "text": heading_text[:400]})
+            self._heading_tag = ""
+            self._heading_buffer = []
+        elif tag == "a":
+            text = " ".join(self._current_link_text).strip()
+            if text or self._capture_href:
+                self.links.append({"href": self._capture_href[:800], "text": text[:300]})
+            self._capture_href = ""
+            self._current_link_text = []
+        elif tag in {"p", "li", "article", "section"}:
+            text = " ".join(self._current_paragraph).strip()
+            if text:
+                self.paragraphs.append(text[:1200])
+            self._current_paragraph = []
+
+    def handle_data(self, data):
+        text = data.strip()
+        if not text:
+            return
+        if self._in_title and not self.title:
+            self.title = text[:300]
+        self._chunks.append(text)
+        if self._heading_tag:
+            self._heading_buffer.append(text)
+        if self._capture_href:
+            self._current_link_text.append(text)
+        if self._current_paragraph is not None:
+            self._current_paragraph.append(text)
+
+    def get_text(self) -> str:
+        text = html.unescape("\n".join(self._chunks))
+        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+        return "\n".join(line for line in lines if line)
+
+
+def _rlm_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return {"__kind__": "path", "value": str(value)}
+    if isinstance(value, dict):
+        return {str(k): _rlm_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_rlm_json_safe(v) for v in value]
+    return {"__kind__": "repr", "type": type(value).__name__, "repr": repr(value)[:1000]}
+
+
+def _rlm_json_restore(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_rlm_json_restore(v) for v in value]
+    if isinstance(value, dict):
+        kind = value.get("__kind__")
+        if kind == "path":
+            return Path(value.get("value", ""))
+        if kind == "repr":
+            return value
+        return {k: _rlm_json_restore(v) for k, v in value.items()}
+    return value
+
+
+def _rlm_notebook_sessions() -> dict[str, Any]:
+    if not NOTEBOOK_SESSION_FILE.exists():
+        return {}
+    try:
+        data = _rlm_load_json_file(NOTEBOOK_SESSION_FILE)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _rlm_save_notebook_sessions(data: dict[str, Any]):
+    _rlm_save_json_file(NOTEBOOK_SESSION_FILE, data)
+
+
+def _rlm_notebook_session_key(path: Path) -> str:
+    return str(path.resolve())
+
+
+def _rlm_get_notebook_session(path: Path) -> dict[str, Any]:
+    sessions = _rlm_notebook_sessions()
+    return dict(sessions.get(_rlm_notebook_session_key(path), {}))
+
+
+def _rlm_set_notebook_session(path: Path, session: dict[str, Any]):
+    sessions = _rlm_notebook_sessions()
+    sessions[_rlm_notebook_session_key(path)] = session
+    _rlm_save_notebook_sessions(sessions)
+
+
+def _rlm_clear_notebook_session(path: Path):
+    sessions = _rlm_notebook_sessions()
+    sessions.pop(_rlm_notebook_session_key(path), None)
+    _rlm_save_notebook_sessions(sessions)
+
+
+def _rlm_load_json_file(path: Path) -> Any:
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def _rlm_save_json_file(path: Path, data: Any):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding='utf-8')
+
+
+def _rlm_notebook_source_text(cell: dict[str, Any]) -> str:
+    source = cell.get("source", "")
+    if isinstance(source, list):
+        return "".join(source)
+    return str(source or "")
+
+
+def _rlm_notebook_set_source(cell: dict[str, Any], source: str):
+    if source and not source.endswith("\n"):
+        source = source + "\n"
+    cell["source"] = source.splitlines(keepends=True)
+
+
+def _rlm_load_notebook(filepath: str) -> tuple[Path | None, dict[str, Any] | None, str | None]:
+    path = Path(filepath)
+    if not path.exists():
+        return None, None, f"File not found: {filepath}"
+    try:
+        data = _rlm_load_json_file(path)
+        if not isinstance(data, dict) or "cells" not in data:
+            return None, None, f"Invalid notebook structure in {filepath}"
+        return path, data, None
+    except Exception as e:
+        return None, None, str(e)
+
+
+def _rlm_notebook_language(nb: dict[str, Any]) -> str:
+    metadata = nb.get("metadata", {}) if isinstance(nb, dict) else {}
+    kernelspec = metadata.get("kernelspec", {}) if isinstance(metadata, dict) else {}
+    language_info = metadata.get("language_info", {}) if isinstance(metadata, dict) else {}
+    return str(language_info.get("name") or kernelspec.get("language") or "python")
+
+
+def _rlm_execute_notebook_cell(source: str, env: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    outputs: list[dict[str, Any]] = []
+    error_text = None
+    try:
+        compiled: Any = source
+        tree = ast.parse(source, filename="<notebook-cell>", mode="exec")
+        last_expr_value = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last_expr = tree.body[-1].value
+            tree.body = tree.body[:-1]
+            compiled = compile(tree, filename="<notebook-cell>", mode="exec")
+            expr_compiled = compile(ast.Expression(last_expr), filename="<notebook-cell>", mode="eval")
+        else:
+            compiled = compile(tree, filename="<notebook-cell>", mode="exec")
+            expr_compiled = None
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            exec(compiled, env, env)
+            if expr_compiled is not None:
+                last_expr_value = eval(expr_compiled, env, env)
+        if stdout_buf.getvalue():
+            outputs.append({"output_type": "stream", "name": "stdout", "text": stdout_buf.getvalue().splitlines(keepends=True)})
+        if stderr_buf.getvalue():
+            outputs.append({"output_type": "stream", "name": "stderr", "text": stderr_buf.getvalue().splitlines(keepends=True)})
+        if expr_compiled is not None and last_expr_value is not None:
+            outputs.append({
+                "output_type": "execute_result",
+                "data": {"text/plain": repr(last_expr_value)},
+                "metadata": {},
+                "execution_count": env.get("_execution_count", 1),
+            })
+    except Exception:
+        error_text = traceback.format_exc()
+        outputs.append({
+            "output_type": "error",
+            "ename": "ExecutionError",
+            "evalue": error_text.splitlines()[-1] if error_text else "ExecutionError",
+            "traceback": error_text.splitlines(),
+        })
+    return outputs, error_text
+
+
+def rlm_notebook_summary(filepath: str):
+    path, nb, error = _rlm_load_notebook(filepath)
+    if error:
+        return _rlm_result("notebook_summary", ok=False, errors=[error])
+    session = _rlm_get_notebook_session(path)
+    cells = []
+    for index, cell in enumerate(nb.get("cells", [])):
+        source = _rlm_notebook_source_text(cell)
+        outputs = cell.get("outputs", []) if isinstance(cell, dict) else []
+        cells.append({
+            "index": index,
+            "cell_type": cell.get("cell_type", "unknown"),
+            "language": cell.get("metadata", {}).get("language", _rlm_notebook_language(nb)),
+            "execution_count": cell.get("execution_count"),
+            "source_preview": source[:300],
+            "line_count": len(source.splitlines()),
+            "output_count": len(outputs),
+            "output_types": [output.get("output_type", "unknown") for output in outputs if isinstance(output, dict)],
+        })
+    return _rlm_result(
+        "notebook_summary",
+        data={
+            "file": str(path),
+            "notebook_format": nb.get("nbformat"),
+            "notebook_minor": nb.get("nbformat_minor"),
+            "language": _rlm_notebook_language(nb),
+            "cell_count": len(cells),
+            "cells": cells,
+            "session": {
+                "session_id": session.get("session_id", ""),
+                "execution_count": session.get("execution_count", 0),
+                "last_run": session.get("last_run", ""),
+                "persistent": bool(session),
+            },
+        },
+    )
+
+
+def rlm_notebook_edit_cell(filepath: str, index: int, source: str = "", cell_type: str = "code", operation: str = "replace"):
+    path, nb, error = _rlm_load_notebook(filepath)
+    if error:
+        return _rlm_result("notebook_edit_cell", ok=False, errors=[error])
+    cells = list(nb.get("cells", []))
+    idx = int(index)
+    op = str(operation or "replace").lower()
+    if op == "delete":
+        if idx < 0 or idx >= len(cells):
+            return _rlm_result("notebook_edit_cell", ok=False, errors=[f"Cell index out of range: {idx}"])
+        removed = cells.pop(idx)
+        nb["cells"] = cells
+        _rlm_save_json_file(path, nb)
+        return _rlm_result("notebook_edit_cell", data={"file": str(path), "operation": op, "index": idx, "removed_type": removed.get("cell_type", "unknown")})
+    new_cell = {
+        "cell_type": cell_type,
+        "metadata": {},
+        "source": [],
+    }
+    if cell_type == "code":
+        new_cell["execution_count"] = None
+        new_cell["outputs"] = []
+    _rlm_notebook_set_source(new_cell, source)
+    if op == "replace":
+        if idx < 0 or idx >= len(cells):
+            return _rlm_result("notebook_edit_cell", ok=False, errors=[f"Cell index out of range: {idx}"])
+        existing = cells[idx]
+        new_cell["metadata"] = existing.get("metadata", {}) if isinstance(existing, dict) else {}
+        if new_cell["cell_type"] == "code":
+            new_cell["outputs"] = existing.get("outputs", []) if isinstance(existing, dict) else []
+            new_cell["execution_count"] = existing.get("execution_count") if isinstance(existing, dict) else None
+        cells[idx] = new_cell
+    elif op == "insert_before":
+        idx = max(0, idx)
+        cells.insert(idx, new_cell)
+    elif op == "insert_after":
+        idx = min(len(cells), idx + 1)
+        cells.insert(idx, new_cell)
+    else:
+        return _rlm_result("notebook_edit_cell", ok=False, errors=[f"Unsupported operation: {operation}"])
+    nb["cells"] = cells
+    _rlm_save_json_file(path, nb)
+    return _rlm_result("notebook_edit_cell", data={"file": str(path), "operation": op, "index": idx, "cell_type": new_cell["cell_type"]})
+
+
+def rlm_notebook_run(filepath: str, cell_index: int | None = None, persist_output: bool = True, persist_session: bool = True, reset_session: bool = False):
+    path, nb, error = _rlm_load_notebook(filepath)
+    if error:
+        return _rlm_result("notebook_run", ok=False, errors=[error])
+    language = _rlm_notebook_language(nb)
+    if language.lower() != "python":
+        return _rlm_result("notebook_run", ok=False, errors=[f"Unsupported notebook language: {language}"])
+    cells = list(nb.get("cells", []))
+    target = None if cell_index is None else int(cell_index)
+    if target is not None and (target < 0 or target >= len(cells)):
+        return _rlm_result("notebook_run", ok=False, errors=[f"Cell index out of range: {target}"])
+    session = {} if reset_session else _rlm_get_notebook_session(path)
+    env: dict[str, Any] = {"__name__": "__main__"}
+    if session.get("globals"):
+        restored = _rlm_json_restore(session.get("globals", {}))
+        if isinstance(restored, dict):
+            env.update(restored)
+    executed = []
+    failed = False
+    exec_count = int(session.get("execution_count", 0) or 0) + 1
+    for index, cell in enumerate(cells):
+        if cell.get("cell_type") != "code":
+            continue
+        if target is not None and index > target:
+            break
+        source = _rlm_notebook_source_text(cell)
+        env["_execution_count"] = exec_count
+        outputs, error_text = _rlm_execute_notebook_cell(source, env)
+        cell["outputs"] = outputs if persist_output else []
+        cell["execution_count"] = exec_count
+        executed.append({
+            "index": index,
+            "execution_count": exec_count,
+            "output_count": len(outputs),
+            "error": bool(error_text),
+        })
+        exec_count += 1
+        if error_text:
+            failed = True
+            break
+        if target is not None and index == target:
+            break
+    if persist_output:
+        nb["cells"] = cells
+        _rlm_save_json_file(path, nb)
+    session_id = session.get("session_id") or str(uuid.uuid4())[:12]
+    session_summary = {
+        "session_id": session_id,
+        "execution_count": exec_count - 1,
+        "last_run": datetime.now().isoformat(),
+        "globals": _rlm_json_safe({
+            k: v for k, v in env.items()
+            if not k.startswith("__") and k != "_execution_count" and not callable(v) and not isinstance(v, type(sys))
+        }),
+        "last_target_cell": target,
+    }
+    if persist_session:
+        _rlm_set_notebook_session(path, session_summary)
+    return _rlm_result(
+        "notebook_run",
+        ok=not failed,
+        data={
+            "file": str(path),
+            "language": language,
+            "executed_cells": executed,
+            "target_cell": target,
+            "persist_output": bool(persist_output),
+            "persist_session": bool(persist_session),
+            "session": {
+                "session_id": session_id,
+                "execution_count": session_summary["execution_count"],
+                "last_run": session_summary["last_run"],
+            },
+        },
+        errors=["Notebook execution stopped due to a cell error."] if failed else [],
+    )
+
+
+def rlm_notebook_kernel_info(filepath: str):
+    path, nb, error = _rlm_load_notebook(filepath)
+    if error:
+        return _rlm_result("notebook_kernel_info", ok=False, errors=[error])
+    metadata = nb.get("metadata", {}) if isinstance(nb, dict) else {}
+    return _rlm_result(
+        "notebook_kernel_info",
+        data={
+            "file": str(path),
+            "kernelspec": metadata.get("kernelspec", {}),
+            "language_info": metadata.get("language_info", {}),
+            "session": _rlm_get_notebook_session(path),
+            "python_environment": json.loads(rlm_inspect_python_environment()),
+        },
+    )
+
+
+def rlm_notebook_session_status(filepath: str):
+    path, _, error = _rlm_load_notebook(filepath)
+    if error:
+        return _rlm_result("notebook_session_status", ok=False, errors=[error])
+    session = _rlm_get_notebook_session(path)
+    return _rlm_result(
+        "notebook_session_status",
+        data={
+            "file": str(path),
+            "session_exists": bool(session),
+            "session": {
+                "session_id": session.get("session_id", ""),
+                "execution_count": session.get("execution_count", 0),
+                "last_run": session.get("last_run", ""),
+                "globals_preview": sorted(list((session.get("globals") or {}).keys()))[:50] if isinstance(session.get("globals"), dict) else [],
+                "last_target_cell": session.get("last_target_cell"),
+            },
+        },
+    )
+
+
+def rlm_notebook_clear_session(filepath: str):
+    path, _, error = _rlm_load_notebook(filepath)
+    if error:
+        return _rlm_result("notebook_clear_session", ok=False, errors=[error])
+    _rlm_clear_notebook_session(path)
+    return _rlm_result("notebook_clear_session", data={"file": str(path), "cleared": True})
+
+
+def rlm_notebook_install_package(filepath: str, package: str, upgrade: bool = False):
+    result = json.loads(rlm_list_python_packages(limit=5000))
+    before = {item.get("name"): item.get("version") for item in result.get("packages", [])} if result.get("ok") else {}
+    cmd = [sys.executable, "-m", "pip", "install", package]
+    if upgrade:
+        cmd.append("--upgrade")
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300, encoding='utf-8', errors='replace')
+        after_result = json.loads(rlm_list_python_packages(limit=5000))
+        after = {item.get("name"): item.get("version") for item in after_result.get("packages", [])} if after_result.get("ok") else {}
+        return _rlm_result(
+            "notebook_install_package",
+            ok=res.returncode == 0,
+            data={
+                "file": filepath,
+                "package": package,
+                "upgrade": bool(upgrade),
+                "returncode": res.returncode,
+                "before_version": before.get(package),
+                "after_version": after.get(package),
+                "output": ((res.stdout or "") + ("\n" + res.stderr if res.stderr else ""))[:4000],
+            },
+            errors=[] if res.returncode == 0 else [res.stderr.strip() or res.stdout.strip() or "pip install failed"],
+        )
+    except Exception as e:
+        return _rlm_result("notebook_install_package", ok=False, errors=[str(e)], data={"file": filepath, "package": package, "upgrade": bool(upgrade)})
+
+
+def _rlm_db_profiles() -> dict[str, Any]:
+    if not DB_PROFILES_FILE.exists():
+        return {}
+    try:
+        data = _rlm_load_json_file(DB_PROFILES_FILE)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _rlm_save_db_profiles(data: dict[str, Any]):
+    _rlm_save_json_file(DB_PROFILES_FILE, data)
+
+
+def rlm_db_save_profile(name: str, database_path: str, kind: str = "sqlite", description: str = ""):
+    if not name.strip():
+        return _rlm_result("db_save_profile", ok=False, errors=["Profile name is required."])
+    if kind != "sqlite":
+        return _rlm_result("db_save_profile", ok=False, errors=["Only sqlite profiles are currently supported."])
+    path = Path(database_path)
+    if not path.exists():
+        return _rlm_result("db_save_profile", ok=False, errors=[f"Database file not found: {database_path}"])
+    profiles = _rlm_db_profiles()
+    profiles[name] = {"kind": kind, "database_path": str(path), "description": description}
+    _rlm_save_db_profiles(profiles)
+    return _rlm_result("db_save_profile", data={"name": name, "profile": profiles[name]})
+
+
+def rlm_db_list_profiles():
+    profiles = _rlm_db_profiles()
+    return _rlm_result("db_list_profiles", data={"profiles": profiles, "count": len(profiles)})
+
+
+def _rlm_db_resolve(profile_name: str = "", database_path: str = "") -> tuple[Path | None, dict[str, Any] | None, str | None]:
+    if database_path:
+        path = Path(database_path)
+        if not path.exists():
+            return None, None, f"Database file not found: {database_path}"
+        return path, {"kind": "sqlite", "database_path": str(path)}, None
+    profiles = _rlm_db_profiles()
+    if not profile_name:
+        return None, None, "Either profile_name or database_path is required."
+    profile = profiles.get(profile_name)
+    if not profile:
+        return None, None, f"Database profile not found: {profile_name}"
+    path = Path(profile.get("database_path", ""))
+    if not path.exists():
+        return None, profile, f"Database file not found: {path}"
+    return path, profile, None
+
+
+def _rlm_sqlite_connect_readonly(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def rlm_db_schema(profile_name: str = "", database_path: str = ""):
+    path, profile, error = _rlm_db_resolve(profile_name=profile_name, database_path=database_path)
+    if error:
+        return _rlm_result("db_schema", ok=False, errors=[error])
+    try:
+        conn = _rlm_sqlite_connect_readonly(path)
+        conn.row_factory = sqlite3.Row
+        objects = []
+        tables = []
+        with conn:
+            rows = conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").fetchall()
+            for row in rows:
+                record = dict(row)
+                if record.get("type") == "table":
+                    columns = [dict(col) for col in conn.execute(f"PRAGMA table_info('{record['name']}')").fetchall()]
+                    tables.append({"name": record["name"], "columns": columns})
+                objects.append(record)
+        conn.close()
+        return _rlm_result("db_schema", data={"database_path": str(path), "profile": profile, "objects": objects, "tables": tables})
+    except Exception as e:
+        return _rlm_result("db_schema", ok=False, errors=[str(e)], data={"database_path": str(path), "profile": profile})
+
+
+def _rlm_is_safe_readonly_query(query: str) -> tuple[bool, str]:
+    stripped = (query or "").strip().rstrip(';')
+    if not stripped:
+        return False, "Query is required."
+    lowered = stripped.lower()
+    dangerous = re.search(r"\b(insert|update|delete|drop|alter|create|replace|truncate|attach|detach|vacuum|reindex|begin|commit|rollback|pragma\s+\w+\s*=)\b", lowered)
+    if dangerous:
+        return False, f"Read-only database tool rejected potentially mutating SQL near '{dangerous.group(1)}'."
+    if not re.match(r"^(select|with|pragma|explain)\b", lowered):
+        return False, "Only read-only SELECT/WITH/PRAGMA/EXPLAIN queries are allowed."
+    return True, "allowed"
+
+
+def rlm_db_query(query: str, profile_name: str = "", database_path: str = "", limit: int = 200):
+    path, profile, error = _rlm_db_resolve(profile_name=profile_name, database_path=database_path)
+    if error:
+        return _rlm_result("db_query", ok=False, errors=[error])
+    allowed, reason = _rlm_is_safe_readonly_query(query)
+    if not allowed:
+        return _rlm_result("db_query", ok=False, errors=[reason], data={"database_path": str(path), "profile": profile})
+    try:
+        conn = _rlm_sqlite_connect_readonly(path)
+        conn.row_factory = sqlite3.Row
+        with conn:
+            cursor = conn.execute(query)
+            rows = cursor.fetchmany(max(1, int(limit)))
+            columns = [item[0] for item in (cursor.description or [])]
+            data_rows = [dict(row) for row in rows]
+        conn.close()
+        return _rlm_result("db_query", data={"database_path": str(path), "profile": profile, "columns": columns, "rows": data_rows, "row_count": len(data_rows), "limit": int(limit)})
+    except Exception as e:
+        return _rlm_result("db_query", ok=False, errors=[str(e)], data={"database_path": str(path), "profile": profile})
+
+
+def rlm_db_migration_status(root: str = "."):
+    root_path = Path(root)
+    migration_dirs = []
+    migration_files = []
+    for candidate in ["migrations", "alembic", "db/migrations", "prisma/migrations"]:
+        path = root_path / candidate
+        if path.exists():
+            migration_dirs.append(str(path))
+            for file in path.rglob("*"):
+                if file.is_file():
+                    migration_files.append(str(file))
+    database_files = [str(path) for path in _rlm_collect_files_multi(root, ["*.db", "*.sqlite", "*.sqlite3"])[:20]]
+    applied = []
+    for db_file in database_files[:5]:
+        try:
+            conn = _rlm_sqlite_connect_readonly(Path(db_file))
+            conn.row_factory = sqlite3.Row
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            db_status = {"database_path": db_file, "tables": sorted(tables)}
+            if "alembic_version" in tables:
+                db_status["alembic_version"] = [dict(row) for row in conn.execute("SELECT * FROM alembic_version").fetchall()]
+            if "django_migrations" in tables:
+                db_status["django_migrations_count"] = conn.execute("SELECT COUNT(*) FROM django_migrations").fetchone()[0]
+            applied.append(db_status)
+            conn.close()
+        except Exception:
+            continue
+    return _rlm_result("db_migration_status", data={"migration_dirs": migration_dirs, "migration_files": migration_files[:200], "databases": database_files, "applied": applied})
+
+
+def _rlm_fetch_url(url: str, timeout: int = 20) -> tuple[bool, dict[str, Any]]:
+    try:
+        headers = dict(COMMON_HEADERS)
+        headers["User-Agent"] = COMMON_HEADERS.get("User-Agent", "FlexiBot/1.0")
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read()
+            content_type = res.headers.get("Content-Type", "")
+            charset = res.headers.get_content_charset() or "utf-8"
+            text = raw.decode(charset, errors='replace')
+            extractor = _RLMHTMLTextExtractor()
+            extractor.feed(text)
+            return True, {
+                "url": url,
+                "final_url": res.geturl(),
+                "status": getattr(res, "status", 200),
+                "content_type": content_type,
+                "title": extractor.title,
+                "text": extractor.get_text(),
+                "headings": extractor.headings[:50],
+                "links": extractor.links[:100],
+                "paragraphs": extractor.paragraphs[:100],
+                "html": text,
+            }
+    except Exception as e:
+        return False, {"url": url, "error": str(e)}
+
+
+def rlm_fetch_webpage(url: str, timeout: int = 20, max_chars: int = 12000):
+    ok, payload = _rlm_fetch_url(url, timeout=timeout)
+    if not ok:
+        return _rlm_result("fetch_webpage", ok=False, errors=[payload.get("error", "Fetch failed")], data={"url": url})
+    return _rlm_result(
+        "fetch_webpage",
+        data={
+            "url": payload["url"],
+            "final_url": payload["final_url"],
+            "status": payload["status"],
+            "content_type": payload["content_type"],
+            "title": payload["title"],
+            "text": payload["text"][:max_chars],
+            "headings": payload.get("headings", [])[:20],
+        },
+    )
+
+
+def rlm_extract_web_structure(url: str, timeout: int = 20, max_items: int = 20):
+    ok, payload = _rlm_fetch_url(url, timeout=timeout)
+    if not ok:
+        return _rlm_result("extract_web_structure", ok=False, errors=[payload.get("error", "Fetch failed")], data={"url": url})
+    return _rlm_result(
+        "extract_web_structure",
+        data={
+            "url": url,
+            "title": payload.get("title", ""),
+            "headings": payload.get("headings", [])[:max_items],
+            "links": payload.get("links", [])[:max_items],
+            "paragraphs": payload.get("paragraphs", [])[:max_items],
+        },
+    )
+
+
+def rlm_extract_doc_section(url: str, query: str, timeout: int = 20, max_matches: int = 5):
+    ok, payload = _rlm_fetch_url(url, timeout=timeout)
+    if not ok:
+        return _rlm_result("extract_doc_section", ok=False, errors=[payload.get("error", "Fetch failed")], data={"url": url, "query": query})
+    lines = payload.get("text", "").splitlines()
+    matches = []
+    lowered_query = (query or "").lower().strip()
+    for idx, line in enumerate(lines):
+        if lowered_query and lowered_query not in line.lower():
+            continue
+        start = max(0, idx - 2)
+        end = min(len(lines), idx + 3)
+        matches.append({"line": idx + 1, "excerpt": "\n".join(lines[start:end])[:1200]})
+        if len(matches) >= max_matches:
+            break
+    return _rlm_result("extract_doc_section", data={"url": url, "query": query, "title": payload.get("title", ""), "matches": matches}, warnings=[] if matches else [f"No matches found for '{query}'."])
+
+
+def rlm_summarize_web_reference(url: str, timeout: int = 20, max_points: int = 8):
+    ok, payload = _rlm_fetch_url(url, timeout=timeout)
+    if not ok:
+        return _rlm_result("summarize_web_reference", ok=False, errors=[payload.get("error", "Fetch failed")], data={"url": url})
+    lines = [line for line in payload.get("text", "").splitlines() if len(line.strip()) > 20]
+    bullets = []
+    for line in lines[:max_points]:
+        bullets.append(line[:220])
+    return _rlm_result(
+        "summarize_web_reference",
+        data={
+            "url": url,
+            "title": payload.get("title", ""),
+            "summary_points": bullets,
+            "preview": "\n".join(lines[:12])[:2000],
+        },
+    )
+
+
+def _rlm_query_terms(query: str) -> list[str]:
+    return [term for term in re.findall(r"[A-Za-z0-9_]{3,}", (query or "").lower()) if term]
+
+
+def _rlm_score_text_relevance(text: str, query_terms: list[str]) -> int:
+    lowered = (text or "").lower()
+    score = 0
+    for term in query_terms:
+        if term in lowered:
+            score += lowered.count(term)
+    return score
+
+
+def rlm_research_web(query: str, urls: list[str] | None = None, timeout: int = 20, max_sources: int = 5):
+    query_terms = _rlm_query_terms(query)
+    candidate_urls = [url for url in (urls or []) if url][:max_sources]
+    warnings = []
+    if not candidate_urls:
+        encoded = urllib.parse.quote_plus(query)
+        search_url = f"https://duckduckgo.com/html/?q={encoded}"
+        ok, payload = _rlm_fetch_url(search_url, timeout=timeout)
+        if ok:
+            hrefs = []
+            for link in payload.get("links", []):
+                href = str(link.get("href", ""))
+                if href.startswith("http") and href not in hrefs:
+                    hrefs.append(href)
+                if len(hrefs) >= max_sources:
+                    break
+            candidate_urls = hrefs
+        else:
+            warnings.append(payload.get("error", "Search fetch failed"))
+    findings = []
+    for url in candidate_urls[:max_sources]:
+        ok, payload = _rlm_fetch_url(url, timeout=timeout)
+        if not ok:
+            warnings.append(f"{url}: {payload.get('error', 'Fetch failed')}")
+            continue
+        paragraphs = payload.get("paragraphs", []) or payload.get("text", "").splitlines()
+        ranked = []
+        for paragraph in paragraphs:
+            score = _rlm_score_text_relevance(paragraph, query_terms)
+            if score > 0:
+                ranked.append((score, paragraph[:1200]))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        findings.append({
+            "url": url,
+            "title": payload.get("title", ""),
+            "score": sum(item[0] for item in ranked[:3]),
+            "highlights": [item[1] for item in ranked[:3]],
+        })
+    findings.sort(key=lambda item: item.get("score", 0), reverse=True)
+    summary_points = []
+    for finding in findings[:max_sources]:
+        if finding.get("highlights"):
+            summary_points.append(f"{finding.get('title') or finding.get('url')}: {finding['highlights'][0][:220]}")
+    return _rlm_result(
+        "research_web",
+        data={
+            "query": query,
+            "sources": findings[:max_sources],
+            "summary_points": summary_points,
+            "source_count": len(findings),
+        },
+        warnings=warnings,
+    )
+
+
+def rlm_git_review_summary(repo_path: str = ".", src: str = "HEAD", dst: str = ""):
+    changed = json.loads(rlm_git_changed_files(repo_path=repo_path, include_untracked=True))
+    diff = json.loads(rlm_git_diff_analysis(repo_path=repo_path, src=src, dst=dst))
+    draft = json.loads(rlm_git_commit_message_draft(repo_path=repo_path, src=src, dst=dst))
+    if not changed.get("ok"):
+        return _rlm_result("git_review_summary", ok=False, errors=changed.get("errors", []), warnings=changed.get("warnings", []))
+    files = diff.get("data", {}).get("files", []) if diff.get("ok") else []
+    hotspots = sorted(files, key=lambda item: item.get("additions", 0) + item.get("deletions", 0), reverse=True)[:5]
+    risk_flags = []
+    for item in hotspots:
+        path = item.get("path", "")
+        total = item.get("additions", 0) + item.get("deletions", 0)
+        if any(seg in path.lower() for seg in ["auth", "security", "migration", "config", "policy"]):
+            risk_flags.append({"path": path, "reason": "sensitive filename pattern"})
+        if total >= 200:
+            risk_flags.append({"path": path, "reason": f"large diff ({total} lines changed)"})
+    checklist = [
+        "Verify tests cover the highest-change files.",
+        "Review configuration, policy, and migration-related diffs carefully.",
+        "Confirm added files are intentional and correctly placed.",
+        "Check whether large diffs should be split into smaller commits.",
+    ]
+    return _rlm_result(
+        "git_review_summary",
+        data={
+            "repo": repo_path,
+            "changed_counts": changed.get("data", {}).get("counts", {}),
+            "hotspots": hotspots,
+            "risk_flags": risk_flags,
+            "commit_draft": draft.get("data", {}),
+            "checklist": checklist,
+        },
+        warnings=changed.get("warnings", []) + diff.get("warnings", []) + draft.get("warnings", []),
+        errors=diff.get("errors", []) if not diff.get("ok") else [],
+    )
+
 def rlm_git_diff_summary(repo_path: str = ".", src: str = "HEAD", dst: str = ""):
     """Returns a high-level summary of uncommitted changes or branch diffs."""
     try:
@@ -1325,18 +3269,6 @@ def rlm_git_diff_summary(repo_path: str = ".", src: str = "HEAD", dst: str = "")
         return res if res.strip() else "No changes detected."
     except Exception as e:
         return f"Git error: {e}"
-
-def rlm_git_blame_context(filepath: str, line: int):
-    """Retrieves the commit message associated with a specific line of code."""
-    try:
-        cmd = f"git blame -L {line},{line} --porcelain {filepath}"
-        res = subprocess.check_output(cmd, shell=True, text=True)
-        commit_hash = res.split('\n')[0].split(' ')[0]
-        msg_cmd = f"git show -s --format=%B {commit_hash}"
-        msg = subprocess.check_output(msg_cmd, shell=True, text=True)
-        return f"Commit: {commit_hash}\nMessage: {msg.strip()}"
-    except Exception as e:
-        return f"Blame error: {e}"
 
 def rlm_to_clipboard(text: str):
     """Copies text to the system clipboard."""
@@ -1847,7 +3779,7 @@ class AgentState:
         # strip control characters and limit length
         if not isinstance(text, str):
             return str(text)
-        cleaned = re.sub(r"[\x00-\x1f\x7f]", "", text)
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
         if len(cleaned) > 2000:
             return cleaned[:2000] + "..."
         return cleaned
@@ -2567,6 +4499,7 @@ class FlexiBot:
         self.last_tools = {} # Track tool usage for loop detection
         # persistent turn counter used for logging; increments across handle_turn calls
         self.turn_counter = 0
+        self.last_observation = ""
 
         _log("initialized runtime temp state")
 
@@ -2586,6 +4519,108 @@ class FlexiBot:
     def on_tool_output(self, tool_name: str, output: str):
         # store raw tool output with a tool-specific tag for retrieval
         self.state.append_history("system", output, tags=[f"tool:{tool_name}"])
+
+    def _normalize_tool_payload(self, payload: str) -> str:
+        if not isinstance(payload, str):
+            payload = str(payload)
+        return re.sub(r"\s+", " ", payload).strip()
+
+    def _tool_result_failed(self, result: str) -> bool:
+        lowered = (result or "").lower()
+        failure_markers = (
+            "traceback",
+            "error:",
+            "execution failed",
+            "rejected before execution",
+            "syntaxerror",
+            "execution blocked",
+        )
+        return any(marker in lowered for marker in failure_markers)
+
+    def _append_response_trace(self, event_type: str, **payload):
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "event": event_type,
+            **payload,
+        }
+        try:
+            RESPONSE_TRACE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with RESPONSE_TRACE_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception:
+            pass
+
+    def _format_python_syntax_error(self, code: str, err: SyntaxError) -> str:
+        line = ""
+        if isinstance(getattr(err, "text", None), str):
+            line = err.text.rstrip("\r\n")
+        elif err.lineno:
+            lines = code.splitlines()
+            if 0 < err.lineno <= len(lines):
+                line = lines[err.lineno - 1]
+        pointer = ""
+        if line and err.offset:
+            caret_col = max(0, min(len(line), int(err.offset) - 1))
+            pointer = "\n" + (" " * caret_col) + "^"
+        details = f"{line}{pointer}" if line else ""
+        suffix = f"\n{details}" if details else ""
+        return (
+            f"[System] Python payload rejected before execution: {err.msg} "
+            f"(line {err.lineno}, column {err.offset}). This usually means the model emitted malformed code or collapsed newlines."
+            f"{suffix}"
+        )
+    def _build_recovery_prompt(self, reason: str) -> list[dict[str, str]]:
+        recent_history = self.state.history[-10:]
+        history_text = "\n".join(
+            f"{entry.get('role', 'unknown')}: {str(entry.get('content', ''))[:500]}"
+            for entry in recent_history
+        )
+        prompt = (
+            "You are preparing a handoff note for the user because the agent reached an internal stop condition. "
+            "Do not use any tool tags. Respond in plain text only.\n\n"
+            f"Reason: {reason}\n"
+            f"Last observation: {self.last_observation[:1500] or 'None'}\n\n"
+            "Write a concise response with exactly these sections:\n"
+            "1. Current work summary\n"
+            "2. Progress so far (bullet list)\n"
+            "3. Best next step\n"
+            "4. User choice\n\n"
+            "In 'User choice', ask the user to either continue the same task or switch to something else."
+            f"\n\nRecent history:\n{history_text}"
+        )
+        return [
+            {"role": "system", "content": self.get_system_prompt()},
+            {"role": "user", "content": prompt},
+        ]
+
+    def _recover_from_turn_limit(self, reason: str) -> str:
+        fallback = (
+            "Current work summary\n"
+            f"- The agent paused because: {reason}.\n\n"
+            "Progress so far\n"
+            f"- Last observation: {self.last_observation[:1000] or 'No observation recorded.'}\n\n"
+            "Best next step\n"
+            "- Either continue from the last observation or redirect the task.\n\n"
+            "User choice\n"
+            "- Reply with 'continue' to keep going, or tell me what to do next."
+        )
+        try:
+            recovery_messages = self._build_recovery_prompt(reason)
+            resp_data = self.client.chat(recovery_messages)
+            recovery_text = resp_data["choices"][0]["message"]["content"].strip()
+            if not recovery_text:
+                recovery_text = fallback
+        except Exception as e:
+            recovery_text = fallback + f"\n\n[Recovery note fallback: {e}]"
+
+        self._append_response_trace(
+            "recovery_response",
+            reason=reason,
+            observation=self.last_observation,
+            response=recovery_text,
+        )
+        self.state.log_event("assistant", recovery_text)
+        return recovery_text
 
     # --- convenient getters for prompt assembly ----------------------------
     def recent_user_messages(self, n: int = 3):
@@ -2802,10 +4837,12 @@ class FlexiBot:
             "metrics": {
                 "total_tokens": self.state.total_tokens,
                 "snapshots": len(list(self.state.snapshot_dir.glob("*.db"))),
-                "threads": threading.active_count()
+                "threads": threading.active_count(),
+                "background_tasks": len(self.state.active_processes),
             },
             "subagents": self.subagent_manager.get_load_stats(),
             "memory_keys": list(self.state.structured_memory.keys()),
+            "background_task_ids": sorted(self.state.active_processes.keys()),
             "execution_policy": self.execution_policy.describe(),
         }
 
@@ -2979,9 +5016,9 @@ class FlexiBot:
             while True:
                 try:
                     if use_shell:
-                        res = subprocess.run(exec_args, shell=True, capture_output=True, text=True, timeout=decision.timeout_seconds, encoding='utf-8', errors='replace', env=decision.environment)
+                        res = subprocess.run(exec_args, shell=True, capture_output=True, text=True, timeout=decision.timeout_seconds, encoding='utf-8', errors='replace', **self.execution_policy.subprocess_kwargs(decision))
                     else:
-                        res = subprocess.run(exec_args, capture_output=True, text=True, timeout=decision.timeout_seconds, encoding='utf-8', errors='replace', env=decision.environment)
+                        res = subprocess.run(exec_args, capture_output=True, text=True, timeout=decision.timeout_seconds, encoding='utf-8', errors='replace', **self.execution_policy.subprocess_kwargs(decision))
 
                     stdout = res.stdout or ""
                     stderr = res.stderr or ""
@@ -3053,6 +5090,228 @@ class FlexiBot:
                 results[t] = "Not found"
         return json.dumps(results, indent=2)
 
+    def tool_inspect_python_environment(self):
+        return rlm_inspect_python_environment()
+
+    def tool_list_python_packages(self, limit: int = 500):
+        return rlm_list_python_packages(limit=limit)
+
+    def tool_python_symbol_doc(self, symbol_name: str, filepath: str = "", root: str = ".", max_results: int = 10):
+        return rlm_python_symbol_doc(symbol_name=symbol_name, filepath=filepath, root=root, max_results=max_results)
+
+    def tool_python_import_graph(self, filepath: str, root: str = "."):
+        return rlm_python_import_graph(filepath=filepath, root=root)
+
+    def tool_validate_python_snippet(self, code: str, mode: str = "exec"):
+        return rlm_validate_python_snippet(code=code, mode=mode)
+
+    def tool_python_refactor_symbol(self, filepath: str, old_name: str, new_name: str, apply: bool = False):
+        return rlm_python_refactor_symbol(filepath=filepath, old_name=old_name, new_name=new_name, apply=apply)
+
+    def tool_python_cleanup_unused_imports(self, filepath: str, apply: bool = False):
+        return rlm_python_cleanup_unused_imports(filepath=filepath, apply=apply)
+
+    def tool_python_type_annotation_assist(self, filepath: str):
+        return rlm_python_type_annotation_assist(filepath=filepath)
+
+    def tool_find_references(self, symbol_name: str, root: str = ".", patterns: str = "", max_results: int = 100):
+        return rlm_find_references(symbol_name=symbol_name, root=root, patterns=patterns or None, max_results=max_results)
+
+    def tool_find_implementations(self, symbol_name: str, root: str = ".", patterns: str = "", max_results: int = 100):
+        return rlm_find_implementations(symbol_name=symbol_name, root=root, patterns=patterns or None, max_results=max_results)
+
+    def tool_preview_symbol_rename(self, symbol_name: str, new_name: str, root: str = ".", patterns: str = "", max_results: int = 200):
+        return rlm_preview_symbol_rename(symbol_name=symbol_name, new_name=new_name, root=root, patterns=patterns or None, max_results=max_results)
+
+    def tool_git_changed_files(self, repo_path: str = ".", include_untracked: bool = True):
+        return rlm_git_changed_files(repo_path=repo_path, include_untracked=include_untracked)
+
+    def tool_git_diff_analysis(self, repo_path: str = ".", src: str = "HEAD", dst: str = "", max_patch_chars: int = 4000):
+        return rlm_git_diff_analysis(repo_path=repo_path, src=src, dst=dst, max_patch_chars=max_patch_chars)
+
+    def tool_git_blame_context(self, filepath: str, line: int, repo_path: str = "."):
+        return rlm_git_blame_context(filepath=filepath, line=line, repo_path=repo_path)
+
+    def tool_git_commit_message_draft(self, repo_path: str = ".", src: str = "HEAD", dst: str = ""):
+        return rlm_git_commit_message_draft(repo_path=repo_path, src=src, dst=dst)
+
+    def tool_project_map(self, root: str = "."):
+        return rlm_project_map(root=root)
+
+    def tool_project_relationships(self, root: str = ".", max_nodes: int = 120):
+        return rlm_project_relationships(root=root, max_nodes=max_nodes)
+
+    def tool_notebook_summary(self, filepath: str):
+        return rlm_notebook_summary(filepath)
+
+    def tool_notebook_edit_cell(self, filepath: str, index: int, source: str = "", cell_type: str = "code", operation: str = "replace"):
+        return rlm_notebook_edit_cell(filepath=filepath, index=index, source=source, cell_type=cell_type, operation=operation)
+
+    def tool_notebook_run(self, filepath: str, cell_index: int | None = None, persist_output: bool = True):
+        return rlm_notebook_run(filepath=filepath, cell_index=cell_index, persist_output=persist_output)
+
+    def tool_notebook_kernel_info(self, filepath: str):
+        return rlm_notebook_kernel_info(filepath)
+
+    def tool_notebook_session_status(self, filepath: str):
+        return rlm_notebook_session_status(filepath)
+
+    def tool_notebook_clear_session(self, filepath: str):
+        return rlm_notebook_clear_session(filepath)
+
+    def tool_notebook_install_package(self, filepath: str, package: str, upgrade: bool = False):
+        return rlm_notebook_install_package(filepath=filepath, package=package, upgrade=upgrade)
+
+    def tool_db_save_profile(self, name: str, database_path: str, kind: str = "sqlite", description: str = ""):
+        return rlm_db_save_profile(name=name, database_path=database_path, kind=kind, description=description)
+
+    def tool_db_list_profiles(self):
+        return rlm_db_list_profiles()
+
+    def tool_db_schema(self, profile_name: str = "", database_path: str = ""):
+        return rlm_db_schema(profile_name=profile_name, database_path=database_path)
+
+    def tool_db_query(self, query: str, profile_name: str = "", database_path: str = "", limit: int = 200):
+        return rlm_db_query(query=query, profile_name=profile_name, database_path=database_path, limit=limit)
+
+    def tool_db_migration_status(self, root: str = "."):
+        return rlm_db_migration_status(root=root)
+
+    def tool_fetch_webpage(self, url: str, timeout: int = 20, max_chars: int = 12000):
+        return rlm_fetch_webpage(url=url, timeout=timeout, max_chars=max_chars)
+
+    def tool_extract_web_structure(self, url: str, timeout: int = 20, max_items: int = 20):
+        return rlm_extract_web_structure(url=url, timeout=timeout, max_items=max_items)
+
+    def tool_extract_doc_section(self, url: str, query: str, timeout: int = 20, max_matches: int = 5):
+        return rlm_extract_doc_section(url=url, query=query, timeout=timeout, max_matches=max_matches)
+
+    def tool_summarize_web_reference(self, url: str, timeout: int = 20, max_points: int = 8):
+        return rlm_summarize_web_reference(url=url, timeout=timeout, max_points=max_points)
+
+    def tool_research_web(self, query: str, urls: list[str] | None = None, timeout: int = 20, max_sources: int = 5):
+        return rlm_research_web(query=query, urls=urls, timeout=timeout, max_sources=max_sources)
+
+    def tool_git_review_summary(self, repo_path: str = ".", src: str = "HEAD", dst: str = ""):
+        return rlm_git_review_summary(repo_path=repo_path, src=src, dst=dst)
+
+    def tool_install_python_package(self, package: str, upgrade: bool = False):
+        package = str(package or "").strip()
+        if not package:
+            return json.dumps({"ok": False, "tool": "install_python_package", "errors": ["Package name is required."]}, indent=2)
+        requested = f"{package} {'--upgrade' if upgrade else ''}".strip()
+        decision = self.execution_policy.evaluate("install_python_package", requested)
+        if not decision.allowed:
+            self.execution_policy.audit(decision, action="deny", status="blocked", payload=requested)
+            return json.dumps({"ok": False, "tool": "install_python_package", "errors": [decision.reason]}, indent=2)
+        start_time = time.time()
+        self.execution_policy.audit(decision, action="start", status="allowed", payload=requested)
+        cmd = [sys.executable, "-m", "pip", "install", package]
+        if upgrade:
+            cmd.append("--upgrade")
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=decision.timeout_seconds,
+                encoding='utf-8',
+                errors='replace',
+                **self.execution_policy.subprocess_kwargs(decision),
+            )
+            output = self.execution_policy.trim_output(decision, (res.stdout or "") + ("\n" + res.stderr if res.stderr else ""))
+            result = {
+                "ok": res.returncode == 0,
+                "tool": "install_python_package",
+                "package": package,
+                "upgrade": bool(upgrade),
+                "returncode": res.returncode,
+                "output": output,
+            }
+            self.execution_policy.audit(
+                decision,
+                action="finish",
+                status="completed" if res.returncode == 0 else "failed",
+                payload=requested,
+                result=output,
+                duration_ms=int((time.time() - start_time) * 1000),
+            )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            self.execution_policy.audit(
+                decision,
+                action="finish",
+                status="failed",
+                payload=requested,
+                result=str(e),
+                duration_ms=int((time.time() - start_time) * 1000),
+            )
+            return json.dumps({"ok": False, "tool": "install_python_package", "package": package, "errors": [str(e)]}, indent=2)
+
+    def _bg_task_log_path(self, pid: str | int) -> Path:
+        BG_TASK_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return BG_TASK_LOG_DIR / f"bg_task_{pid}.log"
+
+    def tool_get_bg_task_details(self, pid: str = ""):
+        active = self.state.active_processes
+        if pid:
+            info = active.get(str(pid))
+            if not info:
+                return json.dumps({"ok": False, "tool": "get_bg_task_details", "errors": [f"No background task found for PID {pid}"]}, indent=2)
+            return json.dumps({"ok": True, "tool": "get_bg_task_details", "task": info}, indent=2)
+        return json.dumps({"ok": True, "tool": "get_bg_task_details", "tasks": list(active.values())}, indent=2)
+
+    def tool_read_bg_task_log(self, pid: str, lines: int = 50):
+        log_path = self._bg_task_log_path(pid)
+        if not log_path.exists():
+            return f"No log file found for background task {pid}."
+        try:
+            content = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
+            return "\n".join(content[-max(1, int(lines)):])
+        except Exception as e:
+            return f"Background log read error: {e}"
+
+    def tool_stop_bg_task(self, pid: str, force: bool = False):
+        pid_str = str(pid)
+        active = self.state.active_processes
+        info = active.get(pid_str)
+        if not info:
+            return f"No background task found for PID {pid_str}."
+        try:
+            if os.name == 'nt':
+                cmd = ["taskkill", "/PID", pid_str]
+                if force:
+                    cmd.append("/F")
+                subprocess.run(cmd, capture_output=True, text=True, timeout=20, encoding='utf-8', errors='replace')
+            else:
+                os.kill(int(pid_str), signal.SIGKILL if force else signal.SIGTERM)
+            info["status"] = "stopped"
+            info["stopped_at"] = time.time()
+            self.state.set_active_process(pid_str, info, persist=False)
+            self.state.save()
+            return f"Stopped background task {pid_str}."
+        except Exception as e:
+            return f"Failed to stop background task {pid_str}: {e}"
+
+    def tool_restart_bg_task(self, pid: str):
+        pid_str = str(pid)
+        active = self.state.active_processes
+        info = active.get(pid_str)
+        if not info:
+            return f"No background task found for PID {pid_str}."
+        task_type = info.get("type")
+        if task_type == "shell":
+            self.tool_stop_bg_task(pid_str, force=False)
+            return self.tool_spawn_background(info.get("cmd", ""), timeout=30)
+        if task_type == "python_bg" and info.get("script_path"):
+            try:
+                code = Path(info["script_path"]).read_text(encoding='utf-8', errors='replace')
+            except Exception as e:
+                return f"Failed to reload background script: {e}"
+            self.tool_stop_bg_task(pid_str, force=False)
+            return self.tool_run_python_bg(code)
+        return f"Restart not supported for background task type '{task_type}'."
+
     def subagent(self, task: str, work_dir: str = ".", priority: int = 2, agent_type: str = "generic") -> str:
         """Isolated subagent loop delegated to SubagentManager."""
         print(f"\\n[Subagent Plan]: {task} (Dir: {work_dir}, Prio: {priority}, Type: {agent_type})")
@@ -3105,6 +5364,30 @@ class FlexiBot:
         # We execute the skill code directly into the current environment
         exec(path.read_text(encoding="utf-8"), env, env) 
         return f"✓ Skill '{name}' loaded."
+
+    def tool_validate_python(self, filepath: str = "", code: str = ""):
+        return rlm_validate_python(filepath=filepath, code=code)
+
+    def tool_validate_json(self, filepath: str = "", content: str = ""):
+        return rlm_validate_json(filepath=filepath, content=content)
+
+    def tool_run_tests(self, command: str = ""):
+        test_command = command.strip()
+        if not test_command:
+            test_candidates = list(Path(".").glob("test_*.py")) + list(Path("tests").glob("**/test*.py")) if Path("tests").exists() else list(Path(".").glob("test_*.py"))
+            if not test_candidates:
+                return json.dumps({"ok": False, "tool": "run_tests", "errors": ["No tests found and no command provided."]}, indent=2)
+            test_command = f'"{sys.executable}" -m unittest discover -v'
+        result = self.run_bash(test_command)
+        verification = self.verify_and_report(result, context=f"tests:{test_command}")
+        return json.dumps({
+            "ok": verification.get("success", False),
+            "tool": "run_tests",
+            "command": test_command,
+            "summary": verification.get("summary", ""),
+            "errors": verification.get("errors", []),
+            "output": result[:4000],
+        }, indent=2)
 
     def tool_run_verification(self, target_script: str = "flexi_temp.py"):
         """Generates and runs an advanced controller verification suite."""
@@ -3435,6 +5718,7 @@ if __name__ == "__main__":
 
         start_time = time.time()
         self.execution_policy.audit(decision, action="start", status="allowed", payload=cmd)
+        log_path = self._bg_task_log_path(f"shell_{int(start_time * 1000)}")
         try:
             # We use subprocess.Popen to let it run in the background
             p = subprocess.Popen(
@@ -3446,8 +5730,9 @@ if __name__ == "__main__":
                 bufsize=1,
                 encoding='utf-8',
                 errors='replace',
-                env=decision.environment,
+                **self.execution_policy.subprocess_kwargs(decision),
             )
+            log_path = self._bg_task_log_path(p.pid)
             
             # Register in state
             pid_str = str(p.pid)
@@ -3455,7 +5740,9 @@ if __name__ == "__main__":
                 "cmd": cmd,
                 "start_time": time.time(),
                 "type": "shell",
-                "status": "running"
+                "status": "running",
+                "log_path": str(log_path),
+                "working_directory": decision.isolation_rules.get("working_directory", "."),
             }, persist=False)
             self.state.save()
             
@@ -3473,9 +5760,13 @@ if __name__ == "__main__":
                 # Start a non-blocking consumer to keep pipe clear
                 def drain(proc):
                     try:
-                        while proc.poll() is None:
-                            line = proc.stdout.readline()
-                            if not line: break
+                        with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                            while proc.poll() is None:
+                                line = proc.stdout.readline()
+                                if not line:
+                                    break
+                                log_file.write(line)
+                                log_file.flush()
                     except: pass
                 threading.Thread(target=drain, args=(p,), daemon=True).start()
                 return msg
@@ -3483,26 +5774,29 @@ if __name__ == "__main__":
             # Non-blocking wait logic (Polled for the timeout duration)
             start_time = time.time()
             captured = []
-            while time.time() - start_time < decision.timeout_seconds:
-                line = p.stdout.readline()
-                if not line: break
-                captured.append(line.strip())
-                if stop_marker in line:
-                    msg = f"✓ Process reached '{stop_marker}'. Substituted into memory."
-                    self.tool_remember("processes", f"Spawned '{cmd}' - Ready seen at {time.ctime()}")
-                    # Log the observation as well
-                    self.state.log_event("system", f"Background process '{cmd}' reached marker '{stop_marker}'.")
-                    result = self.execution_policy.trim_output(decision, f"Success: Process reached marker. Last few lines:\n" + "\n".join(captured[-5:]))
-                    self.execution_policy.audit(
-                        decision,
-                        action="finish",
-                        status="completed",
-                        payload=cmd,
-                        result=result,
-                        duration_ms=int((time.time() - start_time) * 1000),
-                        extra={"pid": p.pid, "stop_marker": stop_marker},
-                    )
-                    return result
+            with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                while time.time() - start_time < decision.timeout_seconds:
+                    line = p.stdout.readline()
+                    if not line:
+                        break
+                    log_file.write(line)
+                    log_file.flush()
+                    captured.append(line.strip())
+                    if stop_marker in line:
+                        msg = f"✓ Process reached '{stop_marker}'. Substituted into memory."
+                        self.tool_remember("processes", f"Spawned '{cmd}' - Ready seen at {time.ctime()}")
+                        self.state.log_event("system", f"Background process '{cmd}' reached marker '{stop_marker}'.")
+                        result = self.execution_policy.trim_output(decision, f"Success: Process reached marker. Last few lines:\n" + "\n".join(captured[-5:]))
+                        self.execution_policy.audit(
+                            decision,
+                            action="finish",
+                            status="completed",
+                            payload=cmd,
+                            result=result,
+                            duration_ms=int((time.time() - start_time) * 1000),
+                            extra={"pid": p.pid, "stop_marker": stop_marker, "log_path": str(log_path)},
+                        )
+                        return result
             
             result = f"Started background process (PID {p.pid}), but marker '{stop_marker}' was not seen in {decision.timeout_seconds}s. It continues to run."
             self.execution_policy.audit(
@@ -3512,7 +5806,7 @@ if __name__ == "__main__":
                 payload=cmd,
                 result=result,
                 duration_ms=int((time.time() - start_time) * 1000),
-                extra={"pid": p.pid, "stop_marker": stop_marker},
+                extra={"pid": p.pid, "stop_marker": stop_marker, "log_path": str(log_path)},
             )
             return result
         except Exception as e:
@@ -3557,8 +5851,14 @@ if __name__ == "__main__":
                 cmd, 
                 shell=True,
                 creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0,
-                env=decision.environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                **self.execution_policy.subprocess_kwargs(decision),
             ) 
+            log_path = self._bg_task_log_path(p.pid)
             
             # Register
             self.state.set_active_process(str(p.pid), {
@@ -3566,9 +5866,23 @@ if __name__ == "__main__":
                 "start_time": time.time(),
                 "type": "python_bg",
                 "script_path": str(script_path),
-                "status": "running"
+                "status": "running",
+                "log_path": str(log_path),
+                "working_directory": decision.isolation_rules.get("working_directory", "."),
             }, persist=False)
             self.state.save()
+            def drain(proc):
+                try:
+                    with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                        while proc.poll() is None:
+                            line = proc.stdout.readline()
+                            if not line:
+                                break
+                            log_file.write(line)
+                            log_file.flush()
+                except Exception:
+                    pass
+            threading.Thread(target=drain, args=(p,), daemon=True).start()
             result = f"✓ Started Python Background Task. PID: {p.pid}. Script: {script_path}"
             self.execution_policy.audit(
                 decision,
@@ -3577,7 +5891,7 @@ if __name__ == "__main__":
                 payload=code,
                 result=result,
                 duration_ms=int((time.time() - start_time) * 1000),
-                extra={"pid": p.pid, "script_path": str(script_path)},
+                extra={"pid": p.pid, "script_path": str(script_path), "log_path": str(log_path)},
             )
             return result
         except Exception as e:
@@ -3677,6 +5991,33 @@ if __name__ == "__main__":
 
         start_time = time.time()
         self.execution_policy.audit(decision, action="start", status="allowed", payload=code)
+        try:
+            ast.parse(code)
+        except SyntaxError as err:
+            result = self._format_python_syntax_error(code, err)
+            self.execution_policy.audit(
+                decision,
+                action="finish",
+                status="failed",
+                payload=code,
+                result=result,
+                duration_ms=int((time.time() - start_time) * 1000),
+                extra={
+                    "stage": "syntax_precheck",
+                    "lineno": err.lineno,
+                    "offset": err.offset,
+                    "msg": err.msg,
+                },
+            )
+            self._append_response_trace(
+                "python_syntax_reject",
+                payload=code,
+                error=result,
+                lineno=err.lineno,
+                offset=err.offset,
+                message=err.msg,
+            )
+            return result
 
         def _execute():
             orig_code = code
@@ -3747,13 +6088,62 @@ if __name__ == "__main__":
             "spawn_bg": self.tool_spawn_background,
             "run_python_bg": self.tool_run_python_bg,
             "check_bg_tasks": self.tool_check_bg_tasks,
+                "get_bg_task_details": self.tool_get_bg_task_details,
+                "read_bg_task_log": self.tool_read_bg_task_log,
+                "stop_bg_task": self.tool_stop_bg_task,
+                "restart_bg_task": self.tool_restart_bg_task,
             "find_consuming_port": self.tool_find_consuming_port,
             "find_port": self.tool_find_consuming_port,
+                "validate_python": self.tool_validate_python,
+                "validate_json": self.tool_validate_json,
+                "validate_python_snippet": self.tool_validate_python_snippet,
+                "run_tests": self.tool_run_tests,
+                "inspect_python_environment": self.tool_inspect_python_environment,
+                "list_python_packages": self.tool_list_python_packages,
+                "install_python_package": self.tool_install_python_package,
+                "python_symbol_doc": self.tool_python_symbol_doc,
+                "python_import_graph": self.tool_python_import_graph,
+                "python_refactor_symbol": self.tool_python_refactor_symbol,
+                "cleanup_unused_imports": self.tool_python_cleanup_unused_imports,
+                "python_type_assist": self.tool_python_type_annotation_assist,
+                "find_references": self.tool_find_references,
+                "find_implementations": self.tool_find_implementations,
+                "preview_symbol_rename": self.tool_preview_symbol_rename,
+                "git_changed_files": self.tool_git_changed_files,
+                "git_diff_analysis": self.tool_git_diff_analysis,
+                "git_blame_context": self.tool_git_blame_context,
+                "git_commit_message_draft": self.tool_git_commit_message_draft,
+                "project_map_tool": self.tool_project_map,
+                "project_relationships": self.tool_project_relationships,
+                "notebook_summary": self.tool_notebook_summary,
+                "notebook_edit_cell": self.tool_notebook_edit_cell,
+                "notebook_run": self.tool_notebook_run,
+                "notebook_kernel_info": self.tool_notebook_kernel_info,
+                "notebook_session_status": self.tool_notebook_session_status,
+                "notebook_clear_session": self.tool_notebook_clear_session,
+                "notebook_install_package": self.tool_notebook_install_package,
+                "db_save_profile": self.tool_db_save_profile,
+                "db_list_profiles": self.tool_db_list_profiles,
+                "db_schema": self.tool_db_schema,
+                "db_query": self.tool_db_query,
+                "db_migration_status": self.tool_db_migration_status,
+                "fetch_webpage": self.tool_fetch_webpage,
+                "extract_web_structure": self.tool_extract_web_structure,
+                "extract_doc_section": self.tool_extract_doc_section,
+                "summarize_web_reference": self.tool_summarize_web_reference,
+                "research_web": self.tool_research_web,
+                "git_review_summary": self.tool_git_review_summary,
             # RLM Helpers
             "grep": rlm_grep,
+            "search_workspace": rlm_search_workspace,
+            "find_symbol": rlm_find_symbol,
             "peek": rlm_peek,
             "read_file": rlm_read,
+            "read_range": rlm_read_range,
             "write": rlm_write,
+            "create_file": rlm_create_file,
+            "delete_file": rlm_delete_file,
+            "move_file": rlm_move_file,
             "patch": rlm_patch,
             "edit_lines": rlm_edit_lines,
             "find_files": rlm_find_files,
@@ -3762,11 +6152,44 @@ if __name__ == "__main__":
             "history_search": rlm_history_search,
             "map_deps": rlm_map_dependencies,
             "project_map": rlm_project_summary,
+            "project_map_structured": rlm_project_map,
+            "project_relationships_raw": rlm_project_relationships,
+            "validate_python_file": rlm_validate_python,
+            "validate_json_file": rlm_validate_json,
             "git_diff": rlm_git_diff_summary,
             "git_summary": rlm_git_diff_summary,
             "git_blame": rlm_git_blame_context,
+            "git_changed_files_raw": rlm_git_changed_files,
+            "git_diff_analysis_raw": rlm_git_diff_analysis,
+            "git_commit_message_draft_raw": rlm_git_commit_message_draft,
+            "notebook_summary_raw": rlm_notebook_summary,
+            "notebook_edit_cell_raw": rlm_notebook_edit_cell,
+            "notebook_run_raw": rlm_notebook_run,
+            "notebook_kernel_info_raw": rlm_notebook_kernel_info,
+            "notebook_session_status_raw": rlm_notebook_session_status,
+            "notebook_clear_session_raw": rlm_notebook_clear_session,
+            "notebook_install_package_raw": rlm_notebook_install_package,
+            "db_save_profile_raw": rlm_db_save_profile,
+            "db_list_profiles_raw": rlm_db_list_profiles,
+            "db_schema_raw": rlm_db_schema,
+            "db_query_raw": rlm_db_query,
+            "db_migration_status_raw": rlm_db_migration_status,
+            "fetch_webpage_raw": rlm_fetch_webpage,
+            "extract_web_structure_raw": rlm_extract_web_structure,
+            "extract_doc_section_raw": rlm_extract_doc_section,
+            "summarize_web_reference_raw": rlm_summarize_web_reference,
+            "research_web_raw": rlm_research_web,
+            "git_review_summary_raw": rlm_git_review_summary,
             "to_clip": rlm_to_clipboard,
             "from_clip": rlm_from_clipboard,
+            "python_symbol_doc_raw": rlm_python_symbol_doc,
+            "python_import_graph_raw": rlm_python_import_graph,
+            "python_refactor_symbol_raw": rlm_python_refactor_symbol,
+            "cleanup_unused_imports_raw": rlm_python_cleanup_unused_imports,
+            "python_type_assist_raw": rlm_python_type_annotation_assist,
+            "find_references_raw": rlm_find_references,
+            "find_implementations_raw": rlm_find_implementations,
+            "preview_symbol_rename_raw": rlm_preview_symbol_rename,
             "rlm_see": self.tool_see_image,
             "rlm_see_window": self.tool_see_window,
             # New Capabilities
@@ -3845,7 +6268,7 @@ if __name__ == "__main__":
         self.execution_policy.audit(
             decision,
             action="finish",
-            status="completed" if "Error:" not in result and "Traceback" not in result else "failed",
+            status="failed" if self._tool_result_failed(result) else "completed",
             payload=code,
             result=result,
             duration_ms=int((time.time() - start_time) * 1000),
@@ -3897,11 +6320,18 @@ if __name__ == "__main__":
             "   - **Code Engine**: Use <python>code</python> for script logic.\n"
             "   - **Vision**: `see(path, question)`, `see_window(query, question)`, `see_screen(question)`, `capture_window(query)`.\n"
             "   - **Windows/Env**: `list_windows_advanced()`, `list_processes()`, `get_software_versions()`, `find_port(port)`.\n"
-            "   - **Background**: `spawn_bg(cmd)`, `run_python_bg(code)`, `check_bg_tasks()`. Use these for long-running or unstable tasks.\n"
-            "   - **Git/Project**: `git_diff(repo, src, dst)`, `git_summary(repo)`, `git_blame(file, line)`, `map_deps(path)`, `project_map(root)`.\n"
+            "   - **Background**: `spawn_bg(cmd)`, `run_python_bg(code)`, `check_bg_tasks()`, `get_bg_task_details(pid='')`, `read_bg_task_log(pid)`, `stop_bg_task(pid)`, `restart_bg_task(pid)`.\n"
+            "   - **Environment**: `inspect_python_environment()`, `list_python_packages()`, `install_python_package(name, upgrade=False)`, `get_software_versions()`.\n"
+            "   - **Python Language**: `python_symbol_doc(name, filepath='', root='.')`, `python_import_graph(filepath, root='.')`, `validate_python_snippet(code, mode='exec')`, `python_refactor_symbol(filepath, old_name, new_name, apply=False)`, `cleanup_unused_imports(filepath, apply=False)`, `python_type_assist(filepath)`.\n"
+            "   - **Git/Project**: `git_changed_files(repo='.')`, `git_diff_analysis(repo='.', src='HEAD', dst='')`, `git_commit_message_draft(repo='.')`, `git_blame_context(file, line, repo='.')`, `git_review_summary(repo='.')`, `git_diff(repo, src, dst)`, `git_summary(repo)`, `map_deps(path)`, `project_map(root)`, `project_map_tool(root='.')`, `project_relationships(root='.')`.\n"
+            "   - **Notebook**: `notebook_summary(path)`, `notebook_edit_cell(path, index, source='', cell_type='code', operation='replace')`, `notebook_run(path, cell_index=None, persist_output=True)`, `notebook_kernel_info(path)`, `notebook_session_status(path)`, `notebook_clear_session(path)`, `notebook_install_package(path, package, upgrade=False)`.\n"
+            "   - **Database**: `db_save_profile(name, database_path, kind='sqlite')`, `db_list_profiles()`, `db_schema(profile_name='', database_path='')`, `db_query(query, profile_name='', database_path='')`, `db_migration_status(root='.')`.\n"
+            "   - **Web/Docs**: `fetch_webpage(url)`, `extract_web_structure(url)`, `extract_doc_section(url, query)`, `summarize_web_reference(url)`, `research_web(query, urls=None)`.\n"
             "   - **Utility**: `to_clip(text)`, `from_clip()`.\n"
             "   - **State**: Variables persist; `remember(tag, txt)`, `recall(tag)`, `search_memory(query)`.\n"
-            "   - **Filesystem**: `read_file(path)`, `write(path, content)`, `patch(path, old, new)`, `edit_lines(path, s, e, txt)`, `grep(pattern, file)`, `peek(file)`, `tree(root)`, `find_files(glob)`.\n"
+            "   - **Search**: `search_workspace(query, root='.', pattern='*')`, `find_symbol(name, root='.', pattern='*.py')`, `find_references(name, root='.', patterns='')`, `find_implementations(name, root='.', patterns='')`, `preview_symbol_rename(old, new, root='.', patterns='')`, `grep(pattern, file)`, `find_files(glob)`, `tree(root)`.\n"
+            "   - **Filesystem**: `read_file(path)`, `read_range(path, start, end)`, `write(path, content)`, `create_file(path, content, overwrite=False)`, `move_file(src, dst)`, `delete_file(path)`, `patch(path, old, new)`, `edit_lines(path, s, e, txt)`, `peek(file)`.\n"
+            "   - **Validation**: `validate_python(filepath='', code='')`, `validate_python_snippet(code, mode='exec')`, `validate_json(filepath='', content='')`, `run_tests(command='')`, `verify_work(script_path)`.\n"
             "   - **Recursion**: `subagent(task, agent_type='generic')` spawns a bot. Types: [" + available_agents + "].\n"
             "   - **Background**: `batch_implement(proposal_file)` runs tasks in `subies/`; `check_subagents()` to monitor progress."
         )
@@ -3998,6 +6428,17 @@ if __name__ == "__main__":
                     py = re.findall(r"<python>(.*?)</python>", resp, re.S)
                     plan = re.findall(r"<plan>(.*?)</plan>", resp, re.S)
                     ack = "<ack_observation>" in resp
+                    normalized_bash = [self._normalize_tool_payload(item) for item in bash]
+                    normalized_py = [self._normalize_tool_payload(item) for item in py]
+                    self._append_response_trace(
+                        "llm_response",
+                        response=resp,
+                        bash_payloads=bash,
+                        python_payloads=py,
+                        plan_blocks=plan,
+                        ack=ack,
+                        consensus=("<consensus>" in resp),
+                    )
 
                     # 2. Handle Acknowledgement Lock
                     if ack:
@@ -4051,7 +6492,7 @@ if __name__ == "__main__":
                         out = self.run_python(p)
                         print(f"{Colors.DIM}  -> Tool exit OK.{Colors.ENDC}")
                         obs += f"Python: {out}\n"
-                        if "Traceback (most recent call last)" in out or "Error:" in out:
+                        if self._tool_result_failed(out):
                             print(f"{Colors.RED}❌ Tool Error detected.{Colors.ENDC}")
                             obs += "\nSYSTEM ALERT: ⚠️ An error occurred. Analyze and FIX the code.\n"
                         try:
@@ -4063,21 +6504,31 @@ if __name__ == "__main__":
 
                     # 5. Loop Protection
                     is_exact_repeat = (resp == self.last_turn_resp)
-                    is_tool_repeat = (has_tools and bash == self.last_tools.get('bash') and py == self.last_tools.get('py'))
+                    is_tool_repeat = (has_tools and normalized_bash == self.last_tools.get('bash') and normalized_py == self.last_tools.get('py'))
 
                     if not ack and (is_exact_repeat or is_tool_repeat):
                         self.repetition_count += 1
                         if self.repetition_count >= 2:
                             print(f"{Colors.RED}⚠️ Repetitive Loop Detected.{Colors.ENDC}")
                             if self.repetition_count >= 4:
-                                break
+                                stop_msg = "System Error: Stopping after repeated identical actions without progress. Review .flexi/rlm_state/execution_audit.jsonl and .flexi/rlm_state/response_trace.jsonl for the last failing payloads."
+                                self.state.log_event("system", stop_msg)
+                                self.last_observation = stop_msg
+                                self._append_response_trace(
+                                    "loop_abort",
+                                    response=resp,
+                                    repetition_count=self.repetition_count,
+                                    observation=stop_msg,
+                                )
+                                recovery = self._recover_from_turn_limit("Repeated identical actions without progress")
+                                return f"{stop_msg}\n\n{recovery}"
                             obs = "System Error: You are repeating the same action. You MUST try a different approach or ask the user for help via <consensus>."
                             self.state.log_event("system", obs)
                     else:
                         self.repetition_count = 0
                     
                     self.last_turn_resp = resp
-                    self.last_tools = {'bash': bash, 'py': py}
+                    self.last_tools = {'bash': normalized_bash, 'py': normalized_py}
 
                     if not bash and not py and not ack:
                         if plan:
@@ -4091,8 +6542,10 @@ if __name__ == "__main__":
                     if len(obs) > 4000:
                         print(f"{Colors.YELLOW}[System]: Observation too large ({len(obs)} chars). Truncating for history safety...{Colors.ENDC}")
                         truncated_obs = obs[:2000] + "\n... [TRUNCATED DUE TO SIZE] ...\n" + obs[-1000:]
+                        self.last_observation = truncated_obs
                         self.state.log_event("system", f"Observation (Truncated): {truncated_obs}")
                     else:
+                        self.last_observation = obs
                         self.state.log_event("system", f"Observation: {obs}")
 
                     # 6. Log and Continue
@@ -4123,7 +6576,16 @@ if __name__ == "__main__":
                     obs = f"System Error during turn execution: {inner_e}. Please retry."
                     self.state.log_event("system", obs)
             
-            return "Max turns reached without consensus."
+            stop_msg = "Stopped after max turns without consensus."
+            if self.last_observation:
+                stop_msg += f"\nLast observation:\n{self.last_observation[:1500]}"
+            self._append_response_trace(
+                "turn_limit_abort",
+                observation=self.last_observation,
+                repetition_count=self.repetition_count,
+            )
+            recovery = self._recover_from_turn_limit("Maximum internal turns reached before consensus")
+            return f"{stop_msg}\n\n{recovery}"
         except Exception as outer_e:
             return f"\n{Colors.RED}[CRITICAL HANDLER FAILURE]: {outer_e}{Colors.ENDC}\n{traceback.format_exc()}"
 
