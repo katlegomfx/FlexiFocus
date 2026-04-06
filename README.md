@@ -2,10 +2,7 @@
 
 ## Overview
 
-`coreAgent` currently contains two local Python agent runtimes:
-
-- `flexiFocus.py`: the main autonomous agent with persistent state, structured tools, reviewer passes, background jobs, and an idle self-improvement workflow.
-- `viewerTool.py`: a lighter autonomous runtime that waits for a goal, falls back to a default goal after 5 minutes, and persists goal/history state across cycles.
+`coreAgent` is centered on `flexiFocus.py`, a local autonomous agent runtime with persistent state, structured tools, reviewer passes, background jobs, and an idle self-improvement workflow.
 
 The main runtime is designed to run locally, keep durable state on disk, execute bounded tools, and generate proposal files for self-review rather than directly rewriting itself in place.
 
@@ -46,12 +43,6 @@ py .\flexiFocus.py
 ```
 
 On non-Windows systems, `python3 flexiFocus.py` is the equivalent.
-
-Run the lighter viewer runtime:
-
-```bash
-py .\viewerTool.py
-```
 
 ## Runtime Configuration
 
@@ -175,25 +166,6 @@ Background job support exists in two places:
 - timeout handling
 - stop and restart behavior
 - log tail reads for inspection and tests
-
-## Secondary Runtime: `viewerTool.py`
-
-`viewerTool.py` is a simpler runtime intended for goal-driven autonomous loops.
-
-Current behavior:
-
-- waits up to 5 minutes for a user-supplied goal
-- falls back to the default goal: "Improve the runtime so that it can make money for the user"
-- keeps looping after each goal instead of exiting after one cycle
-- persists runtime history and completed goals
-- rotates archived history so local state does not grow without bound
-- exposes lightweight runtime commands for history and summary inspection
-
-Its input prompt is explicit as well:
-
-```text
-[Awaiting goal input] >
-```
 
 ## Testing
 
