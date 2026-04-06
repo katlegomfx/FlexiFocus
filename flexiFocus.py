@@ -12,6 +12,7 @@ import io
 import re
 import subprocess
 import traceback
+import asyncio
 import uuid
 import queue
 from enum import Enum, IntEnum
@@ -30,6 +31,8 @@ import hashlib
 import builtins
 import sqlite3
 import importlib
+import gc
+import warnings
 import importlib.util
 import tokenize
 import html
@@ -78,22 +81,49 @@ ARCHIVE_FILE = STATE_DIR / "full_archive.jsonl"
 RESPONSE_TRACE_FILE = STATE_DIR / "response_trace.jsonl"
 # maximum size (bytes) before rotating/compressing the legacy JSONL archive
 ARCHIVE_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB by default
+REVIEWER_EVENT_KEY = "reviewer_events"
+GOAL_RECORDS_KEY = "goal_records"
+GOAL_STATUS_ACTIVE = "active"
+GOAL_STATUS_PENDING = "pending"
+GOAL_STATUS_COMPLETED = "completed"
+GOAL_STATUS_CANCELLED = "cancelled"
+GOAL_STATUS_FAILED = "failed"
+OPERATOR_COMMAND_PREFIX = "/"
+OPERATOR_COMMANDS = {
+    "/health",
+    "/history",
+    "/reviews",
+    "/goals",
+    "/goal",
+    "/help",
+}
 
 EVOLUTION_LOG = STATE_DIR / "evolution_log.md"
 MAX_SNAPSHOTS = 5
 TOKEN_THRESHOLD = 368000 # Your specific requirement for summary trigger
-PROMPT_LABEL = "👤 You: "
+PROMPT_LABEL = "[Awaiting user input] > "
 
 # automatic history summarisation parameters
 AUTO_SUMMARY_THRESHOLD = 2000  # if history entries exceed this
 AUTO_SUMMARY_KEEP = 500        # keep this many recent entries intact
+PROPOSAL_ARTIFACT_KEEP_RECENT = 8
+PROPOSAL_ARTIFACT_ARCHIVE_DIRNAME = "archive"
+IDLE_REWRITE_SECTION_NAMES = {
+    "idle_proposal_workflow",
+    "run_proposal_sdlc",
+    "run_interactive_loop",
+    "_apply_idle_proposal_patch",
+}
 
 # Place config next to the logical agent root for discoverability
 CONFIG_FILE = (STATE_DIR.parent / "config.json") if STATE_DIR.name == "rlm_state" else (STATE_DIR / "config.json")
+RUNTIME_CONFIG_PREFIXES = ("FLEXI_", "AGENT_")
 
 TOKEN_CACHE_FILE = "github_token_cache.json"
 COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
 DEFAULT_COPILOT_API_BASE_URL = "https://api.individual.githubcopilot.com"
+ALLOWED_BINARIES = {"git", "python", "pip", "npm", "docker", "echo"}
+DRY_RUN = os.environ.get("AGENT_DRY_RUN", "true").lower() in ("1", "true", "yes")
 
 COMMON_HEADERS = {
     "Editor-Version": "vscode/1.85.1",
@@ -109,16 +139,96 @@ RUNTIME_FLAGS = {
 
 STARTUP_LOG_FILE = Path("startup.log")
 
-def load_runtime_config() -> dict:
+def get_default_runtime_config() -> dict[str, Any]:
+    return {
+        "idle_proposal_enabled": True,
+        "idle_proposal_interval_seconds": 300,
+        "idle_proposal_auto_confirm": True,
+        "reviewer_pass_enabled": False,
+        "reviewer_pass_after_tools": False,
+        "reviewer_pass_after_tests": True,
+        "debug_startup": False,
+        "no_dependency_check": False,
+    }
+
+
+def _parse_runtime_config_value(raw_value: Any, default_value: Any) -> Any:
+    if isinstance(default_value, bool):
+        if isinstance(raw_value, str):
+            return raw_value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(raw_value)
+    if isinstance(default_value, int):
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return default_value
+    return raw_value
+
+
+def _apply_env_config_overrides(config: dict[str, Any]) -> dict[str, Any]:
+    runtime_config = dict(config)
+    for env_name, env_value in os.environ.items():
+        for prefix in RUNTIME_CONFIG_PREFIXES:
+            if env_name.startswith(prefix):
+                key = env_name[len(prefix) :].lower()
+                if not key:
+                    continue
+                runtime_config[key] = _parse_runtime_config_value(env_value, config.get(key))
+                break
+    return runtime_config
+
+
+def validate_runtime_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise TypeError("Runtime config must be a dictionary.")
+    defaults = get_default_runtime_config()
+    validated: dict[str, Any] = {}
+    for key, default_value in defaults.items():
+        if key in cfg:
+            validated[key] = _parse_runtime_config_value(cfg[key], default_value)
+        else:
+            validated[key] = default_value
+    return validated
+
+
+def load_runtime_config() -> dict[str, Any]:
+    raw_config: dict[str, Any] = {}
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+                raw = json.load(f)
+                if isinstance(raw, dict):
+                    raw_config = raw
+                else:
+                    ErrorHandler.log(
+                        TypeError("Runtime config file must contain a JSON object."),
+                        severity=ErrorSeverity.RECOVERABLE,
+                        context="load_runtime_config",
+                        code=ErrorCode.IO_ERROR,
+                    )
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="load_runtime_config", code=ErrorCode.IO_ERROR)
 
-def resolve_runtime_flags(argv: list[str] | None = None) -> dict:
+    config = validate_runtime_config(raw_config)
+    config = _apply_env_config_overrides(config)
+    return config
+
+
+def save_runtime_config(config: dict[str, Any]) -> bool:
+    if not isinstance(config, dict):
+        raise TypeError("Runtime config must be a dictionary.")
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_FILE.write_text(json.dumps(validate_runtime_config(config), indent=2), encoding="utf-8")
+        return True
+    except Exception as e:
+        ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="save_runtime_config", code=ErrorCode.IO_ERROR)
+        return False
+
+
+def resolve_runtime_flags(argv: list[str] | None = None) -> dict[str, Any]:
     argv = argv if argv is not None else sys.argv[1:]
     config = load_runtime_config()
     debug_startup = bool(config.get("debug_startup", False)) or ("--debug-startup" in argv)
@@ -138,8 +248,8 @@ class StartupTracer:
             return
         try:
             STARTUP_LOG_FILE.write_text("", encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="StartupTracer.configure", code=ErrorCode.IO_ERROR)
 
     @staticmethod
     def enabled() -> bool:
@@ -154,8 +264,8 @@ class StartupTracer:
         try:
             with open(STARTUP_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
-        except Exception:
-            pass
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="StartupTracer.log", code=ErrorCode.IO_ERROR)
         ConsoleOutput.debug(line)
 
 # --- SKILL PLUGIN FRAMEWORK ---
@@ -361,6 +471,14 @@ class SystemAutomation:
             "capabilities": ["screen-capture", "window-capture"],
             "message": "Pillow is required for screenshot and capture helpers.",
         },
+        {
+            "id": "mss",
+            "platforms": {"windows", "linux", "darwin"},
+            "module": "mss",
+            "install": "pip install mss",
+            "capabilities": ["screen-capture"],
+            "message": "mss can be used as a fallback for full-screen capture when Pillow ImageGrab is unavailable.",
+        },
     ]
 
     @staticmethod
@@ -435,7 +553,8 @@ class SystemAutomation:
                     try:
                         if win32gui.IsWindowVisible(hwnd):
                             hwnds.append(hwnd)
-                    except: pass
+                    except Exception as e:
+                        StartupTracer.log(f"Window enumeration inner callback failed: {e}", "SYS_AUTO")
                     return True
                 win32gui.EnumWindows(enum_callback, None)
 
@@ -451,12 +570,16 @@ class SystemAutomation:
                             try:
                                 proc = psutil.Process(pid)
                                 info["process_name"] = proc.name()
-                            except:
+                            except Exception as e:
+                                StartupTracer.log(f"Could not resolve process name for pid {pid}: {e}", "SYS_AUTO")
                                 info["process_name"] = "Unknown"
-                        except: pass
+                        except Exception as e:
+                            StartupTracer.log(f"Window PID lookup failed: {e}", "SYS_AUTO")
                         windows.append(info)
-                    except: pass
-            except Exception: pass
+                    except Exception as e:
+                        StartupTracer.log(f"Window metadata collection failed: {e}", "SYS_AUTO")
+            except Exception as e:
+                StartupTracer.log(f"Windows window capture failed: {e}", "SYS_AUTO")
 
         elif system == 'Darwin':
             try:
@@ -474,7 +597,8 @@ class SystemAutomation:
                             "process_id": pid,
                             "hwnd": window_id
                         })
-            except Exception: pass
+            except Exception as e:
+                StartupTracer.log(f"Darwin window capture failed: {e}", "SYS_AUTO")
 
         elif system == 'Linux':
             try:
@@ -632,6 +756,33 @@ class SystemAutomation:
             return "Success"
         except Exception as e:
             return f"Capture Error: {e}"
+
+    @staticmethod
+    def capture_screen(output_path: str) -> str:
+        """Capture the full screen across platforms, using Pillow first and mss as fallback."""
+        path_obj = Path(output_path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            from PIL import ImageGrab
+
+            grab_kwargs = {"all_screens": True} if os.name == 'nt' else {}
+            image = ImageGrab.grab(**grab_kwargs)
+            image.save(str(path_obj))
+            return "Success"
+        except Exception as pil_error:
+            try:
+                import mss
+                from PIL import Image
+
+                with mss.mss() as sct:
+                    monitor = sct.monitors[0]
+                    shot = sct.grab(monitor)
+                    image = Image.frombytes("RGB", shot.size, shot.rgb)
+                    image.save(str(path_obj))
+                return "Success"
+            except Exception as mss_error:
+                return f"Screen Capture Error: Pillow={pil_error}; mss={mss_error}"
 
 # --- UI HELPERS ---
 class Colors:
@@ -1312,10 +1463,10 @@ def rlm_search_workspace(query: str, root: str = ".", pattern: str = "*", is_reg
                         "context": snippet[:1200],
                     })
                     if len(results) >= max_results:
-                        return json.dumps(results, indent=2)
-        return json.dumps(results, indent=2)
+                        return _rlm_result("search_workspace", data={"matches": results}, match_count=len(results))
+        return _rlm_result("search_workspace", data={"matches": results}, match_count=len(results))
     except Exception as e:
-        return json.dumps({"error": f"Workspace search error: {e}"})
+        return _rlm_result("search_workspace", ok=False, errors=[f"Workspace search error: {e}"])
 
 
 def rlm_find_symbol(symbol_name: str, root: str = ".", pattern: str = "*.py", max_results: int = 50):
@@ -1345,10 +1496,10 @@ def rlm_find_symbol(symbol_name: str, root: str = ".", pattern: str = "*.py", ma
                     if any(rx.search(line) for rx in compiled):
                         results.append({"file": str(path), "line": idx, "definition": line.strip()[:300]})
                         if len(results) >= max_results:
-                            return json.dumps(results, indent=2)
-        return json.dumps(results, indent=2)
+                            return _rlm_result("find_symbol", data={"matches": results}, match_count=len(results))
+        return _rlm_result("find_symbol", data={"matches": results}, match_count=len(results))
     except Exception as e:
-        return json.dumps({"error": f"Find symbol error: {e}"})
+        return _rlm_result("find_symbol", ok=False, errors=[f"Find symbol error: {e}"])
 
 
 def rlm_python_symbol_doc(symbol_name: str, filepath: str = "", root: str = ".", max_results: int = 10):
@@ -1781,40 +1932,42 @@ def rlm_read_range(filepath, start_line=1, end_line=100):
     try:
         path = Path(filepath)
         if not path.exists():
-            return f"File not found: {filepath}"
+            return _rlm_result("read_range", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath, "start_line": int(start_line), "end_line": int(end_line)})
         lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
         start = max(1, int(start_line))
         end = max(start, int(end_line))
         selected = lines[start - 1:end]
         numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=start))
-        return numbered
+        return _rlm_result("read_range", data={"file": str(path), "start_line": start, "end_line": end, "content": numbered, "line_count": len(selected)})
     except Exception as e:
-        return f"Read range error: {e}"
+        return _rlm_result("read_range", ok=False, errors=[f"Read range error: {e}"], data={"file": filepath, "start_line": start_line, "end_line": end_line})
 
 
 def rlm_create_file(filepath, content="", overwrite=False):
     try:
         path = Path(filepath)
         if path.exists() and not overwrite:
-            return f"Create error: File already exists at {filepath}"
+            return _rlm_result("create_file", ok=False, errors=[f"File already exists at {filepath}"], data={"file": filepath, "overwrite": bool(overwrite)})
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding='utf-8')
-        return f"Successfully created {filepath}"
+        return _rlm_result("create_file", data={"file": str(path), "overwrite": bool(overwrite), "bytes_written": len(content.encode('utf-8'))}, summary=f"Created {filepath}")
     except Exception as e:
-        return f"Create error: {e}"
+        return _rlm_result("create_file", ok=False, errors=[f"Create error: {e}"], data={"file": filepath, "overwrite": bool(overwrite)})
 
 
 def rlm_delete_file(filepath, missing_ok=True):
     try:
         path = Path(filepath)
         if not path.exists():
-            return f"Delete skipped: File not found at {filepath}" if missing_ok else f"Delete error: File not found at {filepath}"
+            if missing_ok:
+                return _rlm_result("delete_file", data={"file": filepath, "deleted": False, "missing_ok": True}, warnings=[f"File not found at {filepath}"])
+            return _rlm_result("delete_file", ok=False, errors=[f"File not found at {filepath}"], data={"file": filepath, "missing_ok": False})
         if path.is_dir():
-            return f"Delete error: {filepath} is a directory"
+            return _rlm_result("delete_file", ok=False, errors=[f"{filepath} is a directory"], data={"file": filepath})
         path.unlink()
-        return f"Successfully deleted {filepath}"
+        return _rlm_result("delete_file", data={"file": filepath, "deleted": True}, summary=f"Deleted {filepath}")
     except Exception as e:
-        return f"Delete error: {e}"
+        return _rlm_result("delete_file", ok=False, errors=[f"Delete error: {e}"], data={"file": filepath, "missing_ok": bool(missing_ok)})
 
 
 def rlm_move_file(src, dst, overwrite=False):
@@ -1822,14 +1975,14 @@ def rlm_move_file(src, dst, overwrite=False):
         src_path = Path(src)
         dst_path = Path(dst)
         if not src_path.exists():
-            return f"Move error: Source not found at {src}"
+            return _rlm_result("move_file", ok=False, errors=[f"Source not found at {src}"], data={"src": src, "dst": dst, "overwrite": bool(overwrite)})
         if dst_path.exists() and not overwrite:
-            return f"Move error: Destination already exists at {dst}"
+            return _rlm_result("move_file", ok=False, errors=[f"Destination already exists at {dst}"], data={"src": src, "dst": dst, "overwrite": bool(overwrite)})
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src_path), str(dst_path))
-        return f"Successfully moved {src} to {dst}"
+        return _rlm_result("move_file", data={"src": src, "dst": dst, "overwrite": bool(overwrite)}, summary=f"Moved {src} to {dst}")
     except Exception as e:
-        return f"Move error: {e}"
+        return _rlm_result("move_file", ok=False, errors=[f"Move error: {e}"], data={"src": src, "dst": dst, "overwrite": bool(overwrite)})
 
 
 def rlm_validate_python(filepath: str = "", code: str = ""):
@@ -1837,13 +1990,13 @@ def rlm_validate_python(filepath: str = "", code: str = ""):
         if filepath:
             path = Path(filepath)
             if not path.exists():
-                return json.dumps({"ok": False, "tool": "validate_python", "errors": [f"File not found: {filepath}"]}, indent=2)
+                return _rlm_result("validate_python", ok=False, errors=[f"File not found: {filepath}"], data={"target": filepath})
             py_compile.compile(str(path), doraise=True)
-            return json.dumps({"ok": True, "tool": "validate_python", "target": str(path), "errors": []}, indent=2)
+            return _rlm_result("validate_python", data={"target": str(path), "mode": "file"}, summary="Python validation passed.")
         ast.parse(code)
-        return json.dumps({"ok": True, "tool": "validate_python", "target": "inline", "errors": []}, indent=2)
+        return _rlm_result("validate_python", data={"target": "inline", "mode": "inline"}, summary="Python validation passed.")
     except Exception as e:
-        return json.dumps({"ok": False, "tool": "validate_python", "errors": [str(e)]}, indent=2)
+        return _rlm_result("validate_python", ok=False, errors=[str(e)], data={"target": filepath or "inline"})
 
 
 def rlm_validate_json(filepath: str = "", content: str = ""):
@@ -1851,20 +2004,18 @@ def rlm_validate_json(filepath: str = "", content: str = ""):
         if filepath:
             path = Path(filepath)
             if not path.exists():
-                return json.dumps({"ok": False, "tool": "validate_json", "errors": [f"File not found: {filepath}"]}, indent=2)
+                return _rlm_result("validate_json", ok=False, errors=[f"File not found: {filepath}"], data={"target": filepath})
             json.loads(path.read_text(encoding='utf-8'))
-            return json.dumps({"ok": True, "tool": "validate_json", "target": str(path), "errors": []}, indent=2)
+            return _rlm_result("validate_json", data={"target": str(path), "mode": "file"}, summary="JSON validation passed.")
         json.loads(content)
-        return json.dumps({"ok": True, "tool": "validate_json", "target": "inline", "errors": []}, indent=2)
+        return _rlm_result("validate_json", data={"target": "inline", "mode": "inline"}, summary="JSON validation passed.")
     except Exception as e:
-        return json.dumps({"ok": False, "tool": "validate_json", "errors": [str(e)]}, indent=2)
+        return _rlm_result("validate_json", ok=False, errors=[str(e)], data={"target": filepath or "inline"})
 
 
 def rlm_inspect_python_environment():
     try:
         info = {
-            "ok": True,
-            "tool": "inspect_python_environment",
             "python_executable": sys.executable,
             "python_version": sys.version,
             "prefix": sys.prefix,
@@ -1878,9 +2029,9 @@ def rlm_inspect_python_environment():
             },
             "site_paths": list(getattr(sys, "path", [])[:20]),
         }
-        return json.dumps(info, indent=2)
+        return _rlm_result("inspect_python_environment", data=info, summary="Collected Python environment details.")
     except Exception as e:
-        return json.dumps({"ok": False, "tool": "inspect_python_environment", "errors": [str(e)]}, indent=2)
+        return _rlm_result("inspect_python_environment", ok=False, errors=[str(e)])
 
 
 def rlm_list_python_packages(limit: int = 500):
@@ -1888,11 +2039,11 @@ def rlm_list_python_packages(limit: int = 500):
         cmd = [sys.executable, "-m", "pip", "list", "--format=json"]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, encoding='utf-8', errors='replace')
         if res.returncode != 0:
-            return json.dumps({"ok": False, "tool": "list_python_packages", "errors": [res.stderr.strip() or res.stdout.strip() or "pip list failed"]}, indent=2)
+            return _rlm_result("list_python_packages", ok=False, errors=[res.stderr.strip() or res.stdout.strip() or "pip list failed"])
         data = json.loads(res.stdout or "[]")
-        return json.dumps({"ok": True, "tool": "list_python_packages", "count": len(data), "packages": data[: int(limit)]}, indent=2)
+        return _rlm_result("list_python_packages", data={"count": len(data), "packages": data[: int(limit)]}, summary=f"Listed {len(data[: int(limit)])} package(s).")
     except Exception as e:
-        return json.dumps({"ok": False, "tool": "list_python_packages", "errors": [str(e)]}, indent=2)
+        return _rlm_result("list_python_packages", ok=False, errors=[str(e)])
 
 def get_terminal_environment() -> Dict[str, Any]:
     """Detects the current terminal execution environment."""
@@ -1937,7 +2088,8 @@ def get_terminal_environment() -> Dict[str, Any]:
 def rlm_grep(pattern, filepath, context_lines=2):
     results = []
     try:
-        if not os.path.exists(filepath): return f"File not found: {filepath}"
+        if not os.path.exists(filepath):
+            return _rlm_result("grep", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath, "pattern": pattern})
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
@@ -1945,57 +2097,67 @@ def rlm_grep(pattern, filepath, context_lines=2):
                 start = max(0, i - context_lines)
                 end = min(len(lines), i + context_lines + 1)
                 snippet = "".join(lines[start:end])
-                results.append(f"--- Match at line {i+1} ---\n{snippet}")
-        return "\n".join(results) if results else "No matches found."
-    except Exception as e: return f"Grep error: {e}"
+                results.append({"line": i + 1, "context": snippet[:1200]})
+        return _rlm_result("grep", data={"file": filepath, "pattern": pattern, "matches": results}, match_count=len(results), warnings=[] if results else ["No matches found."])
+    except Exception as e:
+        return _rlm_result("grep", ok=False, errors=[f"Grep error: {e}"], data={"file": filepath, "pattern": pattern})
 
 def rlm_peek(filepath, start_line=0, end_line=30):
     try:
-        if not os.path.exists(filepath): return f"File not found: {filepath}"
+        if not os.path.exists(filepath):
+            return _rlm_result("peek", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath, "start_line": int(start_line), "end_line": int(end_line)})
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
         
         content = "".join(lines[start_line:end_line])
         if len(lines) > end_line:
             content += f"\n... (truncated, total lines: {len(lines)})"
-        return content
-    except Exception as e: return f"Peek error: {e}"
+        return _rlm_result("peek", data={"file": filepath, "start_line": int(start_line), "end_line": int(end_line), "content": content})
+    except Exception as e:
+        return _rlm_result("peek", ok=False, errors=[f"Peek error: {e}"], data={"file": filepath, "start_line": start_line, "end_line": end_line})
 
 def rlm_read(filepath):
     try:
-        if not os.path.exists(filepath): return f"File not found: {filepath}"
+        if not os.path.exists(filepath):
+            return _rlm_result("read_file", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath})
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            return f.read()
-    except Exception as e: return f"Read error: {e}"
+            return _rlm_result("read_file", data={"file": filepath, "content": f.read()})
+    except Exception as e:
+        return _rlm_result("read_file", ok=False, errors=[f"Read error: {e}"], data={"file": filepath})
 
 def rlm_write(filepath, content):
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-        return f"Successfully wrote to {filepath}"
-    except Exception as e: return f"Write error: {e}"
+        return _rlm_result("write_file", data={"file": filepath, "bytes_written": len(content.encode('utf-8'))}, summary=f"Wrote {filepath}")
+    except Exception as e:
+        return _rlm_result("write_file", ok=False, errors=[f"Write error: {e}"], data={"file": filepath})
 
 def rlm_patch(filepath, search_block, replace_block, count=1):
     try:
-        if not os.path.exists(filepath): return f"File not found: {filepath}"
+        if not os.path.exists(filepath):
+            return _rlm_result("patch_file", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath, "expected_count": int(count)})
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
         
         occ = content.count(search_block)
-        if occ == 0: return f"Patch error: Search block not found in {filepath}"
+        if occ == 0:
+            return _rlm_result("patch_file", ok=False, errors=[f"Search block not found in {filepath}"], data={"file": filepath, "expected_count": int(count), "actual_count": occ})
         if count > 0 and occ != count:
-            return f"Patch error: Expected {count} occurrence(s), but found {occ} in {filepath}. Patch aborted for safety."
+            return _rlm_result("patch_file", ok=False, errors=[f"Expected {count} occurrence(s), but found {occ} in {filepath}. Patch aborted for safety."], data={"file": filepath, "expected_count": int(count), "actual_count": occ})
         
         new_content = content.replace(search_block, replace_block, count if count > 0 else -1)
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(new_content)
-        return f"Successfully patched {filepath} ({occ} replacement(s))"
-    except Exception as e: return f"Patch error: {e}"
+        return _rlm_result("patch_file", data={"file": filepath, "replacement_count": occ}, summary=f"Patched {filepath}")
+    except Exception as e:
+        return _rlm_result("patch_file", ok=False, errors=[f"Patch error: {e}"], data={"file": filepath, "expected_count": int(count)})
 
 def rlm_edit_lines(filepath, start_line, end_line, new_content):
     """Surgically replaces a range of lines (1-indexed, inclusive)."""
     try:
-        if not os.path.exists(filepath): return f"File not found: {filepath}"
+        if not os.path.exists(filepath):
+            return _rlm_result("edit_lines", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath, "start_line": int(start_line), "end_line": int(end_line)})
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
         
@@ -2003,7 +2165,8 @@ def rlm_edit_lines(filepath, start_line, end_line, new_content):
         s = max(0, start_line - 1)
         e = min(len(lines), end_line)
         
-        if s >= len(lines): return f"Edit error: start_line {start_line} is beyond file length"
+        if s >= len(lines):
+            return _rlm_result("edit_lines", ok=False, errors=[f"start_line {start_line} is beyond file length"], data={"file": filepath, "start_line": int(start_line), "end_line": int(end_line), "line_count": len(lines)})
         
         # Prepare replacement
         if not new_content.endswith('\n') and e < len(lines):
@@ -2013,16 +2176,18 @@ def rlm_edit_lines(filepath, start_line, end_line, new_content):
         
         with open(filepath, 'w', encoding='utf-8') as f:
             f.writelines(lines)
-        return f"Successfully edited lines {start_line}-{end_line} in {filepath}"
-    except Exception as e: return f"Edit error: {e}"
+        return _rlm_result("edit_lines", data={"file": filepath, "start_line": int(start_line), "end_line": int(end_line)}, summary=f"Edited lines {start_line}-{end_line} in {filepath}")
+    except Exception as e:
+        return _rlm_result("edit_lines", ok=False, errors=[f"Edit error: {e}"], data={"file": filepath, "start_line": start_line, "end_line": end_line})
 
 def rlm_find_files(pattern, root="."):
     matches = []
     try:
         for path in Path(root).rglob(pattern):
             matches.append(str(path))
-        return "\n".join(matches) if matches else "No files found."
-    except Exception as e: return f"Find error: {e}"
+        return _rlm_result("find_files", data={"root": root, "pattern": pattern, "matches": matches}, match_count=len(matches), warnings=[] if matches else ["No files found."])
+    except Exception as e:
+        return _rlm_result("find_files", ok=False, errors=[f"Find error: {e}"], data={"root": root, "pattern": pattern})
 
 def rlm_tree(root=".", depth=2):
     output = []
@@ -2040,21 +2205,25 @@ def rlm_tree(root=".", depth=2):
                     walk(entry, current_depth + 1)
         output.append(f"Root: {root_path.resolve()}")
         walk(root_path, 0)
-        return "\n".join(output)
-    except Exception as e: return f"Tree error: {e}"
+        return _rlm_result("tree", data={"root": str(root_path.resolve()), "depth": int(depth), "content": "\n".join(output)})
+    except Exception as e:
+        return _rlm_result("tree", ok=False, errors=[f"Tree error: {e}"], data={"root": root, "depth": depth})
 
 def rlm_read_metadata(filepath):
     try:
         p = Path(filepath)
-        if not p.exists(): return f"File not found: {filepath}"
+        if not p.exists():
+            return _rlm_result("read_metadata", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath})
         stat = p.stat()
-        return f"File: {filepath}\nSize: {stat.st_size} bytes\nModified: {time.ctime(stat.st_mtime)}"
-    except Exception as e: return f"Metadata error: {e}"
+        return _rlm_result("read_metadata", data={"file": filepath, "size": stat.st_size, "modified": time.ctime(stat.st_mtime)})
+    except Exception as e:
+        return _rlm_result("read_metadata", ok=False, errors=[f"Metadata error: {e}"], data={"file": filepath})
 
 def rlm_history_search(query: str, limit: int = 10):
     """Searches the persistent JSONL archive for keywords."""
     results = []
-    if not ARCHIVE_FILE.exists(): return "No history archive found."
+    if not ARCHIVE_FILE.exists():
+        return _rlm_result("history_search", data={"query": query, "matches": []}, warnings=["No history archive found."])
     try:
         with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
             for line in f:
@@ -2062,14 +2231,15 @@ def rlm_history_search(query: str, limit: int = 10):
                     data = json.loads(line)
                     results.append(f"[{time.ctime(data['ts'])}] {data['role'].upper()}: {data['content'][:200]}...")
         
-        if not results: return f"No matches found for '{query}' in archive."
-        return "\n".join(results[-limit:]) # Return last N matches
-    except Exception as e: return f"History search error: {e}"
+        return _rlm_result("history_search", data={"query": query, "matches": results[-limit:]}, match_count=len(results), warnings=[] if results else [f"No matches found for '{query}' in archive."])
+    except Exception as e:
+        return _rlm_result("history_search", ok=False, errors=[f"History search error: {e}"], data={"query": query, "limit": int(limit)})
 
 def rlm_map_dependencies(filepath: str):
     """Uses static analysis (parsing import statements) to show local file dependencies."""
     path = Path(filepath)
-    if not path.exists(): return f"Error: File '{filepath}' not found."
+    if not path.exists():
+        return _rlm_result("map_dependencies", ok=False, errors=[f"File '{filepath}' not found."], data={"file": filepath})
     
     deps = []
     ext = path.suffix.lower()
@@ -2098,9 +2268,10 @@ def rlm_map_dependencies(filepath: str):
                         deps.append(str(candidate))
                         break
         
-        return sorted(list(set(deps)))
+        unique_deps = sorted(list(set(deps)))
+        return _rlm_result("map_dependencies", data={"file": filepath, "dependencies": unique_deps}, dependency_count=len(unique_deps))
     except Exception as e:
-        return f"Error mapping dependencies for {filepath}: {e}"
+        return _rlm_result("map_dependencies", ok=False, errors=[f"Error mapping dependencies for {filepath}: {e}"], data={"file": filepath})
 
 def rlm_project_summary(root: str = "."):
     """Generates a high-level architectural overview of the workspace."""
@@ -3377,6 +3548,28 @@ class DiffLogger:
         entry = f"\n## 📉 CONTEXT COMPRESSION EVENT\n- **Tokens Before:** {tokens_before}\n- **Tokens After:** {tokens_after}\n- **Ratio:** {((tokens_before-tokens_after)/tokens_before)*100:.1f}% reduction\n---\n"
         with self.log_path.open("a", encoding="utf-8") as f: f.write(entry)
 
+    def log_proposal_event(self, proposal_path: Path, passed: bool, notes: str = ""):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        status = "PASSED" if passed else "FAILED"
+        entry = (
+            f"\n## Proposal Event - {timestamp}\n"
+            f"- **Proposal:** {proposal_path}\n"
+            f"- **Status:** {status}\n"
+            f"- **Notes:** {notes or 'none'}\n---\n"
+        )
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+
+    def log_plan_event(self, plan_text: str, context: str = ""):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = (
+            f"\n## Plan Event - {timestamp}\n"
+            f"- **Context:** {context or 'N/A'}\n"
+            f"- **Plan:**\n{plan_text}\n---\n"
+        )
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+
 # --- NEXT-GEN ASYNC STATE MANAGEMENT ---
 @dataclass
 class MemoryEntry:
@@ -3397,6 +3590,7 @@ class AgentState:
     WRITE_BATCH_MAX = 64
     WRITE_BATCH_WAIT_SECONDS = 0.20
     DB_BUSY_TIMEOUT_MS = 5000
+    DEFAULT_JOURNAL_MODE = "wal"
 
     def __init__(self, state_file: Path, globals_file: Path, snapshot_dir: Path, max_snapshots: int = 5):
         self.state_file = state_file
@@ -3438,23 +3632,59 @@ class AgentState:
         self._writer_thread.start()
 
     def _connect_db(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=self.DB_BUSY_TIMEOUT_MS / 1000)
-        conn.row_factory = sqlite3.Row
-        self._apply_pragmas(conn, verify=not self._db_pragmas_verified)
-        return conn
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=self.DB_BUSY_TIMEOUT_MS / 1000)
+            conn.row_factory = sqlite3.Row
+            self._apply_pragmas(conn, verify=not self._db_pragmas_verified)
+            return conn
+        except sqlite3.DatabaseError as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.CRITICAL, context="AgentState._connect_db", code=ErrorCode.IO_ERROR)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if self.db_path.exists():
+                fallback_path = self.db_path.with_name(f"{self.db_path.name}.corrupt.{int(time.time())}")
+                try:
+                    self.db_path.rename(fallback_path)
+                    ConsoleOutput.warning(f"Repaired corrupted state DB; moved original to {fallback_path}")
+                except Exception as rename_error:
+                    ErrorHandler.log(rename_error, severity=ErrorSeverity.CRITICAL, context="AgentState._connect_db.rename", code=ErrorCode.IO_ERROR)
+            conn = None
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=self.DB_BUSY_TIMEOUT_MS / 1000)
+                conn.row_factory = sqlite3.Row
+                self._apply_pragmas(conn, verify=not self._db_pragmas_verified)
+                return conn
+            except Exception:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
 
     def _apply_pragmas(self, conn: sqlite3.Connection, verify: bool = False):
         conn.execute(f"PRAGMA busy_timeout={self.DB_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode=WAL")
+        journal_mode = self.DEFAULT_JOURNAL_MODE
+        try:
+            journal_mode = str(conn.execute(f"PRAGMA journal_mode={self.DEFAULT_JOURNAL_MODE}").fetchone()[0]).lower()
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="AgentState._apply_pragmas.journal_mode", code=ErrorCode.IO_ERROR)
+            journal_mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA foreign_keys=ON")
+        if journal_mode == "wal":
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
         if verify:
             try:
-                journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                current_journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
                 busy_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
-                if journal_mode != "wal":
-                    raise RuntimeError(f"SQLite journal_mode verification failed: expected wal, got {journal_mode}")
+                if current_journal_mode not in {"wal", "delete"}:
+                    raise RuntimeError(f"SQLite journal_mode verification failed: unsupported mode {current_journal_mode}")
                 if busy_timeout < self.DB_BUSY_TIMEOUT_MS:
                     raise RuntimeError(
                         f"SQLite busy_timeout verification failed: expected >= {self.DB_BUSY_TIMEOUT_MS}, got {busy_timeout}"
@@ -3764,6 +3994,13 @@ class AgentState:
         """Wait for the background writer thread to exit."""
         if self._writer_thread.is_alive():
             self._writer_thread.join(timeout=timeout)
+            if self._writer_thread.is_alive():
+                ErrorHandler.log(
+                    RuntimeError("Background writer thread failed to terminate within timeout."),
+                    severity=ErrorSeverity.CRITICAL,
+                    context="AgentState.join_writer",
+                    code=ErrorCode.IO_ERROR,
+                )
 
     def close(self):
         """Flush pending writes, stop the writer thread, and close the state lifecycle."""
@@ -3774,6 +4011,27 @@ class AgentState:
         self._stop_event.set()
         self._write_queue.put(None)
         self.join_writer(timeout=5)
+        if os.name == 'nt':
+            time.sleep(0.5)
+        for attempt in range(5):
+            try:
+                with sqlite3.connect(self.db_path, timeout=self.DB_BUSY_TIMEOUT_MS / 1000) as conn:
+                    mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                    if mode == "wal":
+                        checkpoint_mode = "TRUNCATE" if os.name == 'nt' else "FULL"
+                        conn.execute(f"PRAGMA wal_checkpoint({checkpoint_mode})")
+                break
+            except sqlite3.DatabaseError as e:
+                if attempt == 4:
+                    ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="AgentState.close", code=ErrorCode.IO_ERROR)
+                time.sleep(0.5)
+            except Exception as e:
+                ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="AgentState.close", code=ErrorCode.IO_ERROR)
+                break
+        if os.name == 'nt':
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                gc.collect()
 
     # --- structured history API ------------------------------------------------
     def _sanitize_content(self, text: str) -> str:
@@ -3926,6 +4184,42 @@ class AgentState:
     def recall(self, key: str):
         with self._cache_lock:
             return self._kv_cache.get(key)
+
+    def list_records(self, key: str) -> list[Any]:
+        value = self.recall(key)
+        return list(value) if isinstance(value, list) else []
+
+    def append_record(self, key: str, record: Any, limit: int = 200):
+        records = self.list_records(key)
+        records.append(record)
+        if limit > 0 and len(records) > limit:
+            records = records[-limit:]
+        self.remember(key, records)
+        return records
+
+    def replace_records(self, key: str, records: list[Any]):
+        self.remember(key, list(records or []))
+
+    def upsert_goal(self, goal_record: dict[str, Any]):
+        if not isinstance(goal_record, dict):
+            raise TypeError("Goal record must be a dictionary.")
+        records = self.list_records(GOAL_RECORDS_KEY)
+        goal_id = str(goal_record.get("id", "")).strip()
+        if not goal_id:
+            raise ValueError("Goal record must include an id.")
+        replaced = False
+        for index, existing in enumerate(records):
+            if isinstance(existing, dict) and str(existing.get("id", "")) == goal_id:
+                records[index] = goal_record
+                replaced = True
+                break
+        if not replaced:
+            records.append(goal_record)
+        self.replace_records(GOAL_RECORDS_KEY, records[-500:])
+        return goal_record
+
+    def goal_records(self) -> list[dict[str, Any]]:
+        return [item for item in self.list_records(GOAL_RECORDS_KEY) if isinstance(item, dict)]
             
     def take_snapshot(self, label: str = "auto"):
         # Create a consistent SQLite backup snapshot and rotate old ones.
@@ -3956,12 +4250,12 @@ class OllamaProvider:
         self.url = f"http://{host}:{port}/api/chat"
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
-    def chat(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.1) -> Dict[str, Any]:
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1}
+            "options": {"temperature": float(temperature)}
         }
         headers = {"Content-Type": "application/json"}
         try:
@@ -3975,23 +4269,45 @@ class OllamaProvider:
 
 class CopilotClient:
     def __init__(self):
-        self.github_token = self._get_github_token()
-        self.token_data = None
+        self.token_data = self._read_token_cache() or {}
+        self.github_token = self.token_data.get("access_token") or self._get_github_token()
         self._ensure_session()
+
+    def _read_token_cache(self) -> dict:
+        try:
+            if os.path.exists(TOKEN_CACHE_FILE):
+                with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _write_token_cache(self, data: dict) -> None:
+        try:
+            tmp = TOKEN_CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, TOKEN_CACHE_FILE)
+        except Exception as e:
+            print(f"{Colors.YELLOW}[Auth] Warning: failed to write token cache: {e}{Colors.ENDC}")
 
     def _ensure_session(self, force_refresh=False):
         """Ensures we have a valid short-lived Copilot session token."""
         now = time.time()
-        if not self.token_data or force_refresh or now > self.token_data.get("expires_at", 0) - 300:
+        if force_refresh or not self.token_data or now > self.token_data.get("expires_at", 0) - 300:
             try:
                 self.token_data = self._refresh_token()
+                self.token_data["access_token"] = self.github_token
+                self._write_token_cache(self.token_data)
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     print(f"{Colors.RED}[Auth] GitHub Token (OAuth) is invalid or expired. Re-authenticating...{Colors.ENDC}")
                     self.github_token = self._authenticate_device_flow()
-                    with open(TOKEN_CACHE_FILE, "w") as f: json.dump({"access_token": self.github_token}, f)
                     self.token_data = self._refresh_token()
-                else: raise e
+                    self.token_data["access_token"] = self.github_token
+                    self._write_token_cache(self.token_data)
+                else:
+                    raise e
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def _make_request(self, url, method="GET", headers=None, data=None):
@@ -4005,7 +4321,7 @@ class CopilotClient:
         
         req = urllib.request.Request(url, data=encoded_data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req) as res:
+            with urllib.request.urlopen(req, timeout=10) as res:
                 return res.getcode(), json.loads(res.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read().decode("utf-8"))
@@ -4043,21 +4359,23 @@ class CopilotClient:
             elif token_data.get("error") == "expired_token": raise Exception("Code expired.")
 
     def _get_github_token(self):
-        if os.path.exists(TOKEN_CACHE_FILE):
-            with open(TOKEN_CACHE_FILE, "r") as f: return json.load(f).get("access_token")
-        
+        cache = self._read_token_cache()
+        if cache and cache.get("access_token") and cache.get("expires_at", 0) > time.time() + 30:
+            return cache.get("access_token")
+
         token = os.environ.get("GITHUB_TOKEN")
-        if token: return token
-        
-        # Trigger interactive flow
+        if token:
+            self._write_token_cache({"access_token": token, "expires_at": time.time() + 1500})
+            return token
+
         token = self._authenticate_device_flow()
-        with open(TOKEN_CACHE_FILE, "w") as f: json.dump({"access_token": token}, f)
+        self._write_token_cache({"access_token": token, "expires_at": time.time() + 1500})
         return token
 
     def _refresh_token(self):
         headers = {**COMMON_HEADERS, "Authorization": f"Bearer {self.github_token}"}
         req = urllib.request.Request(COPILOT_TOKEN_URL, headers=headers)
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req, timeout=10) as res:
             data = json.loads(res.read().decode("utf-8"))
             
             # Robust endpoint parsing
@@ -4069,16 +4387,18 @@ class CopilotClient:
             
             # Use expires_at from response, or default to 25 mins
             expires_at = data.get("expires_at", time.time() + 1500)
-            return {"token": data["token"], "base_url": base_url, "expires_at": expires_at}
+            result = {"token": data["token"], "base_url": base_url, "expires_at": expires_at}
+            self._write_token_cache({"access_token": self.github_token, **result})
+            return result
 
     @retry_with_backoff(retries=3, backoff_in_seconds=1)
-    def chat(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    def chat(self, messages: List[Dict[str, str]], temperature: float | None = None, **kwargs) -> Dict[str, Any]:
         try:
             self._ensure_session() # Auto-refresh if expired
             
             url = f"{self.token_data['base_url']}/chat/completions"
             headers = {**COMMON_HEADERS, "Authorization": f"Bearer {self.token_data['token']}", "Content-Type": "application/json"}
-            payload = {"model": "gpt-5-mini", "messages": messages, "temperature": 0.1}
+            payload = {"model": "gpt-5-mini", "messages": messages}
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
             with urllib.request.urlopen(req) as res: return json.loads(res.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
@@ -4469,8 +4789,18 @@ class FlexiBot:
         _log("brain created")
         self.logger = DiffLogger(EVOLUTION_LOG)
         _log("logger created")
-        self.execution_policy = ExecutionPolicyLayer(load_runtime_config())
+        self.config = load_runtime_config()
+        self.execution_policy = ExecutionPolicyLayer(self.config)
         _log("execution policy created")
+
+        # Idle proposal config controls
+        self.idle_proposal_enabled = bool(self.config.get("idle_proposal_enabled", True))
+        self.idle_proposal_interval_seconds = int(self.config.get("idle_proposal_interval_seconds", 300))
+        self.idle_proposal_auto_confirm = bool(self.config.get("idle_proposal_auto_confirm", True))
+        self.reviewer_pass_enabled = bool(self.config.get("reviewer_pass_enabled", False))
+        self.reviewer_pass_after_tools = bool(self.config.get("reviewer_pass_after_tools", False))
+        self.reviewer_pass_after_tests = bool(self.config.get("reviewer_pass_after_tests", True))
+
         # context helper exposes convenient prompt-building utilities
         self.context = BotContext(self)
         _log("context helper created")
@@ -4507,6 +4837,11 @@ class FlexiBot:
         # Control flag: If True, the agent must explicitly acknowledge the last observation
         # using the token <ack_observation> before a <consensus> will be accepted.
         self.must_wait_for_observation = False
+
+        # Background proposal agent processes approved proposals and patches core code.
+        bg_thread = threading.Thread(target=self._background_proposal_agent, daemon=True)
+        bg_thread.start()
+
         _log("constructor complete")
 
     # --- event hooks --------------------------------------------------------
@@ -4527,6 +4862,9 @@ class FlexiBot:
         return re.sub(r"\s+", " ", payload).strip()
 
     def _tool_result_failed(self, result: str) -> bool:
+        payload = self._parse_tool_result_payload(result)
+        if payload is not None:
+            return not bool(payload.get("ok", False))
         lowered = (result or "").lower()
         failure_markers = (
             "traceback",
@@ -4844,16 +5182,233 @@ class FlexiBot:
             "subagents": self.subagent_manager.get_load_stats(),
             "memory_keys": list(self.state.structured_memory.keys()),
             "background_task_ids": sorted(self.state.active_processes.keys()),
+            "reviewer_event_count": len(self.state.list_records(REVIEWER_EVENT_KEY)),
+            "goal_count": len(self.state.goal_records()),
+            "active_goals": [goal for goal in self.state.goal_records() if goal.get("status") in {GOAL_STATUS_ACTIVE, GOAL_STATUS_PENDING}],
             "execution_policy": self.execution_policy.describe(),
         }
+
+
+    def _structured_tool_result(self, tool: str, ok: bool, *, summary: str = "", data: dict[str, Any] | None = None,
+                                errors: list[str] | None = None, warnings: list[str] | None = None) -> str:
+        payload = {
+            "ok": bool(ok),
+            "tool": tool,
+            "summary": summary,
+            "data": data or {},
+            "errors": list(errors or []),
+            "warnings": list(warnings or []),
+        }
+        return json.dumps(payload, indent=2)
+
+    def _parse_tool_result_payload(self, result: str) -> dict[str, Any] | None:
+        if not isinstance(result, str):
+            return None
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict) and parsed.get("tool"):
+                return parsed
+        except Exception:
+            return None
+        return None
+
+    def _tool_result_text(self, result: str) -> str:
+        payload = self._parse_tool_result_payload(result)
+        if not payload:
+            return result or ""
+        data = payload.get("data") or {}
+        parts = []
+        if isinstance(data.get("stdout"), str) and data.get("stdout"):
+            parts.append(data.get("stdout"))
+        if isinstance(data.get("stderr"), str) and data.get("stderr"):
+            parts.append(data.get("stderr"))
+        if isinstance(data.get("output"), str) and data.get("output"):
+            parts.append(data.get("output"))
+        if isinstance(data.get("analysis"), str) and data.get("analysis"):
+            parts.append(data.get("analysis"))
+        if isinstance(payload.get("summary"), str) and payload.get("summary"):
+            parts.append(payload.get("summary"))
+        if isinstance(payload.get("errors"), list) and payload.get("errors"):
+            parts.extend(str(item) for item in payload.get("errors") if item)
+        return "\n".join(part for part in parts if part).strip()
+
+    def _store_reviewer_event(self, subject: str, request_text: str, result_text: str,
+                              verification: dict[str, Any] | None, review: str):
+        event = {
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.now().isoformat(),
+            "subject": subject,
+            "request": (request_text or "")[:500],
+            "result": self._tool_result_text(result_text)[:1000],
+            "verification": verification or {},
+            "review": review,
+        }
+        self.state.append_record(REVIEWER_EVENT_KEY, event, limit=200)
+
+    def _goal_record(self, text: str, *, status: str = GOAL_STATUS_PENDING, priority: int = 2) -> dict[str, Any]:
+        now = datetime.now().isoformat()
+        return {
+            "id": str(uuid.uuid4())[:8],
+            "text": text.strip(),
+            "status": status,
+            "priority": int(priority),
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": "",
+        }
+
+    def add_goal(self, text: str, *, priority: int = 2, status: str = GOAL_STATUS_PENDING) -> dict[str, Any]:
+        goal = self._goal_record(text, status=status, priority=priority)
+        self.state.upsert_goal(goal)
+        self.state.append_history("system", f"Goal added: {goal['id']} {goal['text']}", tags=["goal"])
+        return goal
+
+    def update_goal(self, goal_id: str, *, status: str | None = None, text: str | None = None, priority: int | None = None) -> dict[str, Any] | None:
+        goal_id = str(goal_id).strip()
+        for goal in self.state.goal_records():
+            if str(goal.get("id", "")) != goal_id:
+                continue
+            updated = dict(goal)
+            if status is not None:
+                updated["status"] = status
+                if status in {GOAL_STATUS_COMPLETED, GOAL_STATUS_CANCELLED, GOAL_STATUS_FAILED}:
+                    updated["completed_at"] = datetime.now().isoformat()
+            if text is not None:
+                updated["text"] = text.strip()
+            if priority is not None:
+                updated["priority"] = int(priority)
+            updated["updated_at"] = datetime.now().isoformat()
+            self.state.upsert_goal(updated)
+            self.state.append_history("system", f"Goal updated: {updated['id']} status={updated['status']} text={updated['text']}", tags=["goal"])
+            return updated
+        return None
+
+    def active_goals(self) -> list[dict[str, Any]]:
+        goals = [goal for goal in self.state.goal_records() if goal.get("status") in {GOAL_STATUS_PENDING, GOAL_STATUS_ACTIVE}]
+        return sorted(goals, key=lambda item: (int(item.get("priority", 2)), item.get("created_at", "")))
+
+    def render_goal_summary(self) -> str:
+        goals = self.state.goal_records()
+        if not goals:
+            return "No persisted goals."
+        lines = []
+        for goal in sorted(goals, key=lambda item: (item.get("status", ""), int(item.get("priority", 2)), item.get("created_at", ""))):
+            lines.append(f"[{goal.get('id')}] status={goal.get('status')} priority={goal.get('priority')} text={goal.get('text')}")
+        return "\n".join(lines)
+
+    def render_reviewer_summary(self, limit: int = 10) -> str:
+        events = self.state.list_records(REVIEWER_EVENT_KEY)[-max(1, int(limit)):]
+        if not events:
+            return "No reviewer events recorded."
+        lines = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            lines.append(f"[{event.get('timestamp', '')}] {event.get('subject', '')}: {str(event.get('review', ''))[:300]}")
+        return "\n".join(lines) if lines else "No reviewer events recorded."
+
+    def render_history_summary(self, limit: int = 10) -> str:
+        entries = self.state.query_history(limit=max(1, int(limit)))
+        if not entries:
+            return "No history entries."
+        return "\n".join(
+            f"[{datetime.fromtimestamp(entry.get('timestamp', 0)).isoformat() if entry.get('timestamp') else ''}] {entry.get('role', '')}: {str(entry.get('content', ''))[:300]}"
+            for entry in entries
+        )
+
+    def render_health_summary(self) -> str:
+        status = self.get_runtime_status()
+        metrics = status.get("metrics", {})
+        return "\n".join([
+            f"status={status.get('status')}",
+            f"total_tokens={metrics.get('total_tokens')}",
+            f"threads={metrics.get('threads')}",
+            f"background_tasks={metrics.get('background_tasks')}",
+            f"goals={status.get('goal_count')}",
+            f"reviewer_events={status.get('reviewer_event_count')}",
+        ])
+
+    def handle_operator_command(self, raw_command: str) -> str:
+        command = (raw_command or "").strip()
+        if not command:
+            return ""
+        parts = command.split()
+        head = parts[0].lower()
+
+        if head == "/health":
+            return self.render_health_summary()
+        if head == "/history":
+            limit = 10
+            if len(parts) > 1:
+                try:
+                    limit = max(1, min(100, int(parts[1])))
+                except ValueError:
+                    return "Usage: /history [limit]"
+            return self.render_history_summary(limit=limit)
+        if head == "/reviews":
+            limit = 10
+            if len(parts) > 1:
+                try:
+                    limit = max(1, min(100, int(parts[1])))
+                except ValueError:
+                    return "Usage: /reviews [limit]"
+            return self.render_reviewer_summary(limit=limit)
+        if head == "/goals":
+            return self.render_goal_summary()
+        if head == "/goal":
+            if len(parts) < 2:
+                return "Usage: /goal add <text> | /goal start <id> | /goal done <id> | /goal cancel <id> | /goal fail <id>"
+            action = parts[1].lower()
+            if action == "add":
+                goal_text = command.partition(" add ")[2].strip() if " add " in command else ""
+                if not goal_text:
+                    return "Usage: /goal add <text>"
+                goal = self.add_goal(goal_text)
+                return f"Added goal [{goal['id']}] priority={goal['priority']} status={goal['status']} text={goal['text']}"
+            if len(parts) < 3:
+                return f"Usage: /goal {action} <id>"
+            goal_id = parts[2]
+            status_map = {
+                "start": GOAL_STATUS_ACTIVE,
+                "done": GOAL_STATUS_COMPLETED,
+                "cancel": GOAL_STATUS_CANCELLED,
+                "fail": GOAL_STATUS_FAILED,
+            }
+            if action not in status_map:
+                return "Usage: /goal add <text> | /goal start <id> | /goal done <id> | /goal cancel <id> | /goal fail <id>"
+            updated = self.update_goal(goal_id, status=status_map[action])
+            if not updated:
+                return f"No goal found for id {goal_id}."
+            return f"Updated goal [{updated['id']}] status={updated['status']} text={updated['text']}"
+        if head == "/help":
+            return "\n".join([
+                "/health",
+                "/history [limit]",
+                "/reviews [limit]",
+                "/goals",
+                "/goal add <text>",
+                "/goal start <id>",
+                "/goal done <id>",
+                "/goal cancel <id>",
+                "/goal fail <id>",
+                "exit | quit",
+            ])
+        return f"Unknown operator command: {command}"
 
     def verify_and_report(self, result: str, context: str = "") -> Dict[str, Any]:
         """Run lightweight verification on textual tool output. Returns a summary dict and logs results.
         Looks for "Traceback", 'Error', 'FAILED', '✗', or other failure markers."""
         try:
-            r = (result or "").strip()
+            payload = self._parse_tool_result_payload(result)
             errors = []
             success = True
+            payload_errors = payload.get("errors", []) if payload else []
+            r = self._tool_result_text(result).strip()
+            errors = []
+
+            if payload and not payload.get("ok", True):
+                success = False
+                errors.extend(str(item) for item in payload_errors if item)
 
             if not r:
                 success = False
@@ -4886,6 +5441,64 @@ class FlexiBot:
             ErrorHandler.log(e, context="verify_and_report")
             return {"success": False, "summary": f"Verification failed: {e}", "errors": [str(e)]}
 
+    def _reviewer_pass_allowed(self, subject: str) -> bool:
+        if not self.reviewer_pass_enabled:
+            return False
+        if subject == "tests":
+            return self.reviewer_pass_after_tests
+        return self.reviewer_pass_after_tools
+
+    def _run_reviewer_pass(self, subject: str, request_text: str, result_text: str,
+                           verification: dict[str, Any] | None = None) -> str:
+        if not self._reviewer_pass_allowed(subject):
+            return ""
+
+        truncated_request = (request_text or "")[:1500]
+        truncated_result = (result_text or "")[:4000]
+        verification_text = json.dumps(verification or {}, ensure_ascii=False)[:1500]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise runtime reviewer. Assess the execution result and say whether it looks healthy, "
+                    "risky, or blocked. Keep the response short and practical."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Subject: {subject}\n"
+                    f"Request:\n{truncated_request}\n\n"
+                    f"Result:\n{truncated_result}\n\n"
+                    f"Verification:\n{verification_text}\n\n"
+                    "Respond with two lines: 'Assessment:' and 'Next step:'."
+                ),
+            },
+        ]
+
+        try:
+            resp_data = self.client.chat(messages)
+            review = resp_data["choices"][0]["message"]["content"].strip()
+            if review:
+                self._store_reviewer_event(subject, request_text, result_text, verification, review)
+                self._append_response_trace(
+                    "reviewer_pass",
+                    subject=subject,
+                    request=request_text[:500],
+                    result=self._tool_result_text(result_text)[:1000],
+                    verification=verification or {},
+                    review=review,
+                )
+            return review
+        except Exception as e:
+            ErrorHandler.log(e, context=f"reviewer_pass:{subject}")
+            return ""
+
+    def _append_reviewer_summary(self, result: str, subject: str, request_text: str,
+                                 verification: dict[str, Any] | None = None) -> str:
+        self._run_reviewer_pass(subject, request_text, result, verification=verification)
+        return result
+
     def _run_tool_hook(self, stage: str, tool_name: str, payload: str):
         """Internal helper to call skill hooks before/after tool execution."""
         for skill in getattr(self, 'skills', {}).values():
@@ -4904,8 +5517,13 @@ class FlexiBot:
                 else:
                     skill.on_post_tool(context)
                     skill.post_tool(tool_name, payload)
-            except Exception:
-                pass
+            except Exception as e:
+                ErrorHandler.log(
+                    e,
+                    severity=ErrorSeverity.RECOVERABLE,
+                    context=f"_run_tool_hook:{tool_name}:{skill.metadata().name}",
+                    code=ErrorCode.AGT_ERROR,
+                )
 
     def _run_tool_with_wrapper(self, tool_name: str, payload: str, executor: Callable[[str], str]) -> str:
         wrapper_entry = self.skill_tool_wrappers.get(tool_name)
@@ -4949,42 +5567,46 @@ class FlexiBot:
             except Exception as e:
                 ConsoleOutput.warning(f"Skill '{skill.metadata().name}' on_unload failed: {e}")
 
+    @ErrorHandler.handle(severity=ErrorSeverity.CRITICAL, code=ErrorCode.EXEC_ERROR)
     def run_bash(self, cmd: str) -> str:
         """Run a shell command with smart platform translations and flexible executor selection.
         Returns a string containing STDOUT and STDERR."""
         if not cmd or not cmd.strip():
-            return "No command provided."
+            return self._structured_tool_result("bash", False, summary="No command provided.", errors=["No command provided."])
 
         decision = self.execution_policy.evaluate("bash", cmd)
         if not decision.allowed:
             self.execution_policy.audit(decision, action="deny", status="blocked", payload=cmd)
-            return f"Execution blocked: {decision.reason}"
+            return self._structured_tool_result("bash", False, summary="Execution blocked.", errors=[decision.reason], data={"command": cmd})
 
         try:
             self._run_tool_hook('pre', 'bash', cmd)
-        except Exception:
-            pass
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="run_bash.pre_tool", code=ErrorCode.EXEC_ERROR)
 
         start_time = time.time()
         self.execution_policy.audit(decision, action="start", status="allowed", payload=cmd)
+        execution_meta: dict[str, Any] = {"command": cmd, "executor": "", "translated_command": cmd, "translation_note": ""}
 
         def _execute_core(raw_cmd: str) -> str:
             translation_note = ""
             cmd_stripped = raw_cmd.strip()
             cmd_parts = cmd_stripped.split()
             if not cmd_parts:
-                return "Empty command."
+                execution_meta.update({"executor": "", "translated_command": raw_cmd, "translation_note": ""})
+                return self._structured_tool_result("bash", False, summary="Empty command.", errors=["Empty command."], data={"command": raw_cmd})
             cmd_base = cmd_parts[0].lower()
 
             # Determine Preferred Shell
             executor = "cmd" if os.name == "nt" else "sh"
             if os.name == "nt":
-                # If the user specifically wants bash, we use it, but otherwise default to CMD/PowerShell 
-                # so that agents don't get confused when trying 'dir' on a Windows box with Git Bash installed.
-                if os.environ.get("FLEXI_SHELL") == "bash" and shutil.which("bash"):
+                preferred_shell = str(os.environ.get("FLEXI_SHELL", "")).strip().lower()
+                # Default to cmd.exe on Windows. PowerShell is opt-in because some managed hosts fail to initialize it.
+                if preferred_shell == "bash" and shutil.which("bash"):
                     executor = "bash"
-                elif shutil.which("powershell"):
+                elif preferred_shell == "powershell" and shutil.which("powershell"):
                     executor = "powershell"
+            execution_meta["executor"] = executor
 
             # Apply Cross-Platform Translation logic
             mapping = {}
@@ -4998,6 +5620,8 @@ class FlexiBot:
                 new_base = mapping[cmd_base]
                 cmd_to_run = cmd_stripped.replace(cmd_parts[0], new_base, 1)
                 translation_note = f"[Translated '{cmd_base}' -> '{new_base}' for {executor}] "
+            execution_meta["translated_command"] = cmd_to_run
+            execution_meta["translation_note"] = translation_note
 
             # Prepare Execution Args
             use_shell = True
@@ -5023,109 +5647,799 @@ class FlexiBot:
 
                     stdout = res.stdout or ""
                     stderr = res.stderr or ""
+                    ok = res.returncode == 0 and not any(p in stderr for p in ["not recognized as", "command not found", "No such file or directory"])
+                    summary = "Command completed." if ok else "Command failed."
 
                     not_found = ["not recognized as", "command not found", "No such file or directory"]
                     if any(p in stderr for p in not_found):
                         suggestion = f"Suggestion: use platform-native commands or verify the path. Current executor: {executor}"
-                        return self.execution_policy.trim_output(decision, translation_note + f"STDOUT: {stdout}\nSTDERR: {stderr}\n{suggestion}")
-
-                    return self.execution_policy.trim_output(decision, translation_note + f"STDOUT: {stdout}\nSTDERR: {stderr}")
+                        stderr = f"{stderr}\n{suggestion}".strip()
+                    trimmed_stdout = self.execution_policy.trim_output(decision, stdout)
+                    trimmed_stderr = self.execution_policy.trim_output(decision, stderr)
+                    return self._structured_tool_result(
+                        "bash",
+                        ok,
+                        summary=summary,
+                        errors=[] if ok else [trimmed_stderr or f"Command returned exit code {res.returncode}."] ,
+                        data={
+                            "command": raw_cmd,
+                            "executor": executor,
+                            "translated_command": cmd_to_run,
+                            "translation_note": translation_note,
+                            "returncode": res.returncode,
+                            "stdout": trimmed_stdout,
+                            "stderr": trimmed_stderr,
+                        },
+                    )
 
                 except subprocess.TimeoutExpired as e:
                     attempt += 1
                     if attempt > retries:
-                        return f"Error: Command timed out after {retries} retries ({cmd_to_run})"
+                        return self._structured_tool_result("bash", False, summary="Command timed out.", errors=[f"Command timed out after {retries} retries ({cmd_to_run})"], data={"command": raw_cmd, "executor": executor, "translated_command": cmd_to_run})
                     time.sleep(1 * (2 ** (attempt - 1)))
                     continue
                 except Exception as e:
-                    return f"Error: Execution failed: {e}"
+                    return self._structured_tool_result("bash", False, summary="Execution failed.", errors=[str(e)], data={"command": raw_cmd, "executor": executor, "translated_command": cmd_to_run})
 
         result = self._run_tool_with_wrapper('bash', cmd, _execute_core)
+        result_payload = self._parse_tool_result_payload(result)
         self.execution_policy.audit(
             decision,
             action="finish",
-            status="completed" if not result.startswith("Error:") else "failed",
+            status="completed" if result_payload and result_payload.get("ok", False) else "failed",
             payload=cmd,
-            result=result,
+            result=self._tool_result_text(result),
             duration_ms=int((time.time() - start_time) * 1000),
         )
         try:
             self._run_tool_hook('post', 'bash', result)
-        except Exception:
-            pass
-        return result
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="run_bash.post_tool", code=ErrorCode.EXEC_ERROR)
+        return self._append_reviewer_summary(result, "bash", cmd)
 
-    def idle_proposal_workflow(self):
-        """Idle-triggered workflow: proposal copy + audit + evaluate + accept/decline."""
+    def _apply_idle_proposal_patch(self, proposal_path: Path) -> bool:
+        """Patch proposal file to implement actionable idle-workflow logic instead of only notes."""
         try:
-            # 1. context check for pending plan
-            open_plans = self.state.query_history(tag="plan", limit=5)
-            if open_plans:
-                ConsoleOutput.system("Idle workflow: found pending plan entries, attempting to resume.")
-                # trigger a continuation turn if the system has a pending plan
+            content = proposal_path.read_text(encoding='utf-8', errors='replace')
+            changed = False
+
+            # 1) Add a global toggle if missing (default OFF; allow env override)
+            if "AUTO_IDLE_PROPOSAL_ENABLED" not in content:
+                insert_marker = "# --- THE FlexiBot CORE ---"
+                insert_pos = content.find(insert_marker)
+                # Default to disabled to avoid surprising automatic code edits in deployments.
+                # Allow enabling via environment variable (AUTO_IDLE_PROPOSAL_ENABLED=1/true/yes).
+                default_line = ("AUTO_IDLE_PROPOSAL_ENABLED = os.environ.get(\"AUTO_IDLE_PROPOSAL_ENABLED\", \"false\").lower()"
+                                " in (\"1\", \"true\", \"yes\")\n")
+                if insert_pos != -1:
+                    # ensure os is available near the top if it's not already imported in the file
+                    content = content[:insert_pos] + "import os\n" + default_line + content[insert_pos:]
+                else:
+                    content = "import os\n" + default_line + content
+                changed = True
+
+            # 2) Ensure run_interactive_loop dispatches the workflow during idle condition
+            warning_line = "ConsoleOutput.warning(f\"User idle for {idle_timeout}s. Resuming...\")"
+            if warning_line in content and "bot.idle_proposal_workflow()" not in content:
+                replacement = (warning_line + "\n" +
+                               "                        if AUTO_IDLE_PROPOSAL_ENABLED:\n" +
+                               "                            try:\n" +
+                               "                                workflow_result = bot.idle_proposal_workflow()\n" +
+                               "                                ConsoleOutput.system(f\"Idle workflow result: {workflow_result}\")\n" +
+                               "                            except Exception as e:\n" +
+                               "                                ConsoleOutput.error(f\"Idle workflow error: {e}\")\n")
+                content = content.replace(warning_line, replacement)
+                changed = True
+
+            # 3) avoid just appending notes at bottom
+            content = re.sub(r"(?m)^# Idle workflow note:.*$", "", content)
+
+            if changed:
+                proposal_path.write_text(content, encoding='utf-8')
+
+            return changed
+        except Exception as e:
+            ConsoleOutput.error(f"Failed to apply idle proposal patch: {e}")
+            return False
+
+    def generate_improvement_plan(self) -> str:
+        base = "Generate a concise plan for improving the current agent codebase without making unsafe changes."
+        try:
+            resp = self.client.chat([
+                {"role": "system", "content": "You are an intelligent assistant that suggests code improvement plans."},
+                {"role": "user", "content": base}
+            ], temperature=0.5)
+            plan_text = resp["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            plan_text = "Could not generate plan due to: " + str(e)
+        return plan_text
+
+    def _idle_resume_context(self, limit: int = 5) -> dict[str, Any]:
+        pending_plans = self.state.query_history(tag="plan", limit=limit)
+        recent_user = self.state.query_history(role="user", limit=limit)
+        return {
+            "pending_plans": [entry.get("content", "") for entry in pending_plans],
+            "recent_user_requests": [entry.get("content", "") for entry in recent_user],
+        }
+
+    def _idle_llm_text(self, system_prompt: str, user_prompt: str, fallback: str) -> str:
+        try:
+            resp = self.client.chat([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ], temperature=0.3)
+            text = resp["choices"][0]["message"]["content"].strip()
+            return text or fallback
+        except Exception as e:
+            return f"{fallback} ({e})"
+
+    def _idle_analyze_proposal(self, proposal_path: Path, plan_text: str, resume_context: dict[str, Any]) -> str:
+        proposal_source = proposal_path.read_text(encoding="utf-8", errors="replace")
+        source_preview = proposal_source[:12000]
+        if len(proposal_source) > len(source_preview):
+            source_preview += "\n\n[TRUNCATED SOURCE PREVIEW]"
+        return self._idle_llm_text(
+            "You are a senior software architect reviewing a Python autonomous agent runtime during an idle self-improvement cycle.",
+            (
+                f"Improvement plan:\n{plan_text}\n\n"
+                f"Resume context:\n{json.dumps(resume_context, indent=2)}\n\n"
+                f"Proposal file: {proposal_path.name}\n"
+                "Analyze the latest proposal code. Identify the best improvements, useful new features, and the highest-risk weak points. "
+                "Respond with three short sections: Strengths, Gaps, Recommended Additions.\n\n"
+                f"Proposal source preview:\n{source_preview}"
+            ),
+            "Idle analysis unavailable.",
+        )
+
+    def _idle_audit_proposal(self, proposal_path: Path, analysis_text: str, validation_result: dict[str, Any], compile_result: str) -> str:
+        compile_payload = self._parse_tool_result_payload(compile_result) or {"raw": compile_result}
+        return self._idle_llm_text(
+            "You are a strict code auditor reviewing an idle proposal for a Python runtime.",
+            (
+                f"Proposal: {proposal_path.name}\n\n"
+                f"Analysis:\n{analysis_text}\n\n"
+                f"Python validation:\n{json.dumps(validation_result, indent=2)}\n\n"
+                f"Compile result:\n{json.dumps(compile_payload, indent=2) if isinstance(compile_payload, dict) else str(compile_payload)}\n\n"
+                "Audit this proposal and suggest concrete improvements and features to add. "
+                "Respond with three short sections: Audit Findings, Feature Opportunities, Safety Notes."
+            ),
+            "Idle audit unavailable.",
+        )
+
+    def _idle_plan_changes(self, proposal_path: Path, analysis_text: str, audit_text: str) -> str:
+        return self._idle_llm_text(
+            "You are planning code changes for an idle self-improvement workflow.",
+            (
+                f"Proposal: {proposal_path.name}\n\n"
+                f"Analysis:\n{analysis_text}\n\n"
+                f"Audit:\n{audit_text}\n\n"
+                "Create an actionable change plan for updating the proposal. Keep it short, concrete, and implementation-oriented. "
+                "Return a numbered list of steps."
+            ),
+            "1. Validate proposal\n2. Apply safe idle workflow improvements\n3. Review and test the updated proposal",
+        )
+
+    def _idle_artifact_path(self, proposal_path: Path, suffix: str, extension: str) -> Path:
+        return proposal_path.with_name(f"{proposal_path.stem}.{suffix}.{extension}")
+
+    def _idle_artifact_archive_dir(self, proposals_dir: Path, proposal_path: Path) -> Path:
+        return proposals_dir / PROPOSAL_ARTIFACT_ARCHIVE_DIRNAME / proposal_path.stem
+
+    def _idle_write_artifact_text(self, proposal_path: Path, suffix: str, title: str, body: str) -> Path | None:
+        path = self._idle_artifact_path(proposal_path, suffix, "md")
+        try:
+            lines = [f"# {title}", "", f"Generated: {datetime.now().isoformat()}", f"Proposal: {proposal_path.name}", "", body or ""]
+            path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+            return path
+        except Exception as e:
+            ConsoleOutput.warning(f"Could not write idle artifact {path.name}: {e}")
+            return None
+
+    def _idle_write_artifact_json(self, proposal_path: Path, suffix: str, payload: dict[str, Any]) -> Path | None:
+        path = self._idle_artifact_path(proposal_path, suffix, "json")
+        try:
+            # Write atomically and set restrictive permissions to avoid accidental leakage in working dirs.
+            import tempfile, os
+            data = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=str(path.parent), delete=False) as tf:
+                tf.write(data)
+                tf.flush()
                 try:
-                    self.handle_turn("continue")
+                    os.fsync(tf.fileno())
                 except Exception:
                     pass
+                tmpname = tf.name
+            os.replace(tmpname, str(path))
+            try:
+                os.chmod(str(path), 0o600)
+            except Exception:
+                # best-effort; don't fail the whole operation if chmod isn't supported on the platform
+                pass
+            return path
+        except Exception as e:
+            ConsoleOutput.warning(f"Could not write idle artifact {path.name}: {e}")
+            return None
 
-            # 2. proposal creation
+    def _idle_extract_json_block(self, text: str) -> dict[str, Any] | None:
+        if not isinstance(text, str):
+            return None
+        candidates = [text.strip()]
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+        candidates.extend(fenced)
+        brace_match = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+        if brace_match:
+            candidates.append(brace_match.group(1))
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+        return None
+
+    def _idle_rewrite_sections_from_source(self, source: str) -> list[dict[str, Any]]:
+        try:
+            tree = ast.parse(source)
+        except Exception:
+            return []
+
+        lines = source.splitlines(keepends=True)
+        line_offsets = [0]
+        for line in lines:
+            line_offsets.append(line_offsets[-1] + len(line))
+
+        sections: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            node_name = getattr(node, "name", "")
+            if not node_name:
+                continue
+            if node_name not in IDLE_REWRITE_SECTION_NAMES and not node_name.startswith("_idle_"):
+                continue
+            start_line = getattr(node, "lineno", None)
+            end_line = getattr(node, "end_lineno", None)
+            if not start_line or not end_line:
+                continue
+            start_offset = line_offsets[start_line - 1]
+            end_offset = line_offsets[end_line]
+            section_text = source[start_offset:end_offset]
+            sections.append(
+                {
+                    "name": node_name,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "start_offset": start_offset,
+                    "end_offset": end_offset,
+                    "text": section_text,
+                }
+            )
+
+        sections.sort(key=lambda item: (item["start_line"], item["name"]))
+        return sections
+
+    def _idle_rewrite_sections(self, proposal_path: Path) -> list[dict[str, Any]]:
+        try:
+            source = proposal_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return []
+        return self._idle_rewrite_sections_from_source(source)
+
+    def _idle_rewrite_scope_preview(self, sections: list[dict[str, Any]], limit_per_section: int = 4000) -> str:
+        if not sections:
+            return "No approved rewrite sections detected."
+        previews: list[str] = []
+        for section in sections:
+            text = section.get("text", "")
+            preview = text[:limit_per_section]
+            if len(text) > len(preview):
+                preview += "\n# [TRUNCATED SECTION PREVIEW]"
+            previews.append(
+                f"Section: {section['name']} ({section['start_line']}-{section['end_line']})\n"
+                f"{preview}"
+            )
+        return "\n\n".join(previews)
+
+    def _idle_render_artifact_summary(self, proposal_path: Path, artifact_paths: dict[str, str], status: dict[str, Any]) -> str:
+        lines = [
+            "## Status",
+            "",
+        ]
+        for key, value in status.items():
+            lines.append(f"- {key}: {value}")
+        lines.extend(["", "## Artifacts", ""])
+        for label, path_text in artifact_paths.items():
+            if not path_text:
+                lines.append(f"- {label}: not generated")
+                continue
+            artifact_path = Path(path_text)
+            rel_target = artifact_path.name.replace(" ", "%20")
+            lines.append(f"- [{label}]({rel_target})")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _idle_rotate_old_proposal_artifacts(self, proposals_dir: Path, keep_recent: int = PROPOSAL_ARTIFACT_KEEP_RECENT) -> dict[str, Any]:
+        kept = max(1, keep_recent)
+        archived: list[str] = []
+        errors: list[str] = []
+        try:
+            proposals = sorted(proposals_dir.glob("proposalAgent_*.py"), key=lambda path: path.stat().st_mtime, reverse=True)
+        except Exception as e:
+            return {"ok": False, "archived": archived, "errors": [str(e)]}
+
+        for proposal_path in proposals[kept:]:
+            artifact_candidates = [
+                artifact_path
+                for artifact_path in sorted(proposals_dir.glob(f"{proposal_path.stem}.*"))
+                if artifact_path != proposal_path and artifact_path.parent == proposals_dir
+            ]
+            if not artifact_candidates:
+                continue
+
+            archive_dir = self._idle_artifact_archive_dir(proposals_dir, proposal_path)
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                errors.append(f"{proposal_path.name}: could not create archive dir: {e}")
+                continue
+
+            for artifact_path in artifact_candidates:
+                destination = archive_dir / artifact_path.name
+                try:
+                    if destination.exists():
+                        artifact_path.unlink()
+                    else:
+                        shutil.move(str(artifact_path), str(destination))
+                    archived.append(str(destination))
+                except Exception as e:
+                    errors.append(f"{artifact_path.name}: {e}")
+
+        return {"ok": not errors, "archived": archived, "errors": errors, "kept_recent": kept}
+
+    def _idle_generate_rewrite_plan(self, proposal_path: Path, analysis_text: str, audit_text: str, change_plan_text: str) -> dict[str, Any]:
+        sections = self._idle_rewrite_sections(proposal_path)
+        scope_preview = self._idle_rewrite_scope_preview(sections)
+        section_catalog = [
+            {"name": section["name"], "start_line": section["start_line"], "end_line": section["end_line"]}
+            for section in sections
+        ]
+        fallback = {"edits": [], "notes": ["Rewrite plan unavailable."]}
+        raw = self._idle_llm_text(
+            "You are generating bounded code rewrites for a Python proposal file. Only return JSON.",
+            (
+                f"Proposal: {proposal_path.name}\n\n"
+                f"Analysis:\n{analysis_text}\n\n"
+                f"Audit:\n{audit_text}\n\n"
+                f"Change plan:\n{change_plan_text}\n\n"
+                f"Approved rewrite sections: {json.dumps(section_catalog, ensure_ascii=False)}\n\n"
+                "Return JSON with this exact shape: {\"edits\": [{\"section\": str, \"search\": str, \"replace\": str, \"rationale\": str}], \"notes\": [str]}. "
+                "Constraints: at most 3 edits, every edit must target only one approved section, each search string must match exactly one existing code block within that section, each replace string must stay focused and under 4000 characters, do not rewrite unrelated code, do not invent placeholders.\n\n"
+                f"Approved section source preview:\n{scope_preview}"
+            ),
+            json.dumps(fallback),
+        )
+        parsed = self._idle_extract_json_block(raw)
+        if not parsed:
+            parsed = fallback
+            parsed["notes"] = ["LLM rewrite plan was not valid JSON."]
+        edits = parsed.get("edits", []) if isinstance(parsed, dict) else []
+        if not isinstance(edits, list):
+            edits = []
+        bounded_edits = []
+        for item in edits[:3]:
+            if not isinstance(item, dict):
+                continue
+            section = str(item.get("section", "")).strip()
+            search = str(item.get("search", ""))
+            replace = str(item.get("replace", ""))
+            rationale = str(item.get("rationale", ""))
+            if not section or not search.strip() or not replace.strip():
+                continue
+            if len(search) > 4000 or len(replace) > 4000:
+                continue
+            bounded_edits.append({"section": section, "search": search, "replace": replace, "rationale": rationale})
+        notes = parsed.get("notes", []) if isinstance(parsed, dict) else []
+        if not isinstance(notes, list):
+            notes = [str(notes)]
+        return {
+            "edits": bounded_edits,
+            "notes": [str(note) for note in notes[:20]],
+            "allowed_sections": section_catalog,
+            "raw": raw[:4000],
+        }
+
+    def _idle_apply_rewrite_plan(self, proposal_path: Path, rewrite_plan: dict[str, Any]) -> dict[str, Any]:
+        try:
+            content = proposal_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return {"ok": False, "applied": [], "skipped": [{"reason": f"Could not read proposal: {e}"}]}
+
+        applied: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        updated = content
+        for index, edit in enumerate(rewrite_plan.get("edits", [])[:3], start=1):
+            sections = {section["name"]: section for section in self._idle_rewrite_sections_from_source(updated)}
+            section_name = str(edit.get("section", "")).strip()
+            search = str(edit.get("search", ""))
+            replace = str(edit.get("replace", ""))
+            rationale = str(edit.get("rationale", ""))
+            section = sections.get(section_name)
+            if not section:
+                skipped.append({"index": index, "reason": f"Section not allowed: {section_name or 'missing'}.", "rationale": rationale})
+                continue
+            match_count = updated.count(search)
+            if match_count != 1:
+                skipped.append({"index": index, "reason": f"Expected exactly 1 match, found {match_count}.", "rationale": rationale})
+                continue
+            match_index = updated.find(search)
+            if match_index < 0:
+                skipped.append({"index": index, "reason": "Search block not found.", "rationale": rationale})
+                continue
+            match_end = match_index + len(search)
+            if match_index < section["start_offset"] or match_end > section["end_offset"]:
+                skipped.append({"index": index, "reason": f"Search block is outside approved section {section_name}.", "rationale": rationale})
+                continue
+            delta = len(replace) - len(search)
+            if abs(delta) > 5000:
+                skipped.append({"index": index, "reason": f"Edit size delta too large ({delta}).", "rationale": rationale})
+                continue
+            updated = updated.replace(search, replace, 1)
+            applied.append({"index": index, "section": section_name, "rationale": rationale, "search_length": len(search), "replace_length": len(replace)})
+
+        final_sections = {section["name"]: section for section in self._idle_rewrite_sections_from_source(updated)}
+
+        if applied:
+            try:
+                proposal_path.write_text(updated, encoding="utf-8")
+            except Exception as e:
+                return {"ok": False, "applied": [], "skipped": skipped + [{"reason": f"Could not write proposal: {e}"}]}
+
+        return {
+            "ok": True,
+            "applied": applied,
+            "skipped": skipped,
+            "applied_count": len(applied),
+            "requested_count": len(rewrite_plan.get("edits", [])[:3]),
+            "allowed_sections": sorted(final_sections.keys()),
+        }
+
+    def _append_idle_proposal_notes(self, proposal_path: Path, sections: list[tuple[str, str]]) -> bool:
+        try:
+            lines = ["", "# --- IDLE WORKFLOW REPORT ---"]
+            for title, body in sections:
+                lines.append(f"# {title}:")
+                for raw_line in (body or "").splitlines():
+                    lines.append(f"# {raw_line}")
+            lines.append("# --- END IDLE WORKFLOW REPORT ---")
+            with proposal_path.open("a", encoding="utf-8") as fp:
+                fp.write("\n".join(lines) + "\n")
+            return True
+        except Exception as e:
+            ConsoleOutput.warning(f"Could not append idle workflow notes to proposal: {e}")
+            return False
+
+    def _idle_review_summary(self, proposal_path: Path, stage: str, context_text: str) -> str:
+        return self._idle_llm_text(
+            "You are a concise reviewer in an autonomous idle-code-improvement pipeline.",
+            (
+                f"Proposal: {proposal_path.name}\n"
+                f"Stage: {stage}\n\n"
+                f"Context:\n{context_text}\n\n"
+                "Provide a short review with two lines: Assessment: and Next step:."
+            ),
+            f"Assessment: Review unavailable at stage {stage}.\nNext step: Inspect proposal manually.",
+        )
+
+    def run_proposal_sdlc(self, proposal_path: Path, return_details: bool = False) -> bool | dict[str, Any]:
+        """Run proposal through lightweight SDLC steps before acceptance."""
+        details: dict[str, Any] = {
+            "proposal": str(proposal_path),
+            "compile": {"ok": False, "result": {}},
+            "review": {"ok": False, "result": {}},
+            "tests": {"ok": False, "result": {}},
+            "overall_ok": False,
+        }
+
+        # 1) Build/compile check
+        try:
+            compile_out = self.run_bash(f'"{sys.executable}" -m py_compile "{proposal_path}"')
+            compile_payload = self._parse_tool_result_payload(compile_out) or {"raw": compile_out}
+            compile_ok = not self._tool_result_failed(compile_out)
+            details["compile"] = {"ok": compile_ok, "result": compile_payload}
+            if not compile_ok:
+                ConsoleOutput.warning(f"SDLC compile failed for {proposal_path}: {self._tool_result_text(compile_out)}")
+                details["overall_ok"] = False
+                return details if return_details else False
+            ConsoleOutput.system(f"SDLC compile passed for {proposal_path}")
+        except Exception as e:
+            ConsoleOutput.error(f"SDLC compile exception: {e}")
+            details["compile"] = {"ok": False, "result": {"error": str(e)}}
+            details["overall_ok"] = False
+            return details if return_details else False
+
+        # 2) Code review (lint step)
+        try:
+            lint_out = self.run_bash(f'"{sys.executable}" -m pylint "{proposal_path}" --disable=C,R')
+            lint_payload = self._parse_tool_result_payload(lint_out) or {"raw": lint_out}
+            lint_text = self._tool_result_text(lint_out)
+            lint_ok = not self._tool_result_failed(lint_out) or "Your code has been rated" in lint_text or "No config file found" in lint_text
+            details["review"] = {"ok": lint_ok, "result": lint_payload}
+            if lint_ok:
+                ConsoleOutput.system(f"SDLC code review passed for {proposal_path}")
+            else:
+                ConsoleOutput.warning(f"SDLC code review warning/errors for {proposal_path}: {lint_text}")
+                # treat as fail unless explicitly non-fatal
+                if "error" in lint_text.lower() or "fatal" in lint_text.lower():
+                    details["overall_ok"] = False
+                    return details if return_details else False
+            # continue even if warnings exist
+        except Exception as e:
+            ConsoleOutput.warning(f"SDLC code review fallback: pylint not available or error ({e})")
+            details["review"] = {"ok": True, "result": {"warning": str(e)}}
+
+        # 3) Test run
+        try:
+            if Path("tests").is_dir():
+                test_out = self.tool_run_tests(f'"{sys.executable}" -m pytest -q')
+                test_payload = self._parse_tool_result_payload(test_out) or {"raw": test_out}
+                test_ok = not self._tool_result_failed(test_out)
+                details["tests"] = {"ok": test_ok, "result": test_payload}
+                if not test_ok:
+                    ConsoleOutput.warning(f"SDLC testing failed: {self._tool_result_text(test_out)}")
+                    details["overall_ok"] = False
+                    return details if return_details else False
+                ConsoleOutput.system("SDLC testing passed")
+            else:
+                ConsoleOutput.system("No tests directory found; evaluating via py_compile only (minimal tests)")
+                details["tests"] = {"ok": True, "result": {"warning": "No tests directory found; py_compile only."}}
+        except Exception as e:
+            ConsoleOutput.error(f"SDLC testing exception: {e}")
+            details["tests"] = {"ok": False, "result": {"error": str(e)}}
+            details["overall_ok"] = False
+            return details if return_details else False
+
+        details["overall_ok"] = True
+        return details if return_details else True
+
+    def _background_proposal_agent(self):
+        """Background agent: watch proposals/approved and apply code updates to flexiFocus.py."""
+        proposals_dir = Path("proposals")
+        applied_dir = proposals_dir / "applied"
+        watch_dir = proposals_dir / "approved"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        watch_dir.mkdir(parents=True, exist_ok=True)
+        applied_dir.mkdir(parents=True, exist_ok=True)
+
+        while True:
+            for proposal_path in watch_dir.glob("proposalAgent_*.py"):
+                try:
+                    patch_target = Path(__file__).resolve()
+                    shutil.copy2(proposal_path, patch_target)
+                    ConsoleOutput.system(f"Background agent applied proposal {proposal_path} to flexiFocus.py")
+
+                    # archive applied set
+                    dest = applied_dir / proposal_path.name
+                    shutil.copy2(proposal_path, dest)
+                    proposal_path.unlink(missing_ok=True)
+                except Exception as e:
+                    ConsoleOutput.error(f"Background proposal agent error applying {proposal_path}: {e}")
+            time.sleep(15)
+
+
+    def idle_proposal_workflow(self, auto_propose: bool = False, auto_confirm: bool | None = None):
+        """Idle-triggered workflow following a staged proposal architecture.
+
+        Flow:
+        1. Resume pending work from history when possible.
+        2. Copy the live runtime into proposals/.
+        3. Analyze the latest proposal and suggest improvements/features.
+        4. Audit the proposal and suggest improvements/features.
+        5. Plan change steps from the analysis and audit.
+        6. Execute safe proposal updates.
+        7. Review the updated proposal.
+        8. Test the updated proposal.
+        9. Run a final review after testing.
+        10. Optionally update the live code based on auto_propose/auto_confirm.
+        """
+        try:
+            workflow_trace: dict[str, Any] = {"steps": []}
+
+            # 0. plan generation step
+            plan_text = self.generate_improvement_plan()
+            self.logger.log_plan_event(plan_text, context="idle_proposal_workflow")
+            ConsoleOutput.system("Idle workflow plan generated.")
+            workflow_trace["steps"].append({"step": "generate_plan", "ok": True, "summary": plan_text[:500]})
+
+            # 1. context check for pending plan
+            resume_context = self._idle_resume_context(limit=5)
+            open_plans = resume_context.get("pending_plans", [])
+            resumed_pending_work = False
+            if open_plans:
+                ConsoleOutput.system("Idle workflow: found pending plan entries, attempting to resume.")
+                try:
+                    self.handle_turn("continue")
+                    resumed_pending_work = True
+                except Exception:
+                    pass
+            workflow_trace["steps"].append({"step": "resume_pending_tasks", "ok": True, "summary": json.dumps({"resumed": resumed_pending_work, **resume_context})[:1000]})
+
+            # 2. proposal creation (unique name each run for persistent history)
             source_path = Path(__file__).resolve()
             proposals_dir = Path("proposals")
             proposals_dir.mkdir(parents=True, exist_ok=True)
-            proposal_path = proposals_dir / "proposalAgent.py"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            proposal_path = proposals_dir / f"proposalAgent_{timestamp}.py"
             shutil.copy2(source_path, proposal_path)
             ConsoleOutput.system(f"Crafted proposal file: {proposal_path}")
+            workflow_trace["proposal_path"] = str(proposal_path)
+            workflow_trace["steps"].append({"step": "copy_proposal", "ok": True, "summary": str(proposal_path)})
 
-            # audit proposal with python syntax + static check
+            # 3. analyze proposal and suggest improvements/features
+            analysis_text = self._idle_analyze_proposal(proposal_path, plan_text, resume_context)
+            ConsoleOutput.system("Idle workflow analysis completed.")
+            workflow_trace["analysis"] = analysis_text
+            workflow_trace["steps"].append({"step": "analyze_proposal", "ok": True, "summary": analysis_text[:1000]})
+
+            # 4. audit proposal with python validation + compile result + LLM audit
             audit_text = rlm_validate_python(filepath=str(proposal_path))
             try:
-                audit = json.loads(audit_text)
+                validation_result = json.loads(audit_text)
             except Exception:
-                audit = {"ok": False, "errors": ["Audit output not JSON"]}
+                validation_result = {"ok": False, "errors": ["Audit output not JSON"]}
 
-            if not audit.get("ok", False):
-                ConsoleOutput.warning(f"Proposal audit found issues: {audit.get('errors', [])}")
+            compile_check = self.run_bash(f'"{sys.executable}" -m py_compile "{proposal_path}"')
+            proposal_audit_text = self._idle_audit_proposal(proposal_path, analysis_text, validation_result, compile_check)
+            ConsoleOutput.system("Idle workflow audit completed.")
+            workflow_trace["audit"] = proposal_audit_text
+            workflow_trace["steps"].append({"step": "audit_proposal", "ok": validation_result.get("ok", False) and not self._tool_result_failed(compile_check), "summary": proposal_audit_text[:1000]})
+
+            if not validation_result.get("ok", False):
+                ConsoleOutput.warning(f"Proposal audit found issues: {validation_result.get('errors', [])}")
                 proposal_ok = False
             else:
                 ConsoleOutput.system("Proposal audit passed.")
                 proposal_ok = True
 
-            # propose message + basic improvement annotation
-            hint = "Idle workflow note: Consider review of run_interactive_loop idle handling and tool security policies."
-            with proposal_path.open("a", encoding="utf-8") as fp:
-                fp.write("\n# " + hint + "\n")
-            ConsoleOutput.system("Applied improvement suggestion comment to proposal file.")
+            # 5. plan changes from analysis and audit
+            change_plan_text = self._idle_plan_changes(proposal_path, analysis_text, proposal_audit_text)
+            ConsoleOutput.system("Idle workflow change plan created.")
+            workflow_trace["change_plan"] = change_plan_text
+            workflow_trace["steps"].append({"step": "plan_changes", "ok": True, "summary": change_plan_text[:1000]})
 
-            # 3. evaluation: preliminary compile check
+            # 6. execute planned changes and update proposal
+            rewrite_plan = self._idle_generate_rewrite_plan(proposal_path, analysis_text, proposal_audit_text, change_plan_text)
+            rewrite_result = self._idle_apply_rewrite_plan(proposal_path, rewrite_plan)
+            patch_applied = self._apply_idle_proposal_patch(proposal_path)
+            notes_applied = self._append_idle_proposal_notes(
+                proposal_path,
+                [
+                    ("Idle Improvement Plan", plan_text),
+                    ("Resume Context", json.dumps(resume_context, indent=2)),
+                    ("Proposal Analysis", analysis_text),
+                    ("Proposal Audit", proposal_audit_text),
+                    ("Change Plan", change_plan_text),
+                ],
+            )
+            artifact_paths = {
+                "analysis": str(self._idle_write_artifact_text(proposal_path, "analysis", "Idle Proposal Analysis", analysis_text) or ""),
+                "audit": str(self._idle_write_artifact_text(proposal_path, "audit", "Idle Proposal Audit", proposal_audit_text) or ""),
+                "change_plan": str(self._idle_write_artifact_text(proposal_path, "change-plan", "Idle Proposal Change Plan", change_plan_text) or ""),
+                "rewrite_plan": str(self._idle_write_artifact_json(proposal_path, "rewrite-plan", rewrite_plan) or ""),
+                "rewrite_result": str(self._idle_write_artifact_json(proposal_path, "rewrite-result", rewrite_result) or ""),
+            }
+            ConsoleOutput.system(f"Idle proposal rewrites applied: {rewrite_result.get('applied_count', 0)}; patch applied: {patch_applied}; notes appended: {notes_applied}")
+            workflow_trace["rewrite_plan"] = rewrite_plan
+            workflow_trace["rewrite_result"] = rewrite_result
+            workflow_trace["artifact_paths"] = artifact_paths
+            workflow_trace["steps"].append({"step": "execute_changes", "ok": bool(rewrite_result.get("applied_count", 0) or patch_applied or notes_applied), "summary": json.dumps({"rewrite_result": rewrite_result, "patch_applied": patch_applied, "notes_applied": notes_applied, "artifact_paths": artifact_paths})[:1200]})
+
+            # 7. review updated proposal
+            pre_test_review = self._idle_review_summary(
+                proposal_path,
+                "post-update-review",
+                f"Analysis:\n{analysis_text}\n\nAudit:\n{proposal_audit_text}\n\nChange plan:\n{change_plan_text}\n\nPatch applied: {patch_applied}\nNotes applied: {notes_applied}",
+            )
+            workflow_trace["pre_test_review"] = pre_test_review
+            workflow_trace["steps"].append({"step": "review_before_test", "ok": True, "summary": pre_test_review[:1000]})
+
+            # 8. evaluation: compile check then SDLC test/review pass
             compile_res = self.run_bash(f'"{sys.executable}" -m py_compile "{proposal_path}"')
-            if "Traceback" in compile_res or "Error" in compile_res:
+            compile_ok = not self._tool_result_failed(compile_res)
+            if not compile_ok:
                 ConsoleOutput.warning("Proposal evaluation: compile check failed.")
                 evaluation_ok = False
             else:
                 ConsoleOutput.system("Proposal evaluation: compile check succeeded.")
                 evaluation_ok = True
+            workflow_trace["steps"].append({"step": "compile_check", "ok": evaluation_ok, "summary": self._tool_result_text(compile_res)[:1000]})
+
+            sdlc_ok = False
+            sdlc_details: dict[str, Any] = {"overall_ok": False}
+            if proposal_ok and evaluation_ok:
+                sdlc_details = self.run_proposal_sdlc(proposal_path, return_details=True)
+                sdlc_ok = bool(sdlc_details.get("overall_ok", False))
+            else:
+                ConsoleOutput.warning("Skipping full SDLC due to earlier audit/compile failures.")
+            workflow_trace["sdlc"] = sdlc_details
+            workflow_trace["steps"].append({"step": "test_and_review", "ok": sdlc_ok, "summary": json.dumps(sdlc_details, indent=2)[:1200]})
+
+            # 9. final review after testing
+            final_review = self._idle_review_summary(
+                proposal_path,
+                "post-test-review",
+                f"Pre-test review:\n{pre_test_review}\n\nSDLC details:\n{json.dumps(sdlc_details, indent=2)}",
+            )
+            workflow_trace["final_review"] = final_review
+            workflow_trace["steps"].append({"step": "final_review", "ok": True, "summary": final_review[:1000]})
+            artifact_paths["pre_test_review"] = str(self._idle_write_artifact_text(proposal_path, "review-pre-test", "Idle Proposal Review Before Test", pre_test_review) or "")
+            artifact_paths["final_review"] = str(self._idle_write_artifact_text(proposal_path, "review-final", "Idle Proposal Final Review", final_review) or "")
+            artifact_paths["workflow_trace"] = str(self._idle_write_artifact_json(proposal_path, "workflow-trace", workflow_trace) or "")
+            artifact_status = {
+                "proposal_ok": proposal_ok,
+                "evaluation_ok": evaluation_ok,
+                "sdlc_ok": sdlc_ok,
+                "rewrite_applied": rewrite_result.get("applied_count", 0),
+                "patch_applied": patch_applied,
+                "notes_applied": notes_applied,
+            }
+            summary_body = self._idle_render_artifact_summary(proposal_path, artifact_paths, artifact_status)
+            artifact_paths["summary"] = str(self._idle_write_artifact_text(proposal_path, "summary", f"Idle Proposal Summary: {proposal_path.name}", summary_body) or "")
+            rotation_result = self._idle_rotate_old_proposal_artifacts(proposals_dir)
+            workflow_trace["artifact_rotation"] = rotation_result
+            artifact_paths["workflow_trace"] = str(self._idle_write_artifact_json(proposal_path, "workflow-trace", workflow_trace) or artifact_paths["workflow_trace"])
+
+            # Log proposal summary in evolution log
+            try:
+                notes = "proposal, compile and SDLC check" if (proposal_ok and evaluation_ok and sdlc_ok) else "audit/compile/SDLC issue"
+                self.logger.log_proposal_event(proposal_path, proposal_ok and evaluation_ok and sdlc_ok,
+                                               notes=notes)
+            except Exception:
+                pass
 
             # decide outcome
             confirmed = False
-            if proposal_ok and evaluation_ok:
-                try:
-                    response = input("Apply proposalAgent.py as new flexiFocus.py? [y/N]: ").strip().lower()
-                    confirmed = response == "y"
-                except Exception:
+            if proposal_ok and evaluation_ok and sdlc_ok:
+                if auto_propose:
+                    # Auto proposal mode: keep proposal, do not replace core file
+                    ConsoleOutput.system(f"Auto-proposal mode: proposal saved as {proposal_path}, no replacement applied.")
                     confirmed = False
+                elif auto_confirm is True:
+                    confirmed = True
+                elif auto_confirm is False:
+                    confirmed = False
+                else:
+                    try:
+                        response = input("[Awaiting confirmation] Apply proposalAgent.py as new flexiFocus.py? [y/N]: ").strip().lower()
+                        confirmed = response == "y"
+                    except Exception:
+                        confirmed = False
 
-            if confirmed:
-                shutil.copy2(proposal_path, source_path)
-                proposal_path.unlink(missing_ok=True)
-                ConsoleOutput.system("flexiFocus.py updated from proposalAgent.py.")
-            else:
-                date_tag = datetime.now().strftime("%Y%m%d")
-                renamed = proposals_dir / f"proposalAgent{date_tag}.py"
-                if proposal_path.exists():
-                    proposal_path.rename(renamed)
-                ConsoleOutput.system(f"Kept existing flexiFocus.py. Proposal saved as {renamed}.")
+            if not auto_propose:
+                if confirmed:
+                    shutil.copy2(proposal_path, source_path)
+                    ConsoleOutput.system(f"flexiFocus.py updated from {proposal_path}.")
+                else:
+                    ConsoleOutput.system(f"Kept existing flexiFocus.py. Proposal left as {proposal_path}.")
 
-            return {"proposal_ok": proposal_ok, "evaluation_ok": evaluation_ok, "updated": confirmed}
+            workflow_trace["proposal_ok"] = proposal_ok
+            workflow_trace["evaluation_ok"] = evaluation_ok
+            workflow_trace["sdlc_ok"] = sdlc_ok
+            workflow_trace["updated"] = confirmed
+
+            return {
+                "proposal_ok": proposal_ok,
+                "evaluation_ok": evaluation_ok,
+                "sdlc_ok": sdlc_ok,
+                "updated": confirmed,
+                "analysis": analysis_text[:300],
+                "audit": proposal_audit_text[:300],
+                "plan": change_plan_text[:300],
+                "final_review": final_review[:300],
+                "rewrite_applied": rewrite_result.get("applied_count", 0),
+                "artifacts": artifact_paths,
+            }
 
         except Exception as e:
             ConsoleOutput.error(f"Idle proposal workflow failed: {e}")
@@ -5143,7 +6457,9 @@ class FlexiBot:
                     if filter_text and filter_text.lower() not in name.lower(): continue
                     procs.append(info)
                 except (psutil.NoSuchProcess, psutil.AccessDenied): pass
-            return json.dumps(procs[:100], indent=2) # Limit to 100 for safety
+            limited = procs[:100]
+            warnings = [] if len(procs) <= 100 else [f"Truncated process list to first 100 of {len(procs)} entries."]
+            return self._structured_tool_result("list_processes", True, summary=f"Listed {len(limited)} process(es).", data={"processes": limited, "filter_text": filter_text or ""}, warnings=warnings)
         except ImportError:
             # Fallback to shell
             cmd = "tasklist" if os.name == "nt" else "ps aux"
@@ -5165,7 +6481,7 @@ class FlexiBot:
                     results[t] = "Not installed or failed"
             except Exception:
                 results[t] = "Not found"
-        return json.dumps(results, indent=2)
+        return self._structured_tool_result("get_software_versions", True, summary=f"Checked {len(results)} tool version(s).", data={"versions": results})
 
     def tool_inspect_python_environment(self):
         return rlm_inspect_python_environment()
@@ -5275,12 +6591,12 @@ class FlexiBot:
     def tool_install_python_package(self, package: str, upgrade: bool = False):
         package = str(package or "").strip()
         if not package:
-            return json.dumps({"ok": False, "tool": "install_python_package", "errors": ["Package name is required."]}, indent=2)
+            return self._structured_tool_result("install_python_package", False, summary="Package name is required.", errors=["Package name is required."])
         requested = f"{package} {'--upgrade' if upgrade else ''}".strip()
         decision = self.execution_policy.evaluate("install_python_package", requested)
         if not decision.allowed:
             self.execution_policy.audit(decision, action="deny", status="blocked", payload=requested)
-            return json.dumps({"ok": False, "tool": "install_python_package", "errors": [decision.reason]}, indent=2)
+            return self._structured_tool_result("install_python_package", False, summary="Execution blocked.", errors=[decision.reason], data={"package": package, "upgrade": bool(upgrade)})
         start_time = time.time()
         self.execution_policy.audit(decision, action="start", status="allowed", payload=requested)
         cmd = [sys.executable, "-m", "pip", "install", package]
@@ -5313,7 +6629,13 @@ class FlexiBot:
                 result=output,
                 duration_ms=int((time.time() - start_time) * 1000),
             )
-            return json.dumps(result, indent=2)
+            return self._structured_tool_result(
+                "install_python_package",
+                res.returncode == 0,
+                summary=f"Package install {'completed' if res.returncode == 0 else 'failed'}.",
+                errors=[] if res.returncode == 0 else [output or f"pip install exited with code {res.returncode}"],
+                data=result,
+            )
         except Exception as e:
             self.execution_policy.audit(
                 decision,
@@ -5323,7 +6645,7 @@ class FlexiBot:
                 result=str(e),
                 duration_ms=int((time.time() - start_time) * 1000),
             )
-            return json.dumps({"ok": False, "tool": "install_python_package", "package": package, "errors": [str(e)]}, indent=2)
+            return self._structured_tool_result("install_python_package", False, summary="Package install failed.", errors=[str(e)], data={"package": package, "upgrade": bool(upgrade)})
 
     def _bg_task_log_path(self, pid: str | int) -> Path:
         BG_TASK_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -5334,26 +6656,27 @@ class FlexiBot:
         if pid:
             info = active.get(str(pid))
             if not info:
-                return json.dumps({"ok": False, "tool": "get_bg_task_details", "errors": [f"No background task found for PID {pid}"]}, indent=2)
-            return json.dumps({"ok": True, "tool": "get_bg_task_details", "task": info}, indent=2)
-        return json.dumps({"ok": True, "tool": "get_bg_task_details", "tasks": list(active.values())}, indent=2)
+                return self._structured_tool_result("get_bg_task_details", False, summary="Background task not found.", errors=[f"No background task found for PID {pid}"], data={"pid": str(pid)})
+            return self._structured_tool_result("get_bg_task_details", True, summary=f"Background task details for PID {pid}.", data={"pid": str(pid), "task": info})
+        return self._structured_tool_result("get_bg_task_details", True, summary=f"Listed {len(active)} background task(s).", data={"tasks": list(active.values())})
 
     def tool_read_bg_task_log(self, pid: str, lines: int = 50):
         log_path = self._bg_task_log_path(pid)
         if not log_path.exists():
-            return f"No log file found for background task {pid}."
+            return self._structured_tool_result("read_bg_task_log", False, summary="Background log not found.", errors=[f"No log file found for background task {pid}."], data={"pid": str(pid), "lines": int(lines)})
         try:
             content = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
-            return "\n".join(content[-max(1, int(lines)):])
+            tail_lines = content[-max(1, int(lines)):]
+            return self._structured_tool_result("read_bg_task_log", True, summary=f"Read {len(tail_lines)} log line(s) for PID {pid}.", data={"pid": str(pid), "lines": tail_lines, "log_path": str(log_path)})
         except Exception as e:
-            return f"Background log read error: {e}"
+            return self._structured_tool_result("read_bg_task_log", False, summary="Background log read failed.", errors=[str(e)], data={"pid": str(pid), "log_path": str(log_path)})
 
     def tool_stop_bg_task(self, pid: str, force: bool = False):
         pid_str = str(pid)
         active = self.state.active_processes
         info = active.get(pid_str)
         if not info:
-            return f"No background task found for PID {pid_str}."
+            return self._structured_tool_result("stop_bg_task", False, summary="Background task not found.", errors=[f"No background task found for PID {pid_str}."], data={"pid": pid_str, "force": bool(force)})
         try:
             if os.name == 'nt':
                 cmd = ["taskkill", "/PID", pid_str]
@@ -5366,28 +6689,44 @@ class FlexiBot:
             info["stopped_at"] = time.time()
             self.state.set_active_process(pid_str, info, persist=False)
             self.state.save()
-            return f"Stopped background task {pid_str}."
+            return self._structured_tool_result("stop_bg_task", True, summary=f"Stopped background task {pid_str}.", data={"pid": pid_str, "force": bool(force), "task": info})
         except Exception as e:
-            return f"Failed to stop background task {pid_str}: {e}"
+            return self._structured_tool_result("stop_bg_task", False, summary="Failed to stop background task.", errors=[str(e)], data={"pid": pid_str, "force": bool(force)})
 
     def tool_restart_bg_task(self, pid: str):
         pid_str = str(pid)
         active = self.state.active_processes
         info = active.get(pid_str)
         if not info:
-            return f"No background task found for PID {pid_str}."
+            return self._structured_tool_result("restart_bg_task", False, summary="Background task not found.", errors=[f"No background task found for PID {pid_str}."], data={"pid": pid_str})
         task_type = info.get("type")
         if task_type == "shell":
             self.tool_stop_bg_task(pid_str, force=False)
-            return self.tool_spawn_background(info.get("cmd", ""), timeout=30)
+            restarted = self.tool_spawn_background(info.get("cmd", ""), timeout=30)
+            restarted_payload = self._parse_tool_result_payload(restarted) or {"raw": restarted}
+            return self._structured_tool_result(
+                "restart_bg_task",
+                bool(restarted_payload.get("ok", False)),
+                summary="Restarted shell background task." if restarted_payload.get("ok", False) else "Failed to restart shell background task.",
+                errors=restarted_payload.get("errors", []),
+                data={"pid": pid_str, "previous_task": info, "restart_result": restarted_payload},
+            )
         if task_type == "python_bg" and info.get("script_path"):
             try:
                 code = Path(info["script_path"]).read_text(encoding='utf-8', errors='replace')
             except Exception as e:
-                return f"Failed to reload background script: {e}"
+                return self._structured_tool_result("restart_bg_task", False, summary="Failed to reload background script.", errors=[str(e)], data={"pid": pid_str, "script_path": info.get("script_path")})
             self.tool_stop_bg_task(pid_str, force=False)
-            return self.tool_run_python_bg(code)
-        return f"Restart not supported for background task type '{task_type}'."
+            restarted = self.tool_run_python_bg(code)
+            restarted_payload = self._parse_tool_result_payload(restarted) or {"raw": restarted}
+            return self._structured_tool_result(
+                "restart_bg_task",
+                bool(restarted_payload.get("ok", False)),
+                summary="Restarted python background task." if restarted_payload.get("ok", False) else "Failed to restart python background task.",
+                errors=restarted_payload.get("errors", []),
+                data={"pid": pid_str, "previous_task": info, "restart_result": restarted_payload},
+            )
+        return self._structured_tool_result("restart_bg_task", False, summary="Restart not supported.", errors=[f"Restart not supported for background task type '{task_type}'."], data={"pid": pid_str, "task": info})
 
     def subagent(self, task: str, work_dir: str = ".", priority: int = 2, agent_type: str = "generic") -> str:
         """Isolated subagent loop delegated to SubagentManager."""
@@ -5408,13 +6747,15 @@ class FlexiBot:
         if not isinstance(current, list): current = [str(current)]
         current.append(str(content))
         self.state.remember(tag, current)
-        return f"✓ Stored in memory under tag '{tag}'"
+        return self._structured_tool_result("remember", True, summary=f"Stored memory under tag '{tag}'.", data={"tag": tag, "item_count": len(current)})
 
     def tool_recall(self, tag: str):
         items = self.state.recall(tag)
-        if not items: return f"No memory found for tag '{tag}'"
-        if isinstance(items, list): return "\n---\n".join(str(i) for i in items)
-        return str(items)
+        if not items:
+            return self._structured_tool_result("recall", False, summary="No memory found.", errors=[f"No memory found for tag '{tag}'"], data={"tag": tag})
+        if isinstance(items, list):
+            return self._structured_tool_result("recall", True, summary=f"Recalled {len(items)} memory item(s).", data={"tag": tag, "items": [str(i) for i in items]})
+        return self._structured_tool_result("recall", True, summary="Recalled memory value.", data={"tag": tag, "items": [str(items)]})
 
     def tool_search_memory(self, query: str):
         # Scan kv cache directly
@@ -5428,19 +6769,20 @@ class FlexiBot:
                         results.append(f"[{tag}] {item}")
             elif query.lower() in str(items).lower():
                 results.append(f"[{tag}] {items}")
-        return "\n".join(results) if results else f"No memories found matching '{query}'"
+        return self._structured_tool_result("search_memory", True, summary=f"Found {len(results)} matching memory entr{'y' if len(results) == 1 else 'ies' }.", data={"query": query, "matches": results}, warnings=[] if results else [f"No memories found matching '{query}'"])
 
     def tool_save_skill(self, name: str, code: str):
         path = SKILLS_DIR / f"{name}.py"
         path.write_text(code, encoding="utf-8")
-        return f"✓ Skill '{name}' saved to {path}"
+        return self._structured_tool_result("save_skill", True, summary=f"Skill '{name}' saved.", data={"name": name, "path": str(path), "bytes_written": len(code.encode('utf-8'))})
 
     def tool_load_skill(self, name: str, env: dict):
         path = SKILLS_DIR / f"{name}.py"
-        if not path.exists(): return f"Skill '{name}' not found."
+        if not path.exists():
+            return self._structured_tool_result("load_skill", False, summary="Skill not found.", errors=[f"Skill '{name}' not found."], data={"name": name, "path": str(path)})
         # We execute the skill code directly into the current environment
         exec(path.read_text(encoding="utf-8"), env, env) 
-        return f"✓ Skill '{name}' loaded."
+        return self._structured_tool_result("load_skill", True, summary=f"Skill '{name}' loaded.", data={"name": name, "path": str(path)})
 
     def tool_validate_python(self, filepath: str = "", code: str = ""):
         return rlm_validate_python(filepath=filepath, code=code)
@@ -5453,18 +6795,66 @@ class FlexiBot:
         if not test_command:
             test_candidates = list(Path(".").glob("test_*.py")) + list(Path("tests").glob("**/test*.py")) if Path("tests").exists() else list(Path(".").glob("test_*.py"))
             if not test_candidates:
-                return json.dumps({"ok": False, "tool": "run_tests", "errors": ["No tests found and no command provided."]}, indent=2)
+                return self._structured_tool_result("run_tests", False, summary="No tests found.", errors=["No tests found and no command provided."])
             test_command = f'"{sys.executable}" -m unittest discover -v'
-        result = self.run_bash(test_command)
+        if "pytest" in test_command.lower():
+            try:
+                import shlex
+
+                pytest_args = shlex.split(test_command, posix=os.name != "nt")
+                if len(pytest_args) >= 3 and pytest_args[1:3] == ["-m", "pytest"]:
+                    pytest_args[0] = pytest_args[0].strip('"')
+                    env = os.environ.copy()
+                    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+                    completed = subprocess.run(
+                        pytest_args,
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                        encoding="utf-8",
+                        errors="replace",
+                        env=env,
+                    )
+                    result = self._structured_tool_result(
+                        "bash",
+                        completed.returncode == 0,
+                        summary="Command completed." if completed.returncode == 0 else "Command failed.",
+                        errors=[] if completed.returncode == 0 else [completed.stderr.strip() or completed.stdout.strip() or f"Command returned exit code {completed.returncode}."],
+                        data={
+                            "command": test_command,
+                            "executor": "subprocess",
+                            "translated_command": test_command,
+                            "translation_note": "pytest run with PYTEST_DISABLE_PLUGIN_AUTOLOAD=1",
+                            "returncode": completed.returncode,
+                            "stdout": completed.stdout or "",
+                            "stderr": completed.stderr or "",
+                        },
+                    )
+                else:
+                    result = self.run_bash(test_command)
+            except Exception as e:
+                result = self._structured_tool_result(
+                    "bash",
+                    False,
+                    summary="Command failed.",
+                    errors=[str(e)],
+                    data={"command": test_command, "executor": "subprocess", "translated_command": test_command},
+                )
+        else:
+            result = self.run_bash(test_command)
         verification = self.verify_and_report(result, context=f"tests:{test_command}")
-        return json.dumps({
-            "ok": verification.get("success", False),
-            "tool": "run_tests",
-            "command": test_command,
-            "summary": verification.get("summary", ""),
-            "errors": verification.get("errors", []),
-            "output": result[:4000],
-        }, indent=2)
+        self._run_reviewer_pass("tests", test_command, result, verification=verification)
+        return self._structured_tool_result(
+            "run_tests",
+            verification.get("success", False),
+            summary=verification.get("summary", ""),
+            errors=verification.get("errors", []),
+            data={
+                "command": test_command,
+                "result": self._parse_tool_result_payload(result) or {"raw": result[:4000]},
+                "verification": verification,
+            },
+        )
 
     def tool_run_verification(self, target_script: str = "flexi_temp.py"):
         """Generates and runs an advanced controller verification suite."""
@@ -5539,8 +6929,11 @@ class FlexiBot:
                     if line.strip() == "}}": # End of JSON
                         try:
                             return json.loads(json_buffer)
-                        except: return {{"error": "Invalid JSON status"}}
-            except queue.Empty: pass
+                        except Exception as e:
+                            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="StatusProbe.get_status.json_parse", code=ErrorCode.IO_ERROR)
+                            return {{"error": "Invalid JSON status"}}
+            except queue.Empty:
+                pass
         return {{"error": "Timeout waiting for status"}}
 
     def terminate(self):
@@ -5597,19 +6990,26 @@ if __name__ == "__main__":
             print(f"{Colors.YELLOW}[Verification] Running suite against {target_script}...{Colors.ENDC}")
             # Ensure target exists, or create a dummy if missing to prevent crash
             if not Path(target_script).exists():
-                return f"Target script '{target_script}' does not exist. Cannot verify."
+                return self._structured_tool_result("run_verification", False, summary="Target script missing.", errors=[f"Target script '{target_script}' does not exist. Cannot verify."])
 
             res = self.run_bash(f"python \"{wrapper_path}\"")
             verification = self.verify_and_report(res, context=f"verify:{target_script}")
-            return f"{res}\n\nVerification Summary: {verification.get('summary')}"
+            return self._structured_tool_result(
+                "run_verification",
+                verification.get("success", False),
+                summary=verification.get("summary", ""),
+                errors=verification.get("errors", []),
+                data={"target_script": target_script, "runner_result": self._parse_tool_result_payload(res) or {"raw": res[:4000]}, "verification": verification},
+            )
         except Exception as e:
             ErrorHandler.log(e, context="tool_run_verification")
-            return f"Verification failed: {e}"
+            return self._structured_tool_result("run_verification", False, summary="Verification failed.", errors=[str(e)], data={"target_script": target_script})
 
     def tool_see_image(self, image_path: str, question: str = "Describe this image."):
         """Analyzes an image file using the vision capabilities of the LLM."""
         path = Path(image_path)
-        if not path.exists(): return f"Image file not found: {image_path}"
+        if not path.exists():
+            return self._structured_tool_result("see_image", False, summary="Image file not found.", errors=[f"Image file not found: {image_path}"], data={"image_path": image_path})
         
         try:
             # 1. Base64 Encode
@@ -5630,28 +7030,31 @@ if __name__ == "__main__":
             # 3. Call API
             print(f"{Colors.YELLOW}[Vision] Analyzing {path.name}...{Colors.ENDC}")
             res = self.client.chat(messages)
-            return f"Image Analysis ({path.name}): {res['choices'][0]['message']['content']}"
+            analysis = res['choices'][0]['message']['content']
+            return self._structured_tool_result("see_image", True, summary=f"Image analyzed: {path.name}", data={"image_path": str(path), "question": question, "analysis": analysis})
         except Exception as e:
             ErrorHandler.log(e, context="tool_see_image")
-            return f"Vision Error: {e}"
+            return self._structured_tool_result("see_image", False, summary="Vision error.", errors=[str(e)], data={"image_path": image_path, "question": question})
 
     def tool_list_windows(self, filter_text: str = None):
         """Lists open windows (Windows mostly). Returns JSON. Filter by title optional."""
         
         deps = SystemAutomation.check_dependencies()
-        if deps: return f"Missing dependencies: {', '.join(deps)}"
+        if deps:
+            return self._structured_tool_result("list_windows", False, summary="Missing dependencies.", errors=[f"Missing dependencies: {', '.join(deps)}"], data={"filter_text": filter_text or ""})
 
         try:
             windows = SystemAutomation.get_open_windows(filter_text)
-            return json.dumps(windows, indent=2)
+            return self._structured_tool_result("list_windows", True, summary=f"Listed {len(windows)} window(s).", data={"filter_text": filter_text or "", "windows": windows})
         except Exception as e:
             ErrorHandler.log(e, context="tool_list_windows")
-            return f"Failed to list windows: {e}"
+            return self._structured_tool_result("list_windows", False, summary="Failed to list windows.", errors=[str(e)], data={"filter_text": filter_text or ""})
 
     def tool_capture_window(self, query: str, output_path: str = None):
         """Captures a screenshot of a window by title (query). Returns path."""
         # Backwards-compatible simple capture (Windows-focused)
-        if os.name != 'nt': return "Tool only available on Windows."
+        if os.name != 'nt':
+            return self._structured_tool_result("capture_window", False, summary="Tool only available on Windows.", errors=["Tool only available on Windows."], data={"query": query, "path": output_path or ""})
         
         final_path = output_path if output_path else f"window_capture_{int(time.time())}.png"
         
@@ -5659,11 +7062,11 @@ if __name__ == "__main__":
             res = SystemAutomation.capture_window(query, final_path)
             if res == "Success":
                  self.must_wait_for_observation = True
-                 return f"✓ Screenshot saved to {final_path}. Use <ack_observation> to proceed."
-            return f"Capture failed: {res}"
+                 return self._structured_tool_result("capture_window", True, summary="Window capture saved.", data={"query": query, "path": final_path})
+            return self._structured_tool_result("capture_window", False, summary="Window capture failed.", errors=[str(res)], data={"query": query, "path": final_path})
         except Exception as e:
             ErrorHandler.log(e, context="tool_capture_window")
-            return f"Failed to run capture_window: {e}"
+            return self._structured_tool_result("capture_window", False, summary="Window capture failed.", errors=[str(e)], data={"query": query, "path": final_path})
 
     def tool_capture_window_advanced(self, title: str = None, process: str = None, output_path: str = None, list_on_miss: bool = False, print_base64: bool = False, base64_single_line: bool = False):
         """Advanced capture that works natively or via system automation. Logic merged from capture_window.py."""
@@ -5689,7 +7092,7 @@ if __name__ == "__main__":
                             msg += f"\n--- BASE64 IMAGE START ---\n{b64_str}\n--- BASE64 IMAGE END ---\n"
 
                     self.must_wait_for_observation = True
-                    return {"result": msg, "path": final_path, "base64": b64_str if print_base64 else None}
+                    return self._structured_tool_result("capture_window_advanced", True, summary="Window capture saved.", data={"title": title or "", "process": process or "", "path": final_path, "message": msg, "base64": b64_str if print_base64 else None})
                 else:
                     msg = f"Native capture failed: {res}."
                     if list_on_miss:
@@ -5699,15 +7102,51 @@ if __name__ == "__main__":
                         else:
                             all_wins = SystemAutomation.get_open_windows()
                             msg += "\nNo similar windows found. Open windows:\n" + "\n".join([f" - {w['title']}" for w in all_wins[:15]])
-                    
                     self.must_wait_for_observation = True
-                    return {"result": msg, "path": None}
+                    return self._structured_tool_result("capture_window_advanced", False, summary="Native capture failed.", errors=[str(res)], data={"title": title or "", "process": process or "", "path": None, "message": msg})
 
-            return {"result": "Capture not supported on this platform natively.", "path": None}
+            return self._structured_tool_result("capture_window_advanced", False, summary="Capture not supported on this platform natively.", errors=["Capture not supported on this platform natively."], data={"title": title or "", "process": process or "", "path": None})
 
         except Exception as e:
             ErrorHandler.log(e, context="tool_capture_window_advanced")
-            return {"result": f"Capture failed: {e}", "path": None}
+            return self._structured_tool_result("capture_window_advanced", False, summary="Capture failed.", errors=[str(e)], data={"title": title or "", "process": process or "", "path": None})
+
+    def tool_capture_screen(self, output_path: str = None):
+        """Captures the entire screen and returns the saved path."""
+        final_path = output_path if output_path else f"screen_capture_{int(time.time())}.png"
+        try:
+            res = SystemAutomation.capture_screen(final_path)
+            if res == "Success":
+                self.must_wait_for_observation = True
+                return self._structured_tool_result("capture_screen", True, summary="Screen capture saved.", data={"path": final_path})
+            return self._structured_tool_result("capture_screen", False, summary="Screen capture failed.", errors=[str(res)], data={"path": final_path})
+        except Exception as e:
+            ErrorHandler.log(e, context="tool_capture_screen")
+            return self._structured_tool_result("capture_screen", False, summary="Capture screen failed.", errors=[str(e)], data={"path": final_path})
+
+    def tool_analyze_screen(self, question: str = "What is visible on the screen?", output_path: str = None):
+        """Captures the screen and immediately analyzes it with vision."""
+        temp_path = output_path if output_path else f"temp_screen_capture_{int(time.time())}.png"
+        keep_file = bool(output_path)
+        try:
+            print(f"{Colors.YELLOW}[Analyze Screen] Capturing full screen...{Colors.ENDC}")
+            cap_res = SystemAutomation.capture_screen(temp_path)
+            if cap_res != "Success":
+                return self._structured_tool_result("analyze_screen", False, summary="Could not capture screen.", errors=[str(cap_res)], data={"path": temp_path, "question": question})
+
+            desc = self.tool_see_image(temp_path, question)
+
+            if not keep_file:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+            vision_payload = self._parse_tool_result_payload(desc) or {"raw": desc}
+            ok = bool(vision_payload.get("ok", False)) if isinstance(vision_payload, dict) else False
+            return self._structured_tool_result("analyze_screen", ok, summary="Screen analyzed." if ok else "Screen analysis failed.", errors=vision_payload.get("errors", []) if isinstance(vision_payload, dict) else [], data={"path": temp_path if keep_file else "", "question": question, "vision": vision_payload})
+        except Exception as e:
+            return self._structured_tool_result("analyze_screen", False, summary="Screen analysis failed.", errors=[str(e)], data={"path": temp_path, "question": question})
 
     def tool_see_window(self, query: str, question: str = "What is visible in this window?"):
         """Captures a window and immediately analyzes it with vision."""
@@ -5716,7 +7155,7 @@ if __name__ == "__main__":
             print(f"{Colors.YELLOW}[See Window] Capturing '{query}'...{Colors.ENDC}")
             cap_res = SystemAutomation.capture_window(query, temp_path)
             if cap_res != "Success":
-                return f"Error: Could not capture window '{query}': {cap_res}"
+                return self._structured_tool_result("see_window", False, summary="Could not capture window.", errors=[str(cap_res)], data={"query": query, "question": question})
             
             desc = self.tool_see_image(temp_path, question)
             
@@ -5724,28 +7163,15 @@ if __name__ == "__main__":
             try: os.remove(temp_path)
             except: pass
             
-            return desc
+            vision_payload = self._parse_tool_result_payload(desc) or {"raw": desc}
+            ok = bool(vision_payload.get("ok", False)) if isinstance(vision_payload, dict) else False
+            return self._structured_tool_result("see_window", ok, summary="Window analyzed." if ok else "Window analysis failed.", errors=vision_payload.get("errors", []) if isinstance(vision_payload, dict) else [], data={"query": query, "question": question, "vision": vision_payload})
         except Exception as e:
-            return f"Error in see_window: {e}"
+            return self._structured_tool_result("see_window", False, summary="Window analysis failed.", errors=[str(e)], data={"query": query, "question": question})
 
     def tool_see_screen(self, question: str = "What is visible on the screen?"):
         """Captures the entire screen and immediately analyzes it with vision."""
-        temp_path = f"temp_screen_capture_{int(time.time())}.png"
-        try:
-            print(f"{Colors.YELLOW}[See Screen] Capturing full screen...{Colors.ENDC}")
-            cap_res = SystemAutomation.capture_window(output_path=temp_path)
-            if cap_res != "Success":
-                return f"Error: Could not capture screen: {cap_res}"
-            
-            desc = self.tool_see_image(temp_path, question)
-            
-            # Clean up temp file
-            try: os.remove(temp_path)
-            except: pass
-            
-            return desc
-        except Exception as e:
-            return f"Error in see_screen: {e}"
+        return self.tool_analyze_screen(question)
 
     def tool_list_windows_advanced(self, filter_text: str = None, format: str = 'json'):
         """List open windows using native system automation logic. Logic merged from get_open_windows.py.
@@ -5758,27 +7184,30 @@ if __name__ == "__main__":
                 # Safety Limit: Only return top 100 windows to prevent context/memory crash
                 if len(wins) > 100:
                     wins = wins[:100]
-                    note = f"\n(Truncated list: Showing first 100 of {len(wins)} windows)"
+                    note = f"Truncated list: showing first 100 windows."
                 else:
                     note = ""
                 
-                return json.dumps(wins, indent=2) + note
+                warnings = [note] if note else []
+                return self._structured_tool_result("list_windows_advanced", True, summary=f"Listed {len(wins)} window(s).", data={"filter_text": filter_text or "", "format": format, "windows": wins}, warnings=warnings)
 
-            return "Required dependencies for native window listing are missing."
+            return self._structured_tool_result("list_windows_advanced", False, summary="Required dependencies are missing.", errors=["Required dependencies for native window listing are missing."], data={"filter_text": filter_text or "", "format": format})
         except Exception as e:
             ErrorHandler.log(e, context="tool_list_windows_advanced")
-            return f"Failed to list windows: {e}"
+            return self._structured_tool_result("list_windows_advanced", False, summary="Failed to list windows.", errors=[str(e)], data={"filter_text": filter_text or "", "format": format})
 
 
     def tool_get_active_terminal(self):
         """Returns metadata about the active terminal environment."""
         info = get_terminal_environment()
-        return json.dumps(info, indent=2)
+        return self._structured_tool_result("get_active_terminal", True, summary="Collected active terminal metadata.", data=info)
 
     def tool_find_consuming_port(self, port: int):
         """Finds which PID is holding a port and returns details."""
-        return SystemAutomation.find_consuming_port(port)
+        result = SystemAutomation.find_consuming_port(port)
+        return self._structured_tool_result("find_consuming_port", "error" not in str(result).lower() and "no process found" not in str(result).lower(), summary=f"Port inspection for {port} completed.", errors=[] if "error" not in str(result).lower() else [str(result)], data={"port": int(port), "result": str(result)}, warnings=[str(result)] if "no process found" in str(result).lower() else [])
 
+    @ErrorHandler.handle(severity=ErrorSeverity.CRITICAL, code=ErrorCode.EXEC_ERROR)
     def tool_spawn_background(self, cmd: str, stop_marker: str = None, timeout: int = 30):
         """Spawns a background process and waits for a stop_marker (blocking) or just returns PID.
         Registers the process in state for persistence."""
@@ -5791,7 +7220,7 @@ if __name__ == "__main__":
         )
         if not decision.allowed:
             self.execution_policy.audit(decision, action="deny", status="blocked", payload=cmd)
-            return f"Execution blocked: {decision.reason}"
+            return self._structured_tool_result("spawn_background", False, summary="Execution blocked.", errors=[decision.reason], data={"cmd": cmd, "stop_marker": stop_marker})
 
         start_time = time.time()
         self.execution_policy.audit(decision, action="start", status="allowed", payload=cmd)
@@ -5824,7 +7253,7 @@ if __name__ == "__main__":
             self.state.save()
             
             if not stop_marker:
-                msg = f"✓ Started background process with PID {p.pid} (Registered in State)"
+                msg = f"Started background process with PID {p.pid}."
                 self.execution_policy.audit(
                     decision,
                     action="finish",
@@ -5844,9 +7273,10 @@ if __name__ == "__main__":
                                     break
                                 log_file.write(line)
                                 log_file.flush()
-                    except: pass
+                    except Exception as e:
+                        ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="tool_spawn_background.drain", code=ErrorCode.IO_ERROR)
                 threading.Thread(target=drain, args=(p,), daemon=True).start()
-                return msg
+                return self._structured_tool_result("spawn_background", True, summary=msg, data={"pid": p.pid, "cmd": cmd, "status": "running", "log_path": str(log_path), "stop_marker": stop_marker})
             
             # Non-blocking wait logic (Polled for the timeout duration)
             start_time = time.time()
@@ -5860,10 +7290,10 @@ if __name__ == "__main__":
                     log_file.flush()
                     captured.append(line.strip())
                     if stop_marker in line:
-                        msg = f"✓ Process reached '{stop_marker}'. Substituted into memory."
+                        msg = f"Process reached stop marker '{stop_marker}'."
                         self.tool_remember("processes", f"Spawned '{cmd}' - Ready seen at {time.ctime()}")
                         self.state.log_event("system", f"Background process '{cmd}' reached marker '{stop_marker}'.")
-                        result = self.execution_policy.trim_output(decision, f"Success: Process reached marker. Last few lines:\n" + "\n".join(captured[-5:]))
+                        result = self.execution_policy.trim_output(decision, "Success: Process reached marker. Last few lines:\n" + "\n".join(captured[-5:]))
                         self.execution_policy.audit(
                             decision,
                             action="finish",
@@ -5873,7 +7303,7 @@ if __name__ == "__main__":
                             duration_ms=int((time.time() - start_time) * 1000),
                             extra={"pid": p.pid, "stop_marker": stop_marker, "log_path": str(log_path)},
                         )
-                        return result
+                        return self._structured_tool_result("spawn_background", True, summary=msg, data={"pid": p.pid, "cmd": cmd, "status": "running", "stop_marker": stop_marker, "log_path": str(log_path), "output": result})
             
             result = f"Started background process (PID {p.pid}), but marker '{stop_marker}' was not seen in {decision.timeout_seconds}s. It continues to run."
             self.execution_policy.audit(
@@ -5885,7 +7315,7 @@ if __name__ == "__main__":
                 duration_ms=int((time.time() - start_time) * 1000),
                 extra={"pid": p.pid, "stop_marker": stop_marker, "log_path": str(log_path)},
             )
-            return result
+            return self._structured_tool_result("spawn_background", True, summary="Background process started without observing stop marker.", data={"pid": p.pid, "cmd": cmd, "status": "running", "stop_marker": stop_marker, "log_path": str(log_path), "output": result})
         except Exception as e:
             self.execution_policy.audit(
                 decision,
@@ -5896,8 +7326,9 @@ if __name__ == "__main__":
                 duration_ms=int((time.time() - start_time) * 1000),
             )
             ErrorHandler.log(e, context="tool_spawn_background")
-            return f"Spawn error: {e}"
+            return self._structured_tool_result("spawn_background", False, summary="Background spawn failed.", errors=[str(e)], data={"cmd": cmd, "stop_marker": stop_marker, "log_path": str(log_path)})
 
+    @ErrorHandler.handle(severity=ErrorSeverity.CRITICAL, code=ErrorCode.EXEC_ERROR)
     def tool_run_python_bg(self, code: str):
         """Writes Python code to a temp file and runs it in a detached background process.
         Returns the PID. This is safer for unstable scripts."""
@@ -5908,7 +7339,7 @@ if __name__ == "__main__":
         )
         if not decision.allowed:
             self.execution_policy.audit(decision, action="deny", status="blocked", payload=code)
-            return f"Execution blocked: {decision.reason}"
+            return self._structured_tool_result("run_python_bg", False, summary="Execution blocked.", errors=[decision.reason])
 
         start_time = time.time()
         self.execution_policy.audit(decision, action="start", status="allowed", payload=code)
@@ -5919,7 +7350,7 @@ if __name__ == "__main__":
             script_path = task_dir / f"task_{ts}.py"
             
             # Add some preamble imports to help standalone scripts
-            safe_code = "import sys, os, time\ntry:\n    import flexi\nexcept: pass\n\n" + code
+            safe_code = "import sys, os, time\ntry:\n    import flexi\nexcept Exception:\n    pass\n\n" + code
             script_path.write_text(safe_code, encoding="utf-8")
             
             # Launch
@@ -5957,10 +7388,10 @@ if __name__ == "__main__":
                                 break
                             log_file.write(line)
                             log_file.flush()
-                except Exception:
-                    pass
+                except Exception as e:
+                    ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="tool_run_python_bg.drain", code=ErrorCode.IO_ERROR)
             threading.Thread(target=drain, args=(p,), daemon=True).start()
-            result = f"✓ Started Python Background Task. PID: {p.pid}. Script: {script_path}"
+            result = f"Started Python background task PID {p.pid}."
             self.execution_policy.audit(
                 decision,
                 action="finish",
@@ -5970,7 +7401,7 @@ if __name__ == "__main__":
                 duration_ms=int((time.time() - start_time) * 1000),
                 extra={"pid": p.pid, "script_path": str(script_path), "log_path": str(log_path)},
             )
-            return result
+            return self._structured_tool_result("run_python_bg", True, summary=result, data={"pid": p.pid, "script_path": str(script_path), "status": "running", "log_path": str(log_path)})
         except Exception as e:
             self.execution_policy.audit(
                 decision,
@@ -5980,12 +7411,13 @@ if __name__ == "__main__":
                 result=str(e),
                 duration_ms=int((time.time() - start_time) * 1000),
             )
-            return f"Failed to spawn background python: {e}"
+            return self._structured_tool_result("run_python_bg", False, summary="Failed to spawn background python.", errors=[str(e)])
 
     def tool_check_bg_tasks(self, clear_finished: bool = True):
         """Checks the status of all registered background processes."""
         active = self.state.active_processes
-        if not active: return "No background tasks registered."
+        if not active:
+            return self._structured_tool_result("check_bg_tasks", True, summary="No background tasks registered.", data={"tasks": []})
         
         report = []
         to_remove = []
@@ -5997,19 +7429,19 @@ if __name__ == "__main__":
                 try:
                     proc = psutil.Process(pid)
                     status = proc.status()
-                    report.append(f"PID {pid} ({info.get('type')}): RUNNING ({status}) | Cmd: {info.get('cmd')}")
+                    report.append({"pid": pid, "type": info.get("type"), "status": f"running:{status}", "cmd": info.get("cmd"), "log_path": info.get("log_path")})
                 except psutil.NoSuchProcess:
-                    report.append(f"PID {pid} ({info.get('type')}): FINISHED/GONE | Cmd: {info.get('cmd')}")
+                    report.append({"pid": pid, "type": info.get("type"), "status": "finished", "cmd": info.get("cmd"), "log_path": info.get("log_path")})
                     to_remove.append(pid_str)
         except ImportError:
-            return "Error: psutil missing. Cannot check PIDs."
+            return self._structured_tool_result("check_bg_tasks", False, summary="Cannot check background tasks.", errors=["psutil missing. Cannot check PIDs."])
             
         if clear_finished:
             for pid_str in to_remove:
                 self.state.remove_active_process(pid_str, persist=False)
             self.state.save()
-            
-        return "\n".join(report)
+
+        return self._structured_tool_result("check_bg_tasks", True, summary=f"Checked {len(report)} background task(s).", data={"tasks": report, "cleared_finished": bool(clear_finished), "removed": to_remove})
 
     def _check_code_safety(self, code: str) -> str:
         """Evaluates code safety using heuristics and LLM audit."""
@@ -6055,29 +7487,36 @@ if __name__ == "__main__":
 
     PYTHON_EXEC_TIMEOUT = 60  # seconds default
 
+    @ErrorHandler.handle(severity=ErrorSeverity.CRITICAL, code=ErrorCode.EXEC_ERROR)
     def run_python(self, code: str) -> str:
         decision = self.execution_policy.evaluate("python", code, requested_timeout=self.PYTHON_EXEC_TIMEOUT)
         if not decision.allowed:
             self.execution_policy.audit(decision, action="deny", status="blocked", payload=code)
-            return f"Execution blocked: {decision.reason}"
+            return self._structured_tool_result("python", False, summary="Execution blocked.", errors=[decision.reason], data={"code": code[:2000]})
 
         try:
             self._run_tool_hook('pre', 'python', code)
-        except Exception:
-            pass
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="run_python.pre_tool", code=ErrorCode.EXEC_ERROR)
 
         start_time = time.time()
         self.execution_policy.audit(decision, action="start", status="allowed", payload=code)
         try:
             ast.parse(code)
         except SyntaxError as err:
-            result = self._format_python_syntax_error(code, err)
+            result = self._structured_tool_result(
+                "python",
+                False,
+                summary="Python payload rejected before execution.",
+                errors=[self._format_python_syntax_error(code, err)],
+                data={"code": code[:2000], "stage": "syntax_precheck", "lineno": err.lineno, "offset": err.offset},
+            )
             self.execution_policy.audit(
                 decision,
                 action="finish",
                 status="failed",
                 payload=code,
-                result=result,
+                result=self._tool_result_text(result),
                 duration_ms=int((time.time() - start_time) * 1000),
                 extra={
                     "stage": "syntax_precheck",
@@ -6109,17 +7548,16 @@ if __name__ == "__main__":
                     print(f"{Colors.DIM}Code Start:\n{orig_code[:300]}...{Colors.ENDC}")
                     
                     try:
-                        print(f"{Colors.YELLOW}Allow execution? (y/n/always): {Colors.ENDC}", end="", flush=True)
-                        choice = input().lower().strip()
+                        choice = input(f"{Colors.YELLOW}[Awaiting confirmation] Allow execution? (y/n/always): {Colors.ENDC}").lower().strip()
                     except EOFError:
-                        return "Execution blocked (No Input)."
+                        return self._structured_tool_result("python", False, summary="Execution blocked.", errors=["Execution blocked (No Input)."], data={"code": orig_code[:2000]})
                     
                     if choice == RestartPolicy.ALWAYS:
                         self.state.set_runtime_value("safety_always_allow", True)
                         self.state.save()
                         print(f"{Colors.GREEN}Always-allow enabled for this session.{Colors.ENDC}")
                     elif choice != "y":
-                        return "Execution blocked by user."
+                        return self._structured_tool_result("python", False, summary="Execution blocked by user.", errors=["Execution blocked by user."], data={"code": orig_code[:2000]})
             
             with self._state_lock:
                 current_globals = self.state.globals.copy()
@@ -6154,17 +7592,19 @@ if __name__ == "__main__":
                 "see_image": self.tool_see_image,
                 "see": self.tool_see_image,
                 "see_window": self.tool_see_window,
-            "see_screen": self.tool_see_screen,
-            "capture_window": self.tool_capture_window,
-            "capture_window_advanced": self.tool_capture_window_advanced,
-            "list_windows_advanced": self.tool_list_windows_advanced,
-            "get_active_terminal": self.tool_get_active_terminal,
-            "list_processes": self.tool_list_processes,
-            "get_software_versions": self.tool_get_software_versions,
-            "spawn_background": self.tool_spawn_background,
-            "spawn_bg": self.tool_spawn_background,
-            "run_python_bg": self.tool_run_python_bg,
-            "check_bg_tasks": self.tool_check_bg_tasks,
+                "see_screen": self.tool_see_screen,
+                "analyze_screen": self.tool_analyze_screen,
+                "capture_screen": self.tool_capture_screen,
+                "capture_window": self.tool_capture_window,
+                "capture_window_advanced": self.tool_capture_window_advanced,
+                "list_windows_advanced": self.tool_list_windows_advanced,
+                "get_active_terminal": self.tool_get_active_terminal,
+                "list_processes": self.tool_list_processes,
+                "get_software_versions": self.tool_get_software_versions,
+                "spawn_background": self.tool_spawn_background,
+                "spawn_bg": self.tool_spawn_background,
+                "run_python_bg": self.tool_run_python_bg,
+                "check_bg_tasks": self.tool_check_bg_tasks,
                 "get_bg_task_details": self.tool_get_bg_task_details,
                 "read_bg_task_log": self.tool_read_bg_task_log,
                 "stop_bg_task": self.tool_stop_bg_task,
@@ -6296,7 +7736,8 @@ if __name__ == "__main__":
                     ast.fix_missing_locations(print_call)
                     tree.body[-1] = print_call
                     exec_code = compile(tree, filename="<string>", mode="exec")     
-            except Exception:
+            except Exception as e:
+                    ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="run_python.ast_wrap", code=ErrorCode.EXEC_ERROR)
                     # If AST parsing fails, just execute original code (might be syntax error, let exec handle it)
                     pass
 
@@ -6323,23 +7764,35 @@ if __name__ == "__main__":
                     new_globals = dict(list(new_globals.items())[:max_globals])
                 self.state.globals = new_globals
                 self.state.save()
-            return self.execution_policy.trim_output(decision, stdout_buf.getvalue())
+            trimmed_output = self.execution_policy.trim_output(decision, stdout_buf.getvalue())
+            return self._structured_tool_result(
+                "python",
+                True,
+                summary="Python execution completed.",
+                data={"output": trimmed_output, "code": orig_code[:2000]},
+            )
             # end of _execute
-        # run with timeout in executor
+        async def _execute_async() -> str:
+            loop = asyncio.get_running_loop()
+            return await asyncio.wait_for(loop.run_in_executor(None, _execute), timeout=decision.timeout_seconds)
+
         def _execute_core(raw_code: str) -> str:
             nonlocal code
             code = raw_code
-            result = ""
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_execute)
-                try:
-                    result = future.result(timeout=decision.timeout_seconds)
-                except Exception as e:
-                    if isinstance(e, TimeoutError):
-                        result = f"[System] Error: Python execution timed out ({decision.timeout_seconds}s)"
-                    else:
-                        result = f"[System] Execution failed: {e}"
-            return result
+            try:
+                return asyncio.run(_execute_async())
+            except RuntimeError:
+                # Already running in an event loop; fall back to thread-based execution.
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_execute)
+                    try:
+                        return future.result(timeout=decision.timeout_seconds)
+                    except TimeoutError:
+                        return self._structured_tool_result("python", False, summary="Python execution timed out.", errors=[f"Python execution timed out ({decision.timeout_seconds}s)"], data={"code": raw_code[:2000]})
+                    except Exception as e:
+                        return self._structured_tool_result("python", False, summary="Python execution failed.", errors=[str(e)], data={"code": raw_code[:2000]})
+            except Exception as e:
+                return self._structured_tool_result("python", False, summary="Python execution failed.", errors=[str(e)], data={"code": raw_code[:2000]})
 
         result = self._run_tool_with_wrapper('python', code, _execute_core)
         self.execution_policy.audit(
@@ -6347,20 +7800,25 @@ if __name__ == "__main__":
             action="finish",
             status="failed" if self._tool_result_failed(result) else "completed",
             payload=code,
-            result=result,
+            result=self._tool_result_text(result),
             duration_ms=int((time.time() - start_time) * 1000),
         )
         # post-tool hook
         try:
             self._run_tool_hook('post', 'python', result)
-        except Exception:
-            pass
-        return result
+        except Exception as e:
+            ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="run_python.post_tool", code=ErrorCode.EXEC_ERROR)
+        return self._append_reviewer_summary(result, "python", code)
         # end of run_python
 
     def get_system_prompt(self) -> str:
         summary_text = self.state.compressed_summary
         summary_block = f"\nTECHNICAL BACKGROUND (SUMMARY): {summary_text}" if summary_text else ""
+        active_goals = self.active_goals()
+        goal_block = ""
+        if active_goals:
+            goal_lines = [f"   - [{goal.get('id')}] priority={goal.get('priority')} status={goal.get('status')} text={goal.get('text')}" for goal in active_goals[:8]]
+            goal_block = "\nACTIVE GOALS:\n" + "\n".join(goal_lines)
         
         # System Info Injection
         sys_info = f"OS: {os.name} | Platform: {sys.platform}"
@@ -6371,8 +7829,10 @@ if __name__ == "__main__":
         cwd = os.getcwd()
         py_path = sys.executable
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try: user = os.getlogin()
-        except: user = os.environ.get("USER", "unknown")
+        try:
+            user = os.getlogin()
+        except Exception:
+            user = os.environ.get("USER", "unknown")
         
         env_context = (f"   - **Environment**: CWD='{cwd}' | User='{user}' | Time='{timestamp}'\n"
                        f"   - **Runtime**: Python='{py_path}'")
@@ -6428,12 +7888,13 @@ if __name__ == "__main__":
                 f"INSTRUCTIONS:\n"
                 f"1. Use <plan> to outline steps.\n"
                 f"2. Use <bash> or <python> for execution.\n"
-                f"3. **STRICT**: ONLY use <bash>, <python>, or <plan> tags. To run functions, use <python>tool_name()</python>.\n"
+                f"3. **STRICT**: Only use these control tags: <plan>, <bash>, <python>, <ack_observation>, and <consensus>. To run functions, use <python>tool_name()</python>.\n"
                 f"4. **LOCKING**: If the system says 'Awaiting Acknowledgement', you MUST output <ack_observation> to unlock the turn.\n"
                 f"5. **VALIDATION**: If you write code, you MUST wait for turn output before calling <consensus>.\n"
                 f"6. **INTERACTION**: To ask the user a question or present a menu, use <consensus>Question text...</consensus>. DO NOT print menus with <python> and wait.\n"
                 f"7. **FINALITY**: Use <consensus>final response</consensus> ONLY when the task is complete.\n"
-            f"{summary_block}{mem_hint}{skill_prompt_block}")
+                f"8. **DIRECT ANSWERS**: If the user asks for simple factual information already present in SYSTEM INFO or Environment, answer directly with <consensus> and do not call tools.\n"
+            f"{goal_block}{summary_block}{mem_hint}{skill_prompt_block}")
 
     def handle_turn(self, user_input: str):
         # convenience getters for skills/prompts
@@ -6458,6 +7919,20 @@ if __name__ == "__main__":
                 self.on_user_input(user_input)
             except Exception:
                 pass
+
+            # 0. If there are pending plans, complete them first before starting new proposal cycles.
+            pending_plans = self.state.query_history(tag="plan", limit=20)
+            if pending_plans:
+                ConsoleOutput.system("Pending plans detected; resuming existing work before proposing new auto-improvements.")
+                try:
+                    continue_resp = self.handle_turn("continue")
+                    ConsoleOutput.system(f"Continuing pending work result: {continue_resp}")
+                except Exception as e:
+                    ConsoleOutput.error(f"Error continuing pending plans: {e}")
+
+                # if there are still pending plans, return and wait for next user input.
+                if self.state.query_history(tag="plan", limit=20):
+                    return "Pending plan work resumed. Continue next turn to keep going."
 
             for _ in range(24):
                 # increment global turn counter so each log entry gets a unique number
@@ -6544,8 +8019,8 @@ if __name__ == "__main__":
                             meta = ["consensus"]
                             # no tools used for pure consensus
                             self.logger.log_turn(turn_num, resp, self.state.calculate_diff(turn_start_data, self.state.data), ["consensus"], duration=dur, meta=meta)
-                            # Final response gets the enforced You label to prevent accidental removal
-                            return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{PROMPT_LABEL}{draft}"
+                            # Final response should not include the user label prefix
+                            return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{draft}"
                     else:
                         obs_prefix = ""
 
@@ -6667,6 +8142,7 @@ if __name__ == "__main__":
         except Exception as outer_e:
             return f"\n{Colors.RED}[CRITICAL HANDLER FAILURE]: {outer_e}{Colors.ENDC}\n{traceback.format_exc()}"
 
+
 def clear_console():
     """Cross-platform console clear without using os.system directly."""
     try:
@@ -6727,8 +8203,6 @@ def bootstrap_runtime(log_step):
     bot = FlexiBot()
     log_step("bot instantiated")
     ConsoleOutput.system(f"System initialized. Auto-Summary threshold: {TOKEN_THRESHOLD}")
-    # Ensure prompt label is always visible on startup
-    ConsoleOutput.prompt()
     log_step("after bot init print")
     return bot
 
@@ -6764,6 +8238,7 @@ def shutdown_runtime(bot: Optional[FlexiBot], reason: str = ""):
 def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle_timeout: int = 300):
     stdin_closed = False
     log_step("enter input loop")
+    effective_idle = bot.idle_proposal_interval_seconds if getattr(bot, 'idle_proposal_enabled', False) else idle_timeout
     while True:
         log_step("loop iteration start")
         ConsoleOutput.user_output("", end="")
@@ -6778,16 +8253,26 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
                     user_input = input_queue.get(timeout=0.5)
                     break
                 except queue.Empty:
-                    if time.time() - last_activity > idle_timeout:
-                        ConsoleOutput.warning(f"User idle for {idle_timeout}s. Resuming...")
+                    if time.time() - last_activity > effective_idle:
+                        ConsoleOutput.warning(f"User idle for {effective_idle}s. Resuming...")
                         last_activity = time.time()
 
-                        # trigger idle proposal workflow and update loop state
-                        try:
-                            workflow_result = bot.idle_proposal_workflow()
-                            ConsoleOutput.system(f"Idle workflow result: {workflow_result}")
-                        except Exception as e:
-                            ConsoleOutput.error(f"Idle workflow error: {e}")
+                        # trigger auto-proposal workflow and apply confirmed patch (guarded + lightweight safety)
+                        # Only run the workflow when explicitly enabled; avoid blocking the input loop.
+                        if getattr(bot, "idle_proposal_enabled", False) and getattr(bot, "idle_proposal_interval_seconds", 0) > 0:
+                            try:
+                                start_time = time.time()
+                                # call with configured auto_confirm flag if present; keep the call synchronous but observe duration
+                                workflow_result = bot.idle_proposal_workflow(auto_propose=False, auto_confirm=getattr(bot, "idle_proposal_auto_confirm", None))
+                                ConsoleOutput.system(f"Idle workflow result: {workflow_result}")
+                                elapsed = time.time() - start_time
+                                # log unusually long runs to aid debugging and avoid silent hangs
+                                if elapsed > max(10, effective_idle * 2):
+                                    ConsoleOutput.warning(f"Idle workflow completed but took long: {elapsed:.1f}s")
+                            except Exception as e:
+                                ConsoleOutput.error(f"Idle workflow error: {e}")
+                        else:
+                            ConsoleOutput.system("Idle proposal workflow disabled or misconfigured; skipping automated run.")
 
                         ConsoleOutput.user_output("", end="")
                         ConsoleOutput.prompt()
@@ -6806,6 +8291,14 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
         if user_input.strip() == "__STATUS__":
             ConsoleOutput.system("STATUS PROBE")
             ConsoleOutput.user_output(json.dumps(bot.get_runtime_status(), indent=2))
+            continue
+
+        stripped_input = user_input.strip()
+        if stripped_input.startswith(OPERATOR_COMMAND_PREFIX):
+            try:
+                ConsoleOutput.user_output(bot.handle_operator_command(stripped_input))
+            except Exception as e:
+                ConsoleOutput.error(f"Operator command error: {e}")
             continue
 
         if user_input.lower() in ["exit", "quit"]:
