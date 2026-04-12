@@ -6,6 +6,7 @@ import time
 import sys
 import platform
 from datetime import datetime, timedelta
+import csv
 import json
 import os
 import io
@@ -36,31 +37,50 @@ import warnings
 import importlib.util
 import tokenize
 import html
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
-try:
-    import readline
-    HISTORY_SUPPORT = True
-except ImportError:
-    try:
-        import pyreadline3 as readline
-        HISTORY_SUPPORT = True
-    except ImportError:
-        HISTORY_SUPPORT = False
-
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from typing import List, Dict, Any, Optional, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from contextlib import redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 
-class RestartPolicy(str, Enum):
-    NEVER = "never"
-    ON_FAILURE = "on_failure"
-    ALWAYS = "always"
 
-# --- QA / EVOLUTION CONSTANTS ---
-# --- CONFIGURATION ---
-# Allow running multiple agent instances by pointing to a custom state dir via env var
+def _is_termux_environment() -> bool:
+    if platform.system() != "Linux":
+        return False
+    prefix = os.environ.get("PREFIX", "")
+    return "com.termux" in prefix or bool(os.environ.get("TERMUX_VERSION"))
+
+
+def _safe_import_posix_readline():
+    saved_settings = None
+    termios_mod = None
+    stdin_stream = getattr(sys, "stdin", None)
+    should_restore_tty = _is_termux_environment()
+    if should_restore_tty and stdin_stream is not None and hasattr(stdin_stream, "fileno"):
+        try:
+            import termios as termios_mod_local
+            termios_mod = termios_mod_local
+            saved_settings = termios_mod.tcgetattr(stdin_stream.fileno())
+        except Exception:
+            saved_settings = None
+            termios_mod = None
+
+    try:
+        import readline as readline_mod
+        return readline_mod, True
+    except ImportError:
+        return None, False
+    finally:
+        if saved_settings is not None and termios_mod is not None and stdin_stream is not None:
+            try:
+                termios_mod.tcsetattr(stdin_stream.fileno(), termios_mod.TCSADRAIN, saved_settings)
+            except Exception:
+                pass
+
+
+readline, HISTORY_SUPPORT = _safe_import_posix_readline()
+
 # Example: FLEXI_STATE_DIR=.flexi_cli python flexi.py
 STATE_DIR = Path(os.environ.get("FLEXI_STATE_DIR", ".flexi/rlm_state"))
 
@@ -74,6 +94,8 @@ else:
 STATE_FILE = STATE_DIR / "state.json"
 GLOBALS_FILE = STATE_DIR / "globals.pkl"
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
+COMMAND_HISTORY_FILE = STATE_DIR / "command_history"
+COMMAND_HISTORY_LENGTH = 2000
 BG_TASK_LOG_DIR = STATE_DIR / "bg_task_logs"
 DB_PROFILES_FILE = STATE_DIR / "db_profiles.json"
 NOTEBOOK_SESSION_FILE = STATE_DIR / "notebook_sessions.json"
@@ -83,12 +105,22 @@ RESPONSE_TRACE_FILE = STATE_DIR / "response_trace.jsonl"
 ARCHIVE_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB by default
 REVIEWER_EVENT_KEY = "reviewer_events"
 GOAL_RECORDS_KEY = "goal_records"
+RUNTIME_HEARTBEAT_KEY = "runtime_heartbeat"
+PROJECT_MEMORY_KEY = "project_memory"
+TASK_MEMORY_KEY = "task_memory"
+FAILURE_MEMORY_KEY = "failure_memory"
+PROJECT_BRIEF_KEY = "project_brief"
+TASK_GRAPH_KEY = "task_graph"
+WORKSPACE_LOCKS_KEY = "workspace_locks"
+LAST_TEST_RUN_KEY = "last_test_run"
+IDLE_TRIAGE_RECORD_KEY = "idle_triage"
 GOAL_STATUS_ACTIVE = "active"
 GOAL_STATUS_PENDING = "pending"
 GOAL_STATUS_COMPLETED = "completed"
 GOAL_STATUS_CANCELLED = "cancelled"
 GOAL_STATUS_FAILED = "failed"
 OPERATOR_COMMAND_PREFIX = "/"
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5
 OPERATOR_COMMANDS = {
     "/health",
     "/history",
@@ -139,13 +171,91 @@ RUNTIME_FLAGS = {
 
 STARTUP_LOG_FILE = Path("startup.log")
 
+
+def _readline_history_available() -> bool:
+    return bool(
+        HISTORY_SUPPORT
+        and readline is not None
+        and hasattr(readline, "read_history_file")
+        and hasattr(readline, "write_history_file")
+    )
+
+
+def load_command_history() -> bool:
+    if not _readline_history_available():
+        return False
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if hasattr(readline, "set_history_length"):
+            readline.set_history_length(COMMAND_HISTORY_LENGTH)
+        if hasattr(readline, "set_auto_history"):
+            try:
+                readline.set_auto_history(True)
+            except Exception:
+                pass
+        if hasattr(readline, "parse_and_bind"):
+            try:
+                readline.parse_and_bind("tab: complete")
+            except Exception:
+                pass
+        if COMMAND_HISTORY_FILE.exists():
+            readline.read_history_file(str(COMMAND_HISTORY_FILE))
+        return True
+    except Exception:
+        return False
+
+
+def _dedupe_readline_history() -> bool:
+    if not _readline_history_available():
+        return False
+    required = ("get_current_history_length", "get_history_item", "clear_history", "add_history")
+    if not all(hasattr(readline, attr) for attr in required):
+        return False
+    try:
+        history_length = int(readline.get_current_history_length())
+        if history_length <= 1:
+            return True
+        entries: list[str] = []
+        previous_entry: str | None = None
+        for index in range(1, history_length + 1):
+            entry = readline.get_history_item(index)
+            if entry is None:
+                continue
+            if entry == previous_entry:
+                continue
+            entries.append(entry)
+            previous_entry = entry
+        if COMMAND_HISTORY_LENGTH > 0 and len(entries) > COMMAND_HISTORY_LENGTH:
+            entries = entries[-COMMAND_HISTORY_LENGTH:]
+        readline.clear_history()
+        for entry in entries:
+            readline.add_history(entry)
+        return True
+    except Exception:
+        return False
+
+
+def save_command_history() -> bool:
+    if not _readline_history_available():
+        return False
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if hasattr(readline, "set_history_length"):
+            readline.set_history_length(COMMAND_HISTORY_LENGTH)
+        _dedupe_readline_history()
+        readline.write_history_file(str(COMMAND_HISTORY_FILE))
+        return True
+    except Exception:
+        return False
+
 def get_default_runtime_config() -> dict[str, Any]:
     return {
         "idle_proposal_enabled": True,
         "idle_proposal_interval_seconds": 300,
         "idle_proposal_auto_confirm": True,
-        "reviewer_pass_enabled": False,
-        "reviewer_pass_after_tools": False,
+        "heartbeat_interval_seconds": DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        "reviewer_pass_enabled": True,
+        "reviewer_pass_after_tools": True,
         "reviewer_pass_after_tests": True,
         "debug_startup": False,
         "no_dependency_check": False,
@@ -1027,6 +1137,63 @@ class ExecutionPolicyDecision:
 class ExecutionPolicyLayer:
     """Central policy layer for tool execution behavior."""
 
+    INSPECTION_PATTERNS = {
+        "bash": [
+            r"\brg\b",
+            r"\bgrep\b",
+            r"\bfindstr\b",
+            r"\bcat\b",
+            r"\btype\b",
+            r"\bls\b",
+            r"\bdir\b",
+            r"\bpwd\b",
+            r"\bwhere\b",
+            r"\bwhich\b",
+            r"git\s+(status|diff|show|log)",
+            r"py_compile",
+        ],
+        "python": [
+            r"safe_inspect\(",
+            r"inspect_file_chunk\(",
+            r"read_file\(",
+            r"read_range\(",
+            r"peek\(",
+            r"grep\(",
+            r"find_",
+            r"tree\(",
+            r"inspect_python_environment\(",
+            r"list_python_packages\(",
+            r"project_map",
+            r"task_graph",
+        ],
+    }
+    MUTATING_PATTERNS = {
+        "bash": [
+            r"\bpip\s+install\b",
+            r"\bnpm\s+(install|update|run)\b",
+            r"\bgit\s+(add|commit|push|checkout|switch|reset)\b",
+            r"\brm\b",
+            r"\bdel\b",
+            r"\bmv\b",
+            r"\bmove\b",
+            r"\bcopy\b",
+            r"\bcp\b",
+            r"\btaskkill\b",
+        ],
+        "python": [
+            r"write\(",
+            r"create_file\(",
+            r"delete_file\(",
+            r"move_file\(",
+            r"patch\(",
+            r"edit_lines\(",
+            r"spawn_background\(",
+            r"run_python_bg\(",
+            r"install_python_package\(",
+            r"subprocess\.",
+        ],
+    }
+
     DEFAULT_ALLOWED_TOOLS = {
         "bash": True,
         "python": True,
@@ -1059,6 +1226,12 @@ class ExecutionPolicyLayer:
         "python": {
             "max_input_chars": 12000,
             "max_globals": 256,
+            "inspect_max_depth": 2,
+            "inspect_max_items": 20,
+            "inspect_max_fields": 24,
+            "inspect_max_string_chars": 240,
+            "inspect_file_chunk_lines": 120,
+            "print_max_chars_per_call": 3000,
         },
         "spawn_background": {
             "max_input_chars": 4000,
@@ -1122,6 +1295,16 @@ class ExecutionPolicyLayer:
         self.audit_logging = copy.deepcopy(self.DEFAULT_AUDIT_LOGGING)
         self.audit_logging.update(dict(policy_cfg.get("audit_logging", {}) or {}))
         self.audit_log_path = STATE_DIR / self.audit_logging.get("path", "execution_audit.jsonl")
+        self.runtime_feedback: dict[str, Any] = {}
+
+    def set_runtime_feedback(self, feedback: dict[str, Any] | None):
+        self.runtime_feedback = copy.deepcopy(feedback or {})
+
+    def clear_runtime_feedback(self):
+        self.runtime_feedback = {}
+
+    def _feedback_snapshot(self) -> dict[str, Any]:
+        return copy.deepcopy(self.runtime_feedback or {})
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -1131,7 +1314,21 @@ class ExecutionPolicyLayer:
             "resource_ceilings": copy.deepcopy(self.resource_ceilings),
             "environment_isolation": copy.deepcopy(self.environment_isolation),
             "audit_logging": copy.deepcopy(self.audit_logging),
+            "runtime_feedback": self._feedback_snapshot(),
         }
+
+    def _payload_matches(self, tool_name: str, payload: str, patterns: dict[str, list[str]]) -> bool:
+        text = str(payload or "")
+        for pattern in patterns.get(tool_name, []):
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        return False
+
+    def _inspection_like_payload(self, tool_name: str, payload: str) -> bool:
+        return self._payload_matches(tool_name, payload, self.INSPECTION_PATTERNS)
+
+    def _mutating_payload(self, tool_name: str, payload: str) -> bool:
+        return self._payload_matches(tool_name, payload, self.MUTATING_PATTERNS)
 
     def _tool_ceilings(self, tool_name: str) -> dict[str, Any]:
         combined = dict(self.resource_ceilings.get("default", {}))
@@ -1194,6 +1391,7 @@ class ExecutionPolicyLayer:
             )
 
         ceilings = self._tool_ceilings(tool_name)
+        feedback = self._feedback_snapshot()
         env, rules = self._build_environment(tool_name)
         blocked_reason = self._payload_block_reason(tool_name, payload, rules)
         if blocked_reason:
@@ -1207,6 +1405,42 @@ class ExecutionPolicyLayer:
                 isolation_rules=rules,
                 audit_format=copy.deepcopy(self.audit_logging),
             )
+
+        if feedback.get("redirect_to_inspection") and self._mutating_payload(tool_name, payload):
+            return ExecutionPolicyDecision(
+                tool_name=tool_name,
+                allowed=False,
+                reason=(
+                    "Reviewer guidance requires inspection before more changes. "
+                    f"Blocked mutating {tool_name} payload until stronger evidence is collected."
+                ),
+                timeout_seconds=0,
+                resource_ceilings=ceilings,
+                environment=env,
+                isolation_rules=rules,
+                audit_format=copy.deepcopy(self.audit_logging),
+            )
+
+        if feedback.get("severity") == "blocked" and tool_name in {"spawn_background", "run_python_bg", "install_python_package"}:
+            return ExecutionPolicyDecision(
+                tool_name=tool_name,
+                allowed=False,
+                reason=(
+                    "Reviewer guidance marked the current work blocked. "
+                    f"{tool_name} is disabled until inspection or recovery evidence is gathered."
+                ),
+                timeout_seconds=0,
+                resource_ceilings=ceilings,
+                environment=env,
+                isolation_rules=rules,
+                audit_format=copy.deepcopy(self.audit_logging),
+            )
+
+        if feedback.get("confidence") == "low" or feedback.get("require_stronger_verification"):
+            ceilings = copy.deepcopy(ceilings)
+            ceilings["max_output_chars"] = min(int(ceilings.get("max_output_chars", 12000)), 8000)
+            if "print_max_chars_per_call" in ceilings:
+                ceilings["print_max_chars_per_call"] = min(int(ceilings.get("print_max_chars_per_call", 3000)), 1800)
 
         max_input = int(ceilings.get("max_input_chars", 100000))
         if len(payload or "") > max_input:
@@ -1237,6 +1471,10 @@ class ExecutionPolicyLayer:
         default_timeout = int(self.timeout_defaults.get(tool_name, 30))
         max_timeout = int(self.timeout_overrides.get(tool_name, default_timeout))
         timeout_seconds = default_timeout if requested_timeout is None else min(int(requested_timeout), max_timeout)
+        if feedback.get("confidence") == "low":
+            timeout_seconds = max(10, int(timeout_seconds * 0.75))
+        elif feedback.get("require_stronger_verification") and not self._inspection_like_payload(tool_name, payload):
+            timeout_seconds = max(10, int(timeout_seconds * 0.85))
         return ExecutionPolicyDecision(
             tool_name=tool_name,
             allowed=True,
@@ -2124,6 +2362,143 @@ def rlm_read(filepath):
             return _rlm_result("read_file", data={"file": filepath, "content": f.read()})
     except Exception as e:
         return _rlm_result("read_file", ok=False, errors=[f"Read error: {e}"], data={"file": filepath})
+
+def _rlm_limit_text(text, max_chars=12000):
+    value = str(text)
+    if max_chars <= 0 or len(value) <= int(max_chars):
+        return value
+    clipped = value[: max(0, int(max_chars))]
+    return f"{clipped}... (truncated, {len(value)} chars total)"
+
+def _rlm_safe_preview_data(value, max_depth=2, max_items=20, max_fields=24, max_string_chars=240, _depth=0):
+    if isinstance(value, str):
+        return _rlm_limit_text(value, max_chars=max_string_chars)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if _depth >= max_depth:
+        return f"<{type(value).__name__}>"
+    if isinstance(value, dict):
+        items = list(value.items())
+        preview = {}
+        for key, item in items[:max_fields]:
+            preview[str(key)] = _rlm_safe_preview_data(
+                item,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_fields=max_fields,
+                max_string_chars=max_string_chars,
+                _depth=_depth + 1,
+            )
+        if len(items) > max_fields:
+            preview["..."] = f"{len(items) - max_fields} more field(s)"
+        return preview
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        preview = [
+            _rlm_safe_preview_data(
+                item,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_fields=max_fields,
+                max_string_chars=max_string_chars,
+                _depth=_depth + 1,
+            )
+            for item in seq[:max_items]
+        ]
+        if len(seq) > max_items:
+            preview.append(f"... ({len(seq) - max_items} more item(s))")
+        return preview
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "read") and hasattr(value, "name"):
+        return {"type": type(value).__name__, "name": getattr(value, "name", "")}
+    if hasattr(value, "__dict__"):
+        try:
+            data = vars(value)
+        except Exception:
+            return repr(value)
+        return {
+            "type": type(value).__name__,
+            "attrs": _rlm_safe_preview_data(
+                data,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_fields=max_fields,
+                max_string_chars=max_string_chars,
+                _depth=_depth + 1,
+            ),
+        }
+    return _rlm_limit_text(repr(value), max_chars=max_string_chars)
+
+def rlm_inspect_file_chunk(filepath, start_line=1, chunk_lines=120, max_chars=12000):
+    try:
+        if not os.path.exists(filepath):
+            return _rlm_result("inspect_file_chunk", ok=False, errors=[f"File not found: {filepath}"], data={"file": filepath, "start_line": int(start_line), "chunk_lines": int(chunk_lines)})
+        start = max(1, int(start_line))
+        chunk = max(1, int(chunk_lines))
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        begin = start - 1
+        end = min(len(lines), begin + chunk)
+        content = "".join(lines[begin:end])
+        limited = _rlm_limit_text(content, max_chars=max_chars)
+        next_start = end + 1 if end < len(lines) else None
+        summary = f"Read lines {start}-{end} from {filepath}"
+        if next_start is not None:
+            summary += f"; next_start_line={next_start}"
+        return _rlm_result(
+            "inspect_file_chunk",
+            data={
+                "file": filepath,
+                "start_line": start,
+                "end_line": end,
+                "chunk_lines": chunk,
+                "next_start_line": next_start,
+                "total_lines": len(lines),
+                "content": limited,
+            },
+            summary=summary,
+        )
+    except Exception as e:
+        return _rlm_result("inspect_file_chunk", ok=False, errors=[f"Inspect file chunk error: {e}"], data={"file": filepath, "start_line": start_line, "chunk_lines": chunk_lines})
+
+def rlm_safe_inspect(target=None, label="", start_line=1, chunk_lines=120, max_depth=2, max_items=20, max_fields=24, max_string_chars=240, prefer_file_reads=True, max_chars=12000):
+    try:
+        file_candidate = None
+        if prefer_file_reads:
+            if isinstance(target, (str, Path)):
+                candidate = Path(target)
+                if candidate.exists() and candidate.is_file():
+                    file_candidate = str(candidate)
+            elif hasattr(target, "name"):
+                candidate = Path(str(getattr(target, "name")))
+                if candidate.exists() and candidate.is_file():
+                    file_candidate = str(candidate)
+        if file_candidate:
+            result = rlm_inspect_file_chunk(file_candidate, start_line=start_line, chunk_lines=chunk_lines, max_chars=max_chars)
+            if label:
+                result.setdefault("data", {})["label"] = label
+                if result.get("summary"):
+                    result["summary"] = f"{label}: {result['summary']}"
+            return result
+        preview = _rlm_safe_preview_data(
+            target,
+            max_depth=max_depth,
+            max_items=max_items,
+            max_fields=max_fields,
+            max_string_chars=max_string_chars,
+        )
+        rendered = _rlm_limit_text(json.dumps(preview, ensure_ascii=False, default=str, indent=2), max_chars=max_chars)
+        summary = "Inspected object safely."
+        if label:
+            summary = f"Inspected {label} safely."
+        return _rlm_result(
+            "safe_inspect",
+            data={"label": label, "preview": rendered},
+            summary=summary,
+        )
+    except Exception as e:
+        return _rlm_result("safe_inspect", ok=False, errors=[f"Safe inspect error: {e}"], data={"label": label})
 
 def rlm_write(filepath, content):
     try:
@@ -3578,6 +3953,81 @@ class MemoryEntry:
     tags: List[str]
     timestamp: float
 
+
+@dataclass
+class ProjectBrief:
+    workspace_path: str = ""
+    stack: list[str] = field(default_factory=list)
+    entrypoints: list[str] = field(default_factory=list)
+    build_commands: list[str] = field(default_factory=list)
+    test_commands: list[str] = field(default_factory=list)
+    deployment_shape: str = ""
+    current_milestone: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class TaskGraphNode:
+    id: str = ""
+    title: str = ""
+    description: str = ""
+    target_files: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    verification_target: str = ""
+    goal_id: str = ""
+    status: str = GOAL_STATUS_PENDING
+
+
+@dataclass
+class TaskGraph:
+    nodes: list[TaskGraphNode] = field(default_factory=list)
+    updated_at: str = ""
+
+
+@dataclass
+class WorkspaceLock:
+    id: str = ""
+    area: str = ""
+    holder: str = ""
+    goal_id: str = ""
+    reason: str = ""
+    acquired_at: str = ""
+    expires_at: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ProjectMemory:
+    workspace_path: str = ""
+    architecture: list[str] = field(default_factory=list)
+    conventions: list[str] = field(default_factory=list)
+    entrypoints: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    current_milestones: list[str] = field(default_factory=list)
+    brief: ProjectBrief = field(default_factory=ProjectBrief)
+    updated_at: str = ""
+
+
+@dataclass
+class TaskMemory:
+    request_signature: str = ""
+    current_operation: str = ""
+    expected_output: str = ""
+    active_goal_id: str = ""
+    current_phase: str = ""
+    touched_files: list[str] = field(default_factory=list)
+    last_observations: list[str] = field(default_factory=list)
+    updated_at: str = ""
+
+
+@dataclass
+class FailureMemory:
+    recurring_errors: list[dict[str, Any]] = field(default_factory=list)
+    known_bad_commands: list[dict[str, Any]] = field(default_factory=list)
+    missing_dependencies: list[dict[str, Any]] = field(default_factory=list)
+    recovery_patterns: list[dict[str, Any]] = field(default_factory=list)
+    updated_at: str = ""
+
 class AgentState:
     """
     SQLite-backed agent state with explicit APIs for history, memory, runtime
@@ -3723,6 +4173,260 @@ class AgentState:
     @property
     def structured_memory(self) -> dict[str, Any]:
         return self.memory
+
+    def _coerce_memory_text_list(self, value: Any, *, limit: int = 20, max_chars: int = 240) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            items = [value]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            text = re.sub(r"\s+", " ", str(item or "")).strip()
+            if not text:
+                continue
+            if len(text) > max_chars:
+                text = text[: max_chars - 3].rstrip() + "..."
+            if text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized[-max(1, int(limit)):]
+
+    def _coerce_failure_records(self, value: Any, *, limit: int = 25) -> list[dict[str, Any]]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        records: list[dict[str, Any]] = []
+        for item in list(value)[-max(1, int(limit)):]:
+            if not isinstance(item, dict):
+                item = {"value": str(item or "").strip()}
+            normalized: dict[str, Any] = {}
+            for key, raw in item.items():
+                if raw is None:
+                    continue
+                if isinstance(raw, str):
+                    text = re.sub(r"\s+", " ", raw).strip()
+                    if text:
+                        normalized[str(key)] = text[:400]
+                elif isinstance(raw, (int, float, bool)):
+                    normalized[str(key)] = raw
+                elif isinstance(raw, (list, tuple, set)):
+                    normalized[str(key)] = self._coerce_memory_text_list(raw, limit=8, max_chars=240)
+                else:
+                    text = re.sub(r"\s+", " ", str(raw)).strip()
+                    if text:
+                        normalized[str(key)] = text[:400]
+            if normalized:
+                records.append(normalized)
+        return records
+
+    def _normalize_project_memory(self, value: Any = None) -> ProjectMemory:
+        raw = value if value is not None else self.recall(PROJECT_MEMORY_KEY)
+        if isinstance(raw, ProjectMemory):
+            memory = copy.deepcopy(raw)
+        else:
+            payload = raw if isinstance(raw, dict) else {}
+            brief_payload = payload.get("brief", {}) if isinstance(payload.get("brief", {}), dict) else {}
+            memory = ProjectMemory(
+                workspace_path=str(payload.get("workspace_path", "") or "").strip(),
+                architecture=self._coerce_memory_text_list(payload.get("architecture", []), limit=16, max_chars=260),
+                conventions=self._coerce_memory_text_list(payload.get("conventions", []), limit=16, max_chars=260),
+                entrypoints=self._coerce_memory_text_list(payload.get("entrypoints", []), limit=16, max_chars=200),
+                dependencies=self._coerce_memory_text_list(payload.get("dependencies", []), limit=24, max_chars=120),
+                current_milestones=self._coerce_memory_text_list(payload.get("current_milestones", []), limit=16, max_chars=260),
+                brief=ProjectBrief(
+                    workspace_path=str(brief_payload.get("workspace_path", payload.get("workspace_path", "")) or "").strip(),
+                    stack=self._coerce_memory_text_list(brief_payload.get("stack", []), limit=16, max_chars=160),
+                    entrypoints=self._coerce_memory_text_list(brief_payload.get("entrypoints", payload.get("entrypoints", [])), limit=16, max_chars=200),
+                    build_commands=self._coerce_memory_text_list(brief_payload.get("build_commands", []), limit=16, max_chars=200),
+                    test_commands=self._coerce_memory_text_list(brief_payload.get("test_commands", []), limit=16, max_chars=200),
+                    deployment_shape=str(brief_payload.get("deployment_shape", "") or "").strip(),
+                    current_milestone=str(brief_payload.get("current_milestone", "") or "").strip(),
+                    updated_at=str(brief_payload.get("updated_at", "") or "").strip(),
+                ),
+                updated_at=str(payload.get("updated_at", "") or "").strip(),
+            )
+        if not memory.updated_at:
+            memory.updated_at = datetime.now().isoformat()
+        return memory
+
+    def _normalize_task_memory(self, value: Any = None) -> TaskMemory:
+        raw = value if value is not None else self.recall(TASK_MEMORY_KEY)
+        if isinstance(raw, TaskMemory):
+            memory = copy.deepcopy(raw)
+        else:
+            payload = raw if isinstance(raw, dict) else {}
+            brief_payload = payload.get("brief", {}) if isinstance(payload.get("brief", {}), dict) else {}
+            memory = TaskMemory(
+                request_signature=str(payload.get("request_signature", "") or "").strip(),
+                current_operation=str(payload.get("current_operation", "") or "").strip(),
+                expected_output=str(payload.get("expected_output", "") or "").strip(),
+                active_goal_id=str(payload.get("active_goal_id", "") or "").strip(),
+                current_phase=str(payload.get("current_phase", "") or "").strip(),
+                touched_files=self._coerce_memory_text_list(payload.get("touched_files", []), limit=20, max_chars=200),
+                last_observations=self._coerce_memory_text_list(payload.get("last_observations", []), limit=8, max_chars=280),
+                updated_at=str(payload.get("updated_at", "") or "").strip(),
+            )
+        if not memory.updated_at:
+            memory.updated_at = datetime.now().isoformat()
+        return memory
+
+    def _normalize_failure_memory(self, value: Any = None) -> FailureMemory:
+        raw = value if value is not None else self.recall(FAILURE_MEMORY_KEY)
+        if isinstance(raw, FailureMemory):
+            memory = copy.deepcopy(raw)
+        else:
+            payload = raw if isinstance(raw, dict) else {}
+            memory = FailureMemory(
+                recurring_errors=self._coerce_failure_records(payload.get("recurring_errors", []), limit=25),
+                known_bad_commands=self._coerce_failure_records(payload.get("known_bad_commands", []), limit=25),
+                missing_dependencies=self._coerce_failure_records(payload.get("missing_dependencies", []), limit=25),
+                recovery_patterns=self._coerce_failure_records(payload.get("recovery_patterns", []), limit=25),
+                updated_at=str(payload.get("updated_at", "") or "").strip(),
+            )
+        if not memory.updated_at:
+            memory.updated_at = datetime.now().isoformat()
+        return memory
+
+    def project_memory(self) -> ProjectMemory:
+        return self._normalize_project_memory()
+
+    def task_memory(self) -> TaskMemory:
+        return self._normalize_task_memory()
+
+    def failure_memory(self) -> FailureMemory:
+        return self._normalize_failure_memory()
+
+    def remember_project_memory(self, memory: ProjectMemory | dict[str, Any]) -> ProjectMemory:
+        normalized = self._normalize_project_memory(memory)
+        normalized.updated_at = datetime.now().isoformat()
+        self.remember(PROJECT_MEMORY_KEY, asdict(normalized))
+        return normalized
+
+    def remember_task_memory(self, memory: TaskMemory | dict[str, Any]) -> TaskMemory:
+        normalized = self._normalize_task_memory(memory)
+        normalized.updated_at = datetime.now().isoformat()
+        self.remember(TASK_MEMORY_KEY, asdict(normalized))
+        return normalized
+
+    def remember_failure_memory(self, memory: FailureMemory | dict[str, Any]) -> FailureMemory:
+        normalized = self._normalize_failure_memory(memory)
+        normalized.updated_at = datetime.now().isoformat()
+        self.remember(FAILURE_MEMORY_KEY, asdict(normalized))
+        return normalized
+
+    def _normalize_project_brief(self, value: Any = None) -> ProjectBrief:
+        raw = value if value is not None else self.recall(PROJECT_BRIEF_KEY)
+        if isinstance(raw, ProjectBrief):
+            brief = copy.deepcopy(raw)
+        else:
+            payload = raw if isinstance(raw, dict) else {}
+            brief = ProjectBrief(
+                workspace_path=str(payload.get("workspace_path", "") or "").strip(),
+                stack=self._coerce_memory_text_list(payload.get("stack", []), limit=16, max_chars=160),
+                entrypoints=self._coerce_memory_text_list(payload.get("entrypoints", []), limit=16, max_chars=200),
+                build_commands=self._coerce_memory_text_list(payload.get("build_commands", []), limit=16, max_chars=200),
+                test_commands=self._coerce_memory_text_list(payload.get("test_commands", []), limit=16, max_chars=200),
+                deployment_shape=str(payload.get("deployment_shape", "") or "").strip(),
+                current_milestone=str(payload.get("current_milestone", "") or "").strip(),
+                updated_at=str(payload.get("updated_at", "") or "").strip(),
+            )
+        if not brief.updated_at:
+            brief.updated_at = datetime.now().isoformat()
+        return brief
+
+    def project_brief(self) -> ProjectBrief:
+        return self._normalize_project_brief()
+
+    def remember_project_brief(self, brief: ProjectBrief | dict[str, Any]) -> ProjectBrief:
+        normalized = self._normalize_project_brief(brief)
+        normalized.updated_at = datetime.now().isoformat()
+        self.remember(PROJECT_BRIEF_KEY, asdict(normalized))
+        return normalized
+
+    def _normalize_task_graph(self, value: Any = None) -> TaskGraph:
+        raw = value if value is not None else self.recall(TASK_GRAPH_KEY)
+        if isinstance(raw, TaskGraph):
+            graph = copy.deepcopy(raw)
+        else:
+            payload = raw if isinstance(raw, dict) else {}
+            nodes: list[TaskGraphNode] = []
+            for item in payload.get("nodes", []) if isinstance(payload.get("nodes", []), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                nodes.append(TaskGraphNode(
+                    id=str(item.get("id", "") or "").strip(),
+                    title=str(item.get("title", "") or "").strip(),
+                    description=str(item.get("description", "") or "").strip(),
+                    target_files=self._coerce_memory_text_list(item.get("target_files", []), limit=24, max_chars=200),
+                    dependencies=self._coerce_memory_text_list(item.get("dependencies", []), limit=24, max_chars=200),
+                    verification_target=str(item.get("verification_target", "") or "").strip(),
+                    goal_id=str(item.get("goal_id", "") or "").strip(),
+                    status=str(item.get("status", GOAL_STATUS_PENDING) or GOAL_STATUS_PENDING).strip(),
+                ))
+            graph = TaskGraph(nodes=nodes, updated_at=str(payload.get("updated_at", "") or "").strip())
+        if not graph.updated_at:
+            graph.updated_at = datetime.now().isoformat()
+        return graph
+
+    def task_graph(self) -> TaskGraph:
+        return self._normalize_task_graph()
+
+    def remember_task_graph(self, graph: TaskGraph | dict[str, Any]) -> TaskGraph:
+        normalized = self._normalize_task_graph(graph)
+        normalized.updated_at = datetime.now().isoformat()
+        self.remember(TASK_GRAPH_KEY, asdict(normalized))
+        return normalized
+
+    def workspace_locks(self) -> list[WorkspaceLock]:
+        raw = self.recall(WORKSPACE_LOCKS_KEY)
+        locks: list[WorkspaceLock] = []
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            locks.append(WorkspaceLock(
+                id=str(item.get("id", "") or "").strip(),
+                area=str(item.get("area", "") or "").strip(),
+                holder=str(item.get("holder", "") or "").strip(),
+                goal_id=str(item.get("goal_id", "") or "").strip(),
+                reason=str(item.get("reason", "") or "").strip(),
+                acquired_at=str(item.get("acquired_at", "") or "").strip(),
+                expires_at=str(item.get("expires_at", "") or "").strip(),
+                metadata=item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {},
+            ))
+        return locks
+
+    def acquire_workspace_lock(self, area: str, holder: str, *, goal_id: str = "", reason: str = "", metadata: dict[str, Any] | None = None, ttl_seconds: int = 300) -> WorkspaceLock:
+        locks = self.workspace_locks()
+        now = datetime.now().isoformat()
+        expires_at = (datetime.now() + timedelta(seconds=int(ttl_seconds))).isoformat() if ttl_seconds > 0 else ""
+        lock = WorkspaceLock(
+            id=str(uuid.uuid4())[:8],
+            area=str(area or "").strip(),
+            holder=str(holder or "").strip(),
+            goal_id=str(goal_id or "").strip(),
+            reason=str(reason or "").strip(),
+            acquired_at=now,
+            expires_at=expires_at,
+            metadata=copy.deepcopy(metadata or {}),
+        )
+        locks = [asdict(item) for item in locks if item.expires_at and item.expires_at > now or not item.expires_at]
+        locks.append(asdict(lock))
+        self.remember(WORKSPACE_LOCKS_KEY, locks)
+        return lock
+
+    def release_workspace_lock(self, lock_id: str) -> bool:
+        locks = self.workspace_locks()
+        remaining = [asdict(lock) for lock in locks if str(lock.id) != str(lock_id).strip()]
+        self.remember(WORKSPACE_LOCKS_KEY, remaining)
+        return len(remaining) != len(locks)
+
+    def clear_workspace_locks(self):
+        self.remember(WORKSPACE_LOCKS_KEY, [])
 
     @property
     def active_processes(self) -> dict[str, Any]:
@@ -4437,17 +5141,76 @@ class Subagent:
         self.must_wait_for_observation = False
         self.last_resp = None
         self.repetition_count = 0
+        self.agent_type = "generic"
+        self.priority = 2
+        self.result_path = self.work_dir / "result.txt"
+        self.log_path = self.work_dir / f"subagent_{self.id}.log"
+        self.spawned_by: dict[str, Any] = {}
+        self.goal: dict[str, Any] = {}
+        self.ready_condition: dict[str, Any] = {
+            "kind": "result_file",
+            "path": str(self.result_path),
+            "status": "pending",
+            "observed_at": "",
+        }
+        self.lifecycle_policy: dict[str, Any] = {
+            "kill": {
+                "mode": "terminate_flag",
+                "force_supported": False,
+                "default_force": False,
+            },
+            "restart": {
+                "supported": True,
+                "mode": "manual_respawn",
+                "attempts": 0,
+            },
+        }
 
     def log(self, msg: str):
-        self.logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        self.logs.append(entry)
+        try:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8", errors="replace") as fh:
+                fh.write(entry + "\n")
+        except Exception:
+            pass
+
+    def snapshot(self) -> dict[str, Any]:
+        result_text = "" if self.result is None else str(self.result)
+        if len(result_text) > 100:
+            result_preview = result_text[:100] + "..."
+        else:
+            result_preview = result_text or None
+        return {
+            "id": self.id,
+            "status": self.status.value,
+            "task": self.task,
+            "agent_type": self.agent_type,
+            "priority": self.priority,
+            "work_dir": str(self.work_dir),
+            "log_path": str(self.log_path),
+            "expected_log_path": str(self.log_path),
+            "result_path": str(self.result_path),
+            "spawned_by": copy.deepcopy(self.spawned_by),
+            "goal": copy.deepcopy(self.goal),
+            "ready_condition": copy.deepcopy(self.ready_condition),
+            "lifecycle_policy": copy.deepcopy(self.lifecycle_policy),
+            "result": result_preview,
+            "logs_tail": self.logs[-5:],
+        }
 
     def terminate(self):
         self._stop_event = True
         self.status = SubagentStatus.TERMINATED
+        self.ready_condition["status"] = "terminated"
+        self.log("Termination requested.")
 
     def run(self):
         self.status = SubagentStatus.RUNNING
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.ready_condition["status"] = "running"
+        self.log(f"Run started for task '{self.task}'.")
         
         # Create a simplified but robust context for the subagent
         sub_prompt = self.system_prompt + (
@@ -4502,7 +5265,10 @@ class Subagent:
                     else:
                         self.result = re.search(r"<consensus>(.*?)</consensus>", resp, re.S).group(1).strip()
                         self.status = SubagentStatus.COMPLETED
-                        try: (self.work_dir / "result.txt").write_text(self.result, encoding="utf-8")
+                        self.ready_condition["status"] = "observed"
+                        self.ready_condition["observed_at"] = datetime.now().isoformat()
+                        self.log("Consensus reached and result captured.")
+                        try: self.result_path.write_text(self.result, encoding="utf-8")
                         except: pass
                         return
                 else:
@@ -4528,14 +5294,18 @@ class Subagent:
             if self.status != SubagentStatus.COMPLETED:
                 self.status = SubagentStatus.FAILED
                 self.result = "Max turns reached without consensus."
+                self.ready_condition["status"] = "failed"
+                self.log(self.result)
 
         except Exception as e:
             self.status = SubagentStatus.FAILED
             self.result = f"Error during subagent execution: {e}"
+            self.ready_condition["status"] = "failed"
+            self.log(self.result)
 
         # Final side-effect write
         try:
-            if self.result: (self.work_dir / "result.txt").write_text(str(self.result), encoding="utf-8")
+            if self.result: self.result_path.write_text(str(self.result), encoding="utf-8")
         except: pass
 
 class SubagentManager:
@@ -4587,6 +5357,25 @@ class SubagentManager:
                     print(f"[SubagentManager] Duplicate spawn detected for task hash {task_hash}. Returning existing agent {existing}.")
                     return existing
 
+        spawn_meta = self.bot._build_task_spawn_context(
+            source="subagent",
+            actor="agent",
+            source_id="",
+        )
+        goal_ref = copy.deepcopy(spawn_meta.get("goal", {}))
+        lock_area = self.bot._workspace_lock_area(work_dir=work_dir, goal=goal_ref)
+        conflict = self.bot._active_workspace_lock(lock_area)
+        if conflict:
+            holder = str(conflict.get("holder", "") or "").strip()
+            if holder.startswith("subagent:"):
+                existing_id = holder.split(":", 1)[1]
+                if existing_id in self.agents:
+                    existing_status = self.agents[existing_id].status
+                    if existing_status in [SubagentStatus.RUNNING, SubagentStatus.INIT]:
+                        print(f"[SubagentManager] Workspace lock reuse for {lock_area}. Returning existing agent {existing_id}.")
+                        return existing_id
+            return f"LOCKED:{lock_area}"
+
         # Resolve Agent Class
         agent_cls = self.agent_registry.get(agent_type, Subagent)
         
@@ -4598,6 +5387,39 @@ class SubagentManager:
             print(f"Error instantiating {agent_type}: {e}. Falling back to generic.")
             agent = Subagent(task, Path(work_dir), self.bot, self.bot.get_system_prompt())
 
+        agent.agent_type = agent_type
+        agent.priority = int(priority)
+        agent.result_path = agent.work_dir / "result.txt"
+        agent.log_path = agent.work_dir / f"subagent_{agent.id}.log"
+        spawn_meta = self.bot._build_task_spawn_context(
+            source="subagent",
+            actor="agent",
+            source_id=agent.id,
+        )
+        agent.spawned_by = copy.deepcopy(spawn_meta.get("spawned_by", {}))
+        agent.goal = copy.deepcopy(spawn_meta.get("goal", {}))
+        lock_id, conflict = self.bot._acquire_workspace_lock(
+            self.bot._workspace_lock_area(work_dir=work_dir, goal=agent.goal),
+            f"subagent:{agent.id}",
+            goal=agent.goal,
+            reason=f"subagent:{agent_type}",
+            metadata={"task": task[:240], "agent_type": agent_type},
+        )
+        if not lock_id:
+            return f"LOCKED:{self.bot._workspace_lock_area(work_dir=work_dir, goal=agent.goal)}"
+        agent.workspace_lock_id = lock_id
+        agent.ready_condition = {
+            "kind": "result_file",
+            "path": str(agent.result_path),
+            "status": "pending",
+            "observed_at": "",
+        }
+        agent.lifecycle_policy = self.bot._default_task_lifecycle_policy(
+            restart_supported=True,
+            kill_mode="terminate_flag",
+            restart_mode="manual_respawn",
+        )
+        agent.log(f"Queued with priority={priority} agent_type={agent_type}.")
         agent._task_hash = task_hash
         self.agents[agent.id] = agent
 
@@ -4646,6 +5468,7 @@ class SubagentManager:
     def _run_wrapper(self, agent):
         try:
             agent.run()
+            agent.log(f"Run finished with status={agent.status.value}.")
             # If the agent produced a result, summarise it and inject as a system observation
             try:
                 if agent.result:
@@ -4661,6 +5484,12 @@ class SubagentManager:
             except Exception:
                 pass
         finally:
+            try:
+                lock_id = str(getattr(agent, 'workspace_lock_id', '') or '').strip()
+                if lock_id:
+                    self.bot._release_workspace_lock(lock_id)
+            except Exception:
+                pass
             with self._pool_lock:
                 self._active_count -= 1
                 # Cleanup running_tasks registry if present
@@ -4679,11 +5508,7 @@ class SubagentManager:
 
     def list_agents(self):
         return {
-            aid: {
-                "status": a.status.value, 
-                "task": a.task, 
-                "result": (a.result[:100] + "...") if a.result else None
-            } 
+            aid: a.snapshot()
             for aid, a in self.agents.items()
         }
 
@@ -4693,7 +5518,8 @@ class SubagentManager:
             "queued": self.queue.qsize(),
             "capacity": self.current_capacity,
             "max_configured": self.max_capacity,
-            "types": list(self.agent_registry.keys())
+            "types": list(self.agent_registry.keys()),
+            "recent_agents": [agent.snapshot() for agent in list(self.agents.values())[-10:]],
         }
 
     def terminate_agent(self, agent_id: str):
@@ -4797,8 +5623,9 @@ class FlexiBot:
         self.idle_proposal_enabled = bool(self.config.get("idle_proposal_enabled", True))
         self.idle_proposal_interval_seconds = int(self.config.get("idle_proposal_interval_seconds", 300))
         self.idle_proposal_auto_confirm = bool(self.config.get("idle_proposal_auto_confirm", True))
-        self.reviewer_pass_enabled = bool(self.config.get("reviewer_pass_enabled", False))
-        self.reviewer_pass_after_tools = bool(self.config.get("reviewer_pass_after_tools", False))
+        self.heartbeat_interval_seconds = max(1, int(self.config.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS) or DEFAULT_HEARTBEAT_INTERVAL_SECONDS))
+        self.reviewer_pass_enabled = bool(self.config.get("reviewer_pass_enabled", True))
+        self.reviewer_pass_after_tools = bool(self.config.get("reviewer_pass_after_tools", True))
         self.reviewer_pass_after_tests = bool(self.config.get("reviewer_pass_after_tests", True))
 
         # context helper exposes convenient prompt-building utilities
@@ -4828,11 +5655,28 @@ class FlexiBot:
         self.last_turn_resp = None
         self.repetition_count = 0
         self.last_tools = {} # Track tool usage for loop detection
+        self.low_progress_turns = 0
+        self.last_progress_evaluation: dict[str, Any] = {}
+        self.last_progress_request_signature = ""
+        self.current_request_context: dict[str, Any] = {}
         # persistent turn counter used for logging; increments across handle_turn calls
         self.turn_counter = 0
         self.last_observation = ""
 
         _log("initialized runtime temp state")
+
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._runtime_heartbeat = self._load_runtime_heartbeat()
+        self._update_runtime_heartbeat(
+            current_mode="interactive",
+            current_phase="startup",
+            current_script_or_project=str(Path.cwd()),
+            persist=True,
+        )
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+        _log("heartbeat started")
 
         # Control flag: If True, the agent must explicitly acknowledge the last observation
         # using the token <ack_observation> before a <consensus> will be accepted.
@@ -4851,10 +5695,735 @@ class FlexiBot:
             self.brain.remember(m.strip(), True)
         # tag a general fact for later querying
         self.state.append_history("system", f"fact:{text}", tags=["fact"])
+        self._update_runtime_heartbeat(
+            current_mode="interactive",
+            current_phase="inspect",
+            last_user_input_at=time.time(),
+            current_script_or_project=self._infer_current_script_or_project(text),
+            persist=True,
+        )
+        try:
+            self._refresh_project_memory(persist=True)
+            self._refresh_task_memory(
+                user_input=text,
+                current_phase="inspect",
+                expected_output=self._expected_output_for_request(text),
+            )
+        except Exception:
+            pass
 
     def on_tool_output(self, tool_name: str, output: str):
         # store raw tool output with a tool-specific tag for retrieval
         self.state.append_history("system", output, tags=[f"tool:{tool_name}"])
+        try:
+            detail = self._tool_result_text(output) or str(output or "")
+            observation = self._memory_summary_text(f"{tool_name}: {detail}", max_chars=320)
+            self._refresh_task_memory(current_phase="verify", observation=observation)
+            if self._tool_result_failed(output):
+                self._remember_failure_event(observation or detail, command=tool_name)
+        except Exception:
+            pass
+
+    def _default_runtime_heartbeat(self) -> dict[str, Any]:
+        return {
+            "heartbeat_at": 0.0,
+            "current_mode": "interactive",
+            "active_goal_id": "",
+            "last_user_input_at": 0.0,
+            "last_tool_run_at": 0.0,
+            "last_success_at": 0.0,
+            "current_phase": "startup",
+            "pending_plan_count": 0,
+            "current_script_or_project": str(Path.cwd()),
+            "last_error_summary": "",
+        }
+
+    def _load_runtime_heartbeat(self) -> dict[str, Any]:
+        heartbeat = self._default_runtime_heartbeat()
+        stored = self.state.get_runtime_value(RUNTIME_HEARTBEAT_KEY, {})
+        if isinstance(stored, dict):
+            for key in heartbeat:
+                if key in stored:
+                    heartbeat[key] = copy.deepcopy(stored[key])
+        if not heartbeat.get("current_script_or_project"):
+            heartbeat["current_script_or_project"] = str(Path.cwd())
+        return heartbeat
+
+    def _heartbeat_active_goal_id(self) -> str:
+        goals = self.active_goals()
+        if not goals:
+            return ""
+        return str(goals[0].get("id", "") or "")
+
+    def _heartbeat_pending_plan_count(self) -> int:
+        try:
+            return len(self.state.query_history(tag="plan", limit=20))
+        except Exception:
+            return 0
+
+    def _trim_heartbeat_text(self, value: str, max_chars: int = 400) -> str:
+        text = str(value or "").strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
+
+    def _infer_current_script_or_project(self, text: str) -> str:
+        source = str(text or "").strip()
+        if not source:
+            return str(Path.cwd())
+
+        patterns = [
+            r'["\']([^"\']+\.(?:py|ipynb|md|json|ya?ml|txt|sh|bat|ps1|js|ts|tsx|jsx|html|css))["\']',
+            r'([A-Za-z]:[\\/][^\s"\']+)',
+            r'((?:\.{0,2}[\\/])?[^\s"\']+\.(?:py|ipynb|md|json|ya?ml|txt|sh|bat|ps1|js|ts|tsx|jsx|html|css))',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, source)
+            if match:
+                return self._trim_heartbeat_text(match.group(1), max_chars=240)
+
+        lowered = source.lower()
+        if any(token in lowered for token in ("pytest", "unittest", "project", "workspace", "repo", "repository")):
+            return self._trim_heartbeat_text(str(Path.cwd()), max_chars=240)
+        return self._trim_heartbeat_text(source.splitlines()[0], max_chars=240)
+
+    def _update_runtime_heartbeat(self, persist: bool = False, **fields) -> dict[str, Any]:
+        with self._heartbeat_lock:
+            heartbeat = copy.deepcopy(self._runtime_heartbeat)
+            for key, value in fields.items():
+                if value is None:
+                    continue
+                if key == "last_error_summary":
+                    heartbeat[key] = self._trim_heartbeat_text(value, max_chars=400)
+                elif key == "current_script_or_project":
+                    heartbeat[key] = self._trim_heartbeat_text(value, max_chars=240)
+                else:
+                    heartbeat[key] = value
+            heartbeat["active_goal_id"] = self._heartbeat_active_goal_id()
+            heartbeat["pending_plan_count"] = self._heartbeat_pending_plan_count()
+            if not heartbeat.get("current_script_or_project"):
+                heartbeat["current_script_or_project"] = str(Path.cwd())
+            if persist:
+                heartbeat["heartbeat_at"] = time.time()
+            self._runtime_heartbeat = heartbeat
+            snapshot = copy.deepcopy(heartbeat)
+
+        if persist:
+            try:
+                self.state.set_runtime_value(RUNTIME_HEARTBEAT_KEY, snapshot, persist=True)
+            except RuntimeError:
+                pass
+        return snapshot
+
+    def runtime_heartbeat(self) -> dict[str, Any]:
+        return self._update_runtime_heartbeat(persist=False)
+
+    def _note_runtime_success(self, summary: str = "", *, current_phase: str = "completed", current_mode: str | None = None, persist: bool = True):
+        previous_error = ""
+        try:
+            previous_error = str(self.runtime_heartbeat().get("last_error_summary", "") or "").strip()
+        except Exception:
+            previous_error = ""
+        fields: dict[str, Any] = {
+            "last_success_at": time.time(),
+            "current_phase": current_phase,
+            "last_error_summary": "",
+        }
+        if current_mode is not None:
+            fields["current_mode"] = current_mode
+        if summary:
+            fields["current_script_or_project"] = self._infer_current_script_or_project(summary)
+        self._update_runtime_heartbeat(persist=persist, **fields)
+        try:
+            if summary:
+                self._refresh_task_memory(current_phase=current_phase, observation=summary)
+            if previous_error and summary:
+                self._remember_recovery_pattern(previous_error, summary)
+        except Exception:
+            pass
+
+    def _note_runtime_error(self, summary: str, *, current_phase: str = "blocked", current_mode: str | None = None, persist: bool = True, command: str = ""):
+        fields: dict[str, Any] = {
+            "current_phase": current_phase,
+            "last_error_summary": summary,
+        }
+        if current_mode is not None:
+            fields["current_mode"] = current_mode
+        self._update_runtime_heartbeat(persist=persist, **fields)
+        try:
+            self._refresh_task_memory(current_phase=current_phase, observation=summary)
+            self._remember_failure_event(summary, command=command)
+        except Exception:
+            pass
+
+    def _note_tool_start(self, tool_name: str, payload: str, *, persist: bool = True):
+        target = self._infer_current_script_or_project(payload)
+        self._update_runtime_heartbeat(
+            current_mode="interactive",
+            current_phase="act",
+            last_tool_run_at=time.time(),
+            current_script_or_project=target or tool_name,
+            persist=persist,
+        )
+
+    def _note_tool_result(self, tool_name: str, result: str, *, persist: bool = True):
+        payload = self._parse_tool_result_payload(result)
+        ok = bool(payload.get("ok", False)) if payload else not self._tool_result_failed(result)
+        if ok:
+            summary = self._tool_result_text(result) or (payload.get("summary", "") if payload else "")
+            self._note_runtime_success(summary, current_phase="verify", persist=persist)
+            return
+        detail = self._tool_result_text(result)
+        if not detail and payload:
+            detail = str(payload.get("summary", "") or "")
+        self._note_runtime_error(f"{tool_name}: {detail or 'tool execution failed'}", current_phase="blocked", persist=persist, command=tool_name)
+
+    def _heartbeat_loop(self):
+        while not self._heartbeat_stop.wait(self.heartbeat_interval_seconds):
+            try:
+                self._update_runtime_heartbeat(persist=True)
+            except Exception as e:
+                ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="FlexiBot._heartbeat_loop", code=ErrorCode.IO_ERROR)
+
+    def stop_runtime_heartbeat(self, reason: str = ""):
+        try:
+            self._update_runtime_heartbeat(
+                current_mode="shutdown",
+                current_phase="shutdown",
+                last_error_summary=reason if reason and "error" in reason.lower() else self.runtime_heartbeat().get("last_error_summary", ""),
+                persist=True,
+            )
+        except Exception:
+            pass
+        self._heartbeat_stop.set()
+        thread = getattr(self, "_heartbeat_thread", None)
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            thread.join(timeout=2)
+
+    def _memory_summary_text(self, value: Any, *, max_chars: int = 240) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            return ""
+        return self._trim_heartbeat_text(text, max_chars=max_chars)
+
+    def _merge_memory_items(self, current: list[str], additions: list[str], *, limit: int = 12, max_chars: int = 240) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for raw in list(current or []) + list(additions or []):
+            text = self._memory_summary_text(raw, max_chars=max_chars)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+        return merged[-max(1, int(limit)):]
+
+    def _default_project_conventions(self) -> list[str]:
+        return [
+            "Prefer safe_inspect, inspect_file_chunk, read_range, or peek over giant object dumps.",
+            "Use actual tool output plus reviewer guidance to finalize or block work instead of speculating.",
+            "Keep project, task, and failure memory updated when new durable facts or repeat failures appear.",
+        ]
+
+    def _discover_project_entrypoints(self) -> list[str]:
+        root = Path.cwd()
+        entrypoints = [path.name for path in sorted(root.glob("*.py")) if path.is_file() and not path.name.startswith(".")]
+        return entrypoints[:12]
+
+    def _discover_project_architecture(self) -> list[str]:
+        root = Path.cwd()
+        lines: list[str] = []
+        if (root / "flexiFocus.py").exists():
+            lines.append("flexiFocus.py is the main agent runtime and orchestration entrypoint.")
+        top_dirs = [path.name for path in sorted(root.iterdir()) if path.is_dir() and not path.name.startswith(".")]
+        if top_dirs:
+            lines.append(f"Top-level directories: {', '.join(top_dirs[:8])}")
+        top_py = [path.name for path in sorted(root.glob("*.py")) if path.is_file() and not path.name.startswith(".")]
+        if top_py:
+            lines.append(f"Top-level Python files: {', '.join(top_py[:8])}")
+        if (root / "tests").exists():
+            lines.append("Regression coverage lives under tests/.")
+        return lines[:8]
+
+    def _discover_project_dependencies(self, *, max_files: int = 80) -> list[str]:
+        root = Path.cwd()
+        stdlib_modules = set(getattr(sys, "stdlib_module_names", set()))
+        local_modules = {path.stem for path in root.glob("*.py")}
+        local_modules.update(path.name for path in root.iterdir() if path.is_dir())
+        skip_dirs = {".git", ".flexi", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"}
+        python_files: list[Path] = []
+        for current_root, dirs, files in os.walk(root):
+            dirs[:] = [name for name in dirs if name not in skip_dirs and not name.startswith(".")]
+            for file_name in files:
+                if not file_name.endswith(".py") or file_name.startswith("."):
+                    continue
+                python_files.append(Path(current_root) / file_name)
+                if len(python_files) >= max_files:
+                    break
+            if len(python_files) >= max_files:
+                break
+
+        dependencies: set[str] = set()
+        for source_path in python_files:
+            try:
+                tree = ast.parse(source_path.read_text(encoding="utf-8", errors="replace"), filename=str(source_path))
+            except Exception:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top_level = str(alias.name or "").split(".", 1)[0].strip()
+                        if top_level:
+                            dependencies.add(top_level)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    top_level = str(node.module or "").split(".", 1)[0].strip()
+                    if top_level:
+                        dependencies.add(top_level)
+
+        filtered = sorted(
+            dep for dep in dependencies
+            if dep and dep not in stdlib_modules and dep not in local_modules and dep != "__future__"
+        )
+        return filtered[:20]
+
+    def _current_milestones(self) -> list[str]:
+        milestones: list[str] = []
+        for goal in self.active_goals()[:8]:
+            line = f"[{goal.get('id')}] {goal.get('status')}: {goal.get('text')}"
+            if goal.get("next_action"):
+                line += f" -> {goal.get('next_action')}"
+            milestones.append(self._memory_summary_text(line, max_chars=280))
+        return [item for item in milestones if item]
+
+    def _refresh_project_memory(self, *, persist: bool = True) -> ProjectMemory:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "project_memory"):
+            return ProjectMemory()
+
+        memory = state.project_memory()
+        changed = False
+        workspace_path = str(Path.cwd())
+        if memory.workspace_path != workspace_path:
+            memory.workspace_path = workspace_path
+            changed = True
+
+        merged_architecture = self._merge_memory_items(memory.architecture, self._discover_project_architecture(), limit=16, max_chars=260)
+        if merged_architecture != memory.architecture:
+            memory.architecture = merged_architecture
+            changed = True
+
+        merged_conventions = self._merge_memory_items(memory.conventions, self._default_project_conventions(), limit=16, max_chars=260)
+        if merged_conventions != memory.conventions:
+            memory.conventions = merged_conventions
+            changed = True
+
+        merged_entrypoints = self._merge_memory_items(memory.entrypoints, self._discover_project_entrypoints(), limit=16, max_chars=200)
+        if merged_entrypoints != memory.entrypoints:
+            memory.entrypoints = merged_entrypoints
+            changed = True
+
+        merged_dependencies = self._merge_memory_items(memory.dependencies, self._discover_project_dependencies(), limit=24, max_chars=120)
+        if merged_dependencies != memory.dependencies:
+            memory.dependencies = merged_dependencies
+            changed = True
+
+        milestones = self._current_milestones()
+        if milestones != memory.current_milestones:
+            memory.current_milestones = milestones
+            changed = True
+
+        if changed and persist:
+            return state.remember_project_memory(memory)
+        return memory
+
+    def _refresh_project_brief(self, *, persist: bool = True) -> ProjectBrief:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "project_brief"):
+            return ProjectBrief()
+
+        brief = state.project_brief()
+        if not brief.workspace_path:
+            brief.workspace_path = str(Path.cwd())
+        if not brief.entrypoints:
+            brief.entrypoints = self._discover_project_entrypoints()
+        if not brief.stack:
+            brief.stack = self._discover_project_dependencies()[:8]
+        if not brief.build_commands and not brief.test_commands:
+            build_commands, test_commands, deployment_shape = self._discover_project_commands()
+            brief.build_commands = build_commands
+            brief.test_commands = test_commands
+            brief.deployment_shape = deployment_shape
+        if not brief.current_milestone:
+            milestones = self._current_milestones()
+            brief.current_milestone = milestones[0] if milestones else ""
+        if persist:
+            return state.remember_project_brief(brief)
+        return brief
+
+    def _discover_project_commands(self) -> tuple[list[str], list[str], str]:
+        root = Path.cwd()
+        build_commands: list[str] = []
+        test_commands: list[str] = []
+        deployment_shape = "unknown"
+
+        if (root / "pyproject.toml").exists():
+            build_commands.append("python -m build")
+            test_commands.append("pytest")
+        if (root / "requirements.txt").exists():
+            build_commands.append("pip install -r requirements.txt")
+        if (root / "setup.py").exists():
+            build_commands.append(f"{sys.executable} setup.py install")
+        if (root / "package.json").exists():
+            build_commands.append("npm install")
+            test_commands.append("npm test")
+            deployment_shape = "containerized or Node.js service"
+        if (root / "Dockerfile").exists():
+            deployment_shape = "Docker container"
+        elif (root / "Procfile").exists():
+            deployment_shape = "process-based deployment"
+        elif (root / "server.py").exists():
+            deployment_shape = "Python web service"
+        if not test_commands:
+            if (root / "tests").exists() or any(root.glob("test_*.py")):
+                test_commands.append(f"{sys.executable} -m pytest")
+        return build_commands[:8], test_commands[:8], deployment_shape
+
+    def _goal_target_files(self, goal: dict[str, Any], task_memory: TaskMemory | None = None) -> list[str]:
+        files: list[str] = []
+        workspace_path = str(goal.get("workspace_path", "") or "").strip()
+        if workspace_path:
+            files.append(workspace_path)
+        verification_target = str(goal.get("verification_target", "") or "").strip()
+        if verification_target and "/" in verification_target or "\\" in verification_target or verification_target.endswith(".py"):
+            files.append(verification_target)
+        goal_id = str(goal.get("id", "") or "").strip()
+        if task_memory is not None and goal_id and task_memory.active_goal_id == goal_id:
+            files.extend(task_memory.touched_files)
+        return self._merge_memory_items([], files, limit=12, max_chars=220)
+
+    def _scoped_verification_target(self) -> str:
+        node = self._current_task_graph_node()
+        if node and str(node.verification_target or "").strip():
+            return str(node.verification_target or "").strip()
+        goal = self.current_goal()
+        if goal and str(goal.get("verification_target", "") or "").strip():
+            return str(goal.get("verification_target", "") or "").strip()
+        brief = self._refresh_project_brief(persist=True)
+        if brief.test_commands:
+            return str(brief.test_commands[0] or "").strip()
+        return ""
+
+    def _refresh_task_graph(self, *, persist: bool = True) -> TaskGraph:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "task_graph"):
+            return TaskGraph()
+
+        graph = state.task_graph()
+        task_memory = state.task_memory() if hasattr(state, "task_memory") else TaskMemory()
+        nodes: list[TaskGraphNode] = []
+        for goal in self.active_goals()[:24]:
+            goal_id = str(goal.get("id", "") or "").strip()
+            nodes.append(
+                TaskGraphNode(
+                    id=goal_id,
+                    title=str(goal.get("text", "") or "").strip(),
+                    description=str(goal.get("done_when", "") or goal.get("blocked_reason", "") or "").strip(),
+                    target_files=self._goal_target_files(goal, task_memory=task_memory),
+                    dependencies=[str(goal.get("parent_goal_id", "") or "").strip()] if goal.get("parent_goal_id") else [],
+                    verification_target=str(goal.get("verification_target", "") or "").strip(),
+                    goal_id=goal_id,
+                    status=str(goal.get("status", GOAL_STATUS_PENDING) or GOAL_STATUS_PENDING).strip(),
+                )
+            )
+        graph.nodes = nodes
+        if persist:
+            return state.remember_task_graph(graph)
+        return graph
+
+    def _current_task_graph_node(self) -> TaskGraphNode | None:
+        graph = self._refresh_task_graph(persist=True)
+        current = self.current_goal()
+        current_goal_id = str(current.get("id", "") or "").strip() if current else ""
+        for node in graph.nodes:
+            if str(node.goal_id or "").strip() == current_goal_id:
+                return node
+        return graph.nodes[0] if graph.nodes else None
+
+    def _expected_output_for_request(self, user_input: str) -> str:
+        goal = self.current_goal()
+        hints: list[str] = []
+        if goal and goal.get("done_when"):
+            hints.append(str(goal.get("done_when")))
+        if goal and goal.get("verification_target"):
+            hints.append(f"Verify against {goal.get('verification_target')}")
+        if not hints:
+            hints.append(str(user_input or "").strip())
+        return self._memory_summary_text("; ".join(hints), max_chars=320)
+
+    def _refresh_task_memory(self, *, user_input: str | None = None, current_phase: str | None = None,
+                             expected_output: str | None = None, touched_files: list[str] | None = None,
+                             observation: str | None = None) -> TaskMemory | None:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "task_memory"):
+            return None
+
+        memory = state.task_memory()
+        request_context = copy.deepcopy(getattr(self, "current_request_context", {}) or {})
+        request_signature = str(request_context.get("request_signature", "") or memory.request_signature).strip()
+        if user_input is not None:
+            computed_signature = self._progress_request_signature(user_input)
+            if computed_signature and computed_signature != "__continue__":
+                request_signature = computed_signature
+                if request_signature != memory.request_signature:
+                    memory.touched_files = []
+                    memory.last_observations = []
+                memory.current_operation = self._memory_summary_text(user_input, max_chars=320)
+                memory.expected_output = self._memory_summary_text(expected_output or self._expected_output_for_request(user_input), max_chars=320)
+
+        if request_signature and request_signature != "__continue__":
+            memory.request_signature = request_signature
+
+        goal = self.current_goal()
+        memory.active_goal_id = str(goal.get("id", "") if goal else "")
+        if current_phase is not None:
+            memory.current_phase = str(current_phase or "").strip()
+        if touched_files:
+            memory.touched_files = self._merge_memory_items(memory.touched_files, list(touched_files), limit=20, max_chars=200)
+        if observation:
+            memory.last_observations = self._merge_memory_items(memory.last_observations, [observation], limit=8, max_chars=280)
+        return state.remember_task_memory(memory)
+
+    def _normalize_failure_signature(self, text: str) -> str:
+        normalized = str(text or "").lower()
+        normalized = re.sub(r"[A-Za-z]:[\\/][^\s]+", "<path>", normalized)
+        normalized = re.sub(r"[/\\][\w./\\-]+", "<path>", normalized)
+        normalized = re.sub(r"\b\d+\b", "<n>", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized[:220]
+
+    def _extract_missing_dependency(self, text: str) -> str:
+        sample = str(text or "")
+        patterns = [
+            r"No module named ['\"]([^'\"]+)['\"]",
+            r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]",
+            r"command not found:?\s*([A-Za-z0-9_.-]+)",
+            r"'([^']+)' is not recognized as an internal or external command",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, sample, re.I)
+            if match:
+                return str(match.group(1) or "").strip()
+        return ""
+
+    def _upsert_failure_record(self, records: list[dict[str, Any]], *, key: str, value: str, defaults: dict[str, Any]) -> list[dict[str, Any]]:
+        now = datetime.now().isoformat()
+        for record in records:
+            if str(record.get(key, "")).strip() != value:
+                continue
+            record["count"] = int(record.get("count", 0) or 0) + 1
+            record["last_seen"] = now
+            for field_name, field_value in defaults.items():
+                if field_value and not record.get(field_name):
+                    record[field_name] = field_value
+            return records
+        fresh = {key: value, "count": 1, "last_seen": now, **defaults}
+        records.append(fresh)
+        return records[-25:]
+
+    def _remember_failure_event(self, summary: str, *, command: str = "") -> FailureMemory | None:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "failure_memory"):
+            return None
+
+        detail = self._memory_summary_text(summary, max_chars=320)
+        if not detail:
+            return None
+        signature = self._normalize_failure_signature(detail)
+        memory = state.failure_memory()
+        memory.recurring_errors = self._upsert_failure_record(
+            memory.recurring_errors,
+            key="signature",
+            value=signature,
+            defaults={"example": detail},
+        )
+
+        command_text = self._memory_summary_text(command, max_chars=260)
+        if command_text:
+            memory.known_bad_commands = self._upsert_failure_record(
+                memory.known_bad_commands,
+                key="command",
+                value=command_text,
+                defaults={"reason": detail},
+            )
+
+        missing_dependency = self._extract_missing_dependency(detail)
+        if missing_dependency:
+            memory.missing_dependencies = self._upsert_failure_record(
+                memory.missing_dependencies,
+                key="dependency",
+                value=missing_dependency,
+                defaults={"error": detail},
+            )
+        return state.remember_failure_memory(memory)
+
+    def _remember_recovery_pattern(self, error_summary: str, recovery_summary: str) -> FailureMemory | None:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "failure_memory"):
+            return None
+        error_text = self._memory_summary_text(error_summary, max_chars=320)
+        recovery_text = self._memory_summary_text(recovery_summary, max_chars=320)
+        if not error_text or not recovery_text:
+            return None
+        signature = self._normalize_failure_signature(error_text)
+        memory = state.failure_memory()
+        memory.recovery_patterns = self._upsert_failure_record(
+            memory.recovery_patterns,
+            key="signature",
+            value=signature,
+            defaults={"recovery": recovery_text, "error": error_text},
+        )
+        for record in memory.recovery_patterns:
+            if str(record.get("signature", "")).strip() == signature:
+                record["recovery"] = recovery_text
+                break
+        return state.remember_failure_memory(memory)
+
+    def _project_memory_payload(self) -> dict[str, Any]:
+        memory = self._refresh_project_memory(persist=True)
+        return asdict(memory)
+
+    def _task_memory_payload(self) -> dict[str, Any]:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "task_memory"):
+            return asdict(TaskMemory())
+        return asdict(state.task_memory())
+
+    def _failure_memory_payload(self) -> dict[str, Any]:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "failure_memory"):
+            return asdict(FailureMemory())
+        return asdict(state.failure_memory())
+
+    def _search_typed_memory(self, query: str) -> list[str]:
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return []
+        project_payload = self._project_memory_payload()
+        task_payload = self._task_memory_payload()
+        failure_payload = self._failure_memory_payload()
+        matches: list[str] = []
+
+        for section, values in {
+            "project.architecture": project_payload.get("architecture", []),
+            "project.conventions": project_payload.get("conventions", []),
+            "project.entrypoints": project_payload.get("entrypoints", []),
+            "project.dependencies": project_payload.get("dependencies", []),
+            "project.current_milestones": project_payload.get("current_milestones", []),
+            "task.touched_files": task_payload.get("touched_files", []),
+            "task.last_observations": task_payload.get("last_observations", []),
+        }.items():
+            for item in values:
+                if lowered in str(item).lower():
+                    matches.append(f"[{section}] {item}")
+
+        for field_name in ("current_operation", "expected_output"):
+            value = str(task_payload.get(field_name, "") or "")
+            if value and lowered in value.lower():
+                matches.append(f"[task.{field_name}] {value}")
+
+        for section_name in ("recurring_errors", "known_bad_commands", "missing_dependencies", "recovery_patterns"):
+            for record in failure_payload.get(section_name, []):
+                rendered = ", ".join(f"{key}={value}" for key, value in record.items() if value not in (None, "", [], {}))
+                if rendered and lowered in rendered.lower():
+                    matches.append(f"[failure.{section_name}] {rendered}")
+        return matches[:40]
+
+    def _render_memory_context(self) -> str:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "project_memory"):
+            return ""
+
+        project = state.project_memory()
+        task = state.task_memory()
+        failure = state.failure_memory()
+        lines: list[str] = []
+
+        if project.architecture or project.conventions or project.entrypoints or project.dependencies or project.current_milestones:
+            lines.append("PROJECT MEMORY:")
+            if project.architecture:
+                lines.append(f"   - Architecture: {'; '.join(project.architecture[:3])}")
+            if project.conventions:
+                lines.append(f"   - Conventions: {'; '.join(project.conventions[:3])}")
+            if project.entrypoints:
+                lines.append(f"   - Entrypoints: {', '.join(project.entrypoints[:6])}")
+            if project.dependencies:
+                lines.append(f"   - Dependencies: {', '.join(project.dependencies[:8])}")
+            if project.current_milestones:
+                lines.append(f"   - Milestones: {'; '.join(project.current_milestones[:4])}")
+
+        if task.current_operation or task.expected_output or task.touched_files or task.last_observations:
+            lines.append("TASK MEMORY:")
+            if task.current_operation:
+                lines.append(f"   - Operation: {task.current_operation}")
+            if task.expected_output:
+                lines.append(f"   - Expected Output: {task.expected_output}")
+            if task.touched_files:
+                lines.append(f"   - Touched Files: {', '.join(task.touched_files[:8])}")
+            if task.last_observations:
+                lines.append(f"   - Last Observations: {'; '.join(task.last_observations[:3])}")
+
+        failure_lines: list[str] = []
+        if failure.recurring_errors:
+            failure_lines.append("recurring errors: " + "; ".join(str(item.get("example") or item.get("signature") or "") for item in failure.recurring_errors[:3] if item))
+        if failure.known_bad_commands:
+            failure_lines.append("bad commands: " + "; ".join(str(item.get("command") or "") for item in failure.known_bad_commands[:3] if item))
+        if failure.missing_dependencies:
+            failure_lines.append("missing deps: " + "; ".join(str(item.get("dependency") or "") for item in failure.missing_dependencies[:3] if item))
+        if failure.recovery_patterns:
+            failure_lines.append("recoveries: " + "; ".join(str(item.get("recovery") or "") for item in failure.recovery_patterns[:2] if item))
+        if failure_lines:
+            lines.append("FAILURE MEMORY:")
+            for line in failure_lines:
+                lines.append(f"   - {line}")
+
+        generic_keys = [key for key in self.state.structured_memory.keys() if key not in {PROJECT_MEMORY_KEY, TASK_MEMORY_KEY, FAILURE_MEMORY_KEY, GOAL_RECORDS_KEY, REVIEWER_EVENT_KEY, RUNTIME_HEARTBEAT_KEY}]
+        if generic_keys:
+            lines.append(f"   - Known Generic Memory Tags: {', '.join(generic_keys[:10])}")
+        return ("\n" + "\n".join(lines)) if lines else ""
+
+    def _render_project_brief_block(self, brief: ProjectBrief) -> str:
+        if not brief or not (brief.stack or brief.entrypoints or brief.build_commands or brief.test_commands or brief.deployment_shape or brief.current_milestone):
+            return ""
+        lines = ["PROJECT BRIEF:"]
+        if brief.stack:
+            lines.append(f"   - Stack: {', '.join(brief.stack[:6])}")
+        if brief.entrypoints:
+            lines.append(f"   - Entrypoints: {', '.join(brief.entrypoints[:6])}")
+        if brief.build_commands:
+            lines.append(f"   - Build Commands: {', '.join(brief.build_commands[:4])}")
+        if brief.test_commands:
+            lines.append(f"   - Test Commands: {', '.join(brief.test_commands[:4])}")
+        if brief.deployment_shape:
+            lines.append(f"   - Deployment: {brief.deployment_shape}")
+        if brief.current_milestone:
+            lines.append(f"   - Current Milestone: {brief.current_milestone}")
+        return "\n" + "\n".join(lines) + "\n\n"
+
+    def _render_task_graph_block(self, graph: TaskGraph) -> str:
+        if not graph or not graph.nodes:
+            return ""
+        lines = ["TASK GRAPH:"]
+        for node in graph.nodes[:4]:
+            node_lines = [
+                f"   - [{node.id}] {node.title}",
+            ]
+            if node.target_files:
+                node_lines.append(f"     * targets: {', '.join(node.target_files[:5])}")
+            if node.dependencies:
+                node_lines.append(f"     * deps: {', '.join(node.dependencies[:5])}")
+            if node.verification_target:
+                node_lines.append(f"     * verify: {node.verification_target}")
+            lines.extend(node_lines)
+        return "\n" + "\n".join(lines) + "\n\n"
 
     def _normalize_tool_payload(self, payload: str) -> str:
         if not isinstance(payload, str):
@@ -4876,6 +6445,20 @@ class FlexiBot:
         )
         return any(marker in lowered for marker in failure_markers)
 
+    def _report_tool_execution_status(self, result: str) -> bool:
+        failed = self._tool_result_failed(result)
+        payload = self._parse_tool_result_payload(result) or {}
+        summary = str(payload.get("summary", "") or "").strip()
+        if not summary:
+            summary = self._tool_result_highlight(result, prefer_error=failed, max_chars=160)
+        summary = re.sub(r"\s+", " ", summary).strip()
+        prefix = "  -> Tool exit FAILED." if failed else "  -> Tool exit OK."
+        if summary:
+            prefix = f"{prefix} {summary}"
+        color = Colors.RED if failed else Colors.DIM
+        print(f"{color}{prefix}{Colors.ENDC}")
+        return failed
+
     def _append_response_trace(self, event_type: str, **payload):
         record = {
             "timestamp": datetime.now().isoformat(),
@@ -4888,6 +6471,655 @@ class FlexiBot:
                 f.write(json.dumps(record) + "\n")
         except Exception:
             pass
+
+    def _progress_request_signature(self, user_input: str) -> str:
+        text = self._normalize_tool_payload(user_input or "")
+        if not text:
+            return ""
+        continuation_markers = {
+            "continue",
+            "retry",
+            "again",
+            "resume",
+            "keep going",
+            "go on",
+            "proceed",
+        }
+        lowered = text.lower()
+        if lowered in continuation_markers:
+            return "__continue__"
+        return lowered[:240]
+
+    def _snapshot_workspace_progress(self) -> dict[str, dict[str, int]]:
+        root = Path.cwd()
+        snapshot: dict[str, dict[str, int]] = {}
+        skip_dirs = {".git", ".flexi", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"}
+        for current_root, dirs, files in os.walk(root):
+            dirs[:] = [name for name in dirs if name not in skip_dirs and not name.startswith(".")]
+            base = Path(current_root)
+            for file_name in files:
+                if file_name.startswith("."):
+                    continue
+                path = base / file_name
+                try:
+                    stat = path.stat()
+                    rel_path = path.relative_to(root).as_posix()
+                except Exception:
+                    continue
+                snapshot[rel_path] = {
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+                }
+        return snapshot
+
+    def _snapshot_state_progress(self) -> dict[str, Any]:
+        memory = self.state.memory
+        filtered_memory = {
+            key: memory[key]
+            for key in sorted(memory)
+            if key not in {GOAL_RECORDS_KEY, REVIEWER_EVENT_KEY, RUNTIME_HEARTBEAT_KEY}
+        }
+        return {
+            "memory": filtered_memory,
+            "active_processes": self.state.active_processes,
+        }
+
+    def _snapshot_goal_progress(self) -> dict[str, dict[str, Any]]:
+        snapshot: dict[str, dict[str, Any]] = {}
+        for goal in self.state.goal_records():
+            normalized = self._normalize_goal_record(goal)
+            goal_id = str(normalized.get("id", "")).strip()
+            if not goal_id:
+                continue
+            snapshot[goal_id] = {
+                "status": normalized.get("status", ""),
+                "next_action": normalized.get("next_action", ""),
+                "done_when": normalized.get("done_when", ""),
+                "verification_target": normalized.get("verification_target", ""),
+                "completed_at": normalized.get("completed_at", ""),
+                "evidence": list(normalized.get("evidence", []) or []),
+            }
+        return snapshot
+
+    def _capture_turn_progress_baseline(self) -> dict[str, Any]:
+        return {
+            "workspace": self._snapshot_workspace_progress(),
+            "state": self._snapshot_state_progress(),
+            "goals": self._snapshot_goal_progress(),
+            "heartbeat": self.runtime_heartbeat(),
+            "observation_blocked": self._last_observation_indicates_blocked(),
+        }
+
+    def _diff_workspace_progress(self, before: dict[str, dict[str, int]], after: dict[str, dict[str, int]]) -> list[str]:
+        changed: list[str] = []
+        for rel_path in sorted(set(before) | set(after)):
+            if before.get(rel_path) != after.get(rel_path):
+                changed.append(rel_path)
+        return changed
+
+    def _diff_state_progress(self, before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+        changed: list[str] = []
+        for key in ("memory", "active_processes"):
+            if before.get(key) != after.get(key):
+                changed.append(key)
+        return changed
+
+    def _goal_advancement_details(self, before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]) -> list[str]:
+        details: list[str] = []
+        status_rank = {
+            GOAL_STATUS_PENDING: 0,
+            GOAL_STATUS_ACTIVE: 1,
+            GOAL_STATUS_COMPLETED: 3,
+            GOAL_STATUS_CANCELLED: 2,
+            GOAL_STATUS_FAILED: 2,
+        }
+        for goal_id in sorted(set(before) | set(after)):
+            before_goal = before.get(goal_id)
+            after_goal = after.get(goal_id)
+            if before_goal is None and after_goal is not None:
+                details.append(f"goal_added:{goal_id}")
+                continue
+            if before_goal is None or after_goal is None:
+                continue
+            if status_rank.get(str(after_goal.get("status", "")), 0) > status_rank.get(str(before_goal.get("status", "")), 0):
+                details.append(f"goal_status:{goal_id}:{before_goal.get('status')}->{after_goal.get('status')}")
+            if str(after_goal.get("next_action", "")).strip() and after_goal.get("next_action") != before_goal.get("next_action"):
+                details.append(f"goal_next_action:{goal_id}")
+            if len(after_goal.get("evidence", []) or []) > len(before_goal.get("evidence", []) or []):
+                details.append(f"goal_evidence:{goal_id}")
+            if str(after_goal.get("completed_at", "")).strip() and after_goal.get("completed_at") != before_goal.get("completed_at"):
+                details.append(f"goal_completed:{goal_id}")
+        return details
+
+    def _evaluate_turn_progress(self, baseline: dict[str, Any], finalize_meta: dict[str, Any], tool_results: list[str]) -> dict[str, Any]:
+        after_workspace = self._snapshot_workspace_progress()
+        after_state = self._snapshot_state_progress()
+        after_goals = self._snapshot_goal_progress()
+        after_heartbeat = self.runtime_heartbeat()
+
+        changed_files = self._diff_workspace_progress(baseline.get("workspace", {}), after_workspace)
+        changed_state = self._diff_state_progress(baseline.get("state", {}), after_state)
+        goal_advances = self._goal_advancement_details(baseline.get("goals", {}), after_goals)
+
+        before_heartbeat = baseline.get("heartbeat", {}) or {}
+        had_error_before = bool(str(before_heartbeat.get("last_error_summary", "")).strip()) or bool(baseline.get("observation_blocked", False))
+        has_error_after = bool(str(after_heartbeat.get("last_error_summary", "")).strip()) or bool(finalize_meta.get("blocked"))
+        resolved_error = had_error_before and not has_error_after
+
+        score = 0
+        if changed_files:
+            score += 2
+        if changed_state:
+            score += 1
+        if resolved_error:
+            score += 2
+        if goal_advances:
+            score += 2
+
+        tool_failures = sum(1 for result in tool_results if self._tool_result_failed(result))
+        return {
+            "score": score,
+            "low_progress": score <= 0,
+            "changed_files": changed_files,
+            "changed_state": changed_state,
+            "goal_advances": goal_advances,
+            "resolved_error": resolved_error,
+            "tool_failures": tool_failures,
+        }
+
+    def _low_progress_strategy_message(self, progress_eval: dict[str, Any]) -> str:
+        gaps = []
+        if not progress_eval.get("changed_files"):
+            gaps.append("changed no workspace files")
+        if not progress_eval.get("changed_state"):
+            gaps.append("changed no meaningful runtime state")
+        if not progress_eval.get("resolved_error"):
+            gaps.append("resolved no prior error")
+        if not progress_eval.get("goal_advances"):
+            gaps.append("advanced no active goal")
+        gap_text = ", ".join(gaps) if gaps else "made no measurable progress"
+        return (
+            "Blocked: The last two action turns were low progress. They "
+            f"{gap_text}. Switch strategy before acting again: make a targeted file change, update the active goal, "
+            "run a narrower verification, or ask the user for missing information instead of repeating inspection attempts."
+        )
+
+    def _user_requested_options(self, user_input: str) -> bool:
+        text = (user_input or "").lower()
+        if not text:
+            return False
+        option_markers = (
+            "option",
+            "options",
+            "choose",
+            "which one",
+            "which should",
+            "what next",
+            "next step",
+            "pick one",
+            "a/b/c",
+            "menu",
+        )
+        return any(marker in text for marker in option_markers)
+
+    def _last_observation_indicates_blocked(self) -> bool:
+        observation = (self.last_observation or "").lower()
+        if not observation:
+            return False
+        blocked_markers = (
+            "error",
+            "failed",
+            "traceback",
+            "timed out",
+            "execution blocked",
+            "must acknowledge",
+            "awaiting <ack_observation>",
+            "no action detected",
+            "stopping after repeated identical actions",
+        )
+        return any(marker in observation for marker in blocked_markers)
+
+    def _find_followup_cutoff(self, text: str) -> int | None:
+        lines = text.splitlines()
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            lowered = stripped.lower()
+            if not stripped:
+                continue
+            if lowered.startswith(("would you like", "what would you like next", "next steps", "which would you like")):
+                return idx
+            if re.match(r"^[A-Z]\)\s", stripped):
+                return idx
+            if lowered.startswith(("reply with", "please pick", "choose one")):
+                return idx
+        return None
+
+    def _trim_menu_heavy_followup(self, draft: str, user_input: str) -> tuple[str, bool]:
+        if not draft or self._last_observation_indicates_blocked() or self._user_requested_options(user_input):
+            return draft, False
+
+        cutoff = self._find_followup_cutoff(draft)
+        if cutoff is None:
+            return draft, False
+
+        lines = draft.splitlines()
+        trimmed = "\n".join(lines[:cutoff]).rstrip()
+        if not trimmed:
+            return draft, False
+        return trimmed, True
+
+    def _extract_consensus_text(self, response: str) -> str:
+        match = re.search(r"<consensus>(.*?)</consensus>", response, re.S)
+        return match.group(1).strip() if match else ""
+
+    def _trim_finalize_followup(self, draft: str) -> tuple[str, bool]:
+        if not draft:
+            return "", False
+        cutoff = self._find_followup_cutoff(draft)
+        if cutoff is None:
+            return draft.strip(), False
+        lines = draft.splitlines()
+        trimmed = "\n".join(lines[:cutoff]).rstrip()
+        if not trimmed:
+            return draft.strip(), False
+        return trimmed.strip(), trimmed.strip() != draft.strip()
+
+    def _summarize_tool_results(self, tool_results: list[str], *, max_chars: int = 4000) -> str:
+        sections: list[str] = []
+        for index, result in enumerate(tool_results, start=1):
+            payload = self._parse_tool_result_payload(result)
+            if payload:
+                tool_name = str(payload.get("tool", f"tool_{index}"))
+                ok = bool(payload.get("ok", False))
+                summary = str(payload.get("summary", "")).strip()
+                text = self._tool_result_text(result)
+                section = [f"Tool {index}: {tool_name}", f"ok={ok}"]
+                if summary:
+                    section.append(f"summary={summary}")
+                if text:
+                    section.append("output:")
+                    section.append(text[:1200])
+                sections.append("\n".join(section).strip())
+            else:
+                sections.append(f"Tool {index}:\n{str(result)[:1200]}")
+        joined = "\n\n".join(section for section in sections if section).strip()
+        return joined[:max_chars]
+
+    def _tool_result_highlight(self, result: str, *, prefer_error: bool | None = None, max_chars: int = 700) -> str:
+        payload = self._parse_tool_result_payload(result)
+        if payload:
+            data = payload.get("data") or {}
+            errors = [str(item).strip() for item in payload.get("errors", []) if str(item).strip()]
+            prefer_error = not bool(payload.get("ok", False)) if prefer_error is None else prefer_error
+            candidates = [
+                data.get("stderr"),
+                "\n".join(errors),
+                data.get("stdout"),
+                data.get("output"),
+                data.get("analysis"),
+                payload.get("summary"),
+            ] if prefer_error else [
+                data.get("stdout"),
+                data.get("output"),
+                data.get("analysis"),
+                payload.get("summary"),
+                data.get("stderr"),
+                "\n".join(errors),
+            ]
+            for candidate in candidates:
+                if not isinstance(candidate, str):
+                    continue
+                text = candidate.strip()
+                if not text:
+                    continue
+                lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+                condensed = "\n".join(lines[:6]).strip()
+                if condensed:
+                    return condensed[:max_chars]
+            return ""
+
+        raw = str(result or "").strip()
+        if not raw:
+            return ""
+        lines = [line.rstrip() for line in raw.splitlines() if line.strip()]
+        condensed = "\n".join(lines[:6]).strip()
+        return condensed[:max_chars]
+
+    def _build_action_turn_result(self, tool_results: list[str]) -> str:
+        failed = False
+        summaries: list[str] = []
+        errors: list[str] = []
+        for index, result in enumerate(tool_results, start=1):
+            payload = self._parse_tool_result_payload(result)
+            if payload:
+                tool_name = str(payload.get("tool", f"tool_{index}"))
+                summary = str(payload.get("summary", "")).strip()
+                if summary:
+                    summaries.append(f"{tool_name}: {summary}")
+                if not bool(payload.get("ok", False)):
+                    failed = True
+                    payload_errors = [str(item).strip() for item in payload.get("errors", []) if str(item).strip()]
+                    if payload_errors:
+                        errors.extend(payload_errors[:3])
+                    else:
+                        detail = self._tool_result_highlight(result, prefer_error=True)
+                        errors.append(f"{tool_name}: {detail or 'execution failed'}")
+                continue
+
+            if self._tool_result_failed(result):
+                failed = True
+                detail = self._tool_result_highlight(result, prefer_error=True)
+                errors.append(detail or f"Tool {index} failed.")
+
+        summary = "; ".join(summaries[:4]).strip()
+        if not summary:
+            summary = "Action turn completed." if not failed else "Action turn blocked."
+
+        return self._structured_tool_result(
+            "action_turn",
+            not failed,
+            summary=summary,
+            errors=errors[:6],
+            data={
+                "tool_count": len(tool_results),
+                "output": self._summarize_tool_results(tool_results, max_chars=3200),
+            },
+        )
+
+    def _response_tool_payloads(self, response: str) -> list[tuple[str, str]]:
+        payloads: list[tuple[str, str]] = []
+        text = str(response or "")
+        for raw in re.findall(r"<bash>(.*?)</bash>", text, re.S):
+            payloads.append(("bash", self._normalize_tool_payload(raw)))
+        for raw in re.findall(r"<python>(.*?)</python>", text, re.S):
+            payloads.append(("python", self._normalize_tool_payload(raw)))
+        return payloads
+
+    def _inspection_only_turn(self, response: str, tool_results: list[str]) -> bool:
+        payloads = self._response_tool_payloads(response)
+        if not payloads or len(payloads) != len(tool_results):
+            return False
+        for index, result in enumerate(tool_results):
+            payload = self._parse_tool_result_payload(result) or {}
+            tool_name = str(payload.get("tool", payloads[index][0]) or payloads[index][0]).strip() or payloads[index][0]
+            payload_tool, raw_payload = payloads[index]
+            effective_tool = payload_tool if tool_name in {"bash", "python"} else tool_name
+            if effective_tool in {"bash", "python"}:
+                if self.execution_policy._mutating_payload(effective_tool, raw_payload):
+                    return False
+                if not self.execution_policy._inspection_like_payload(effective_tool, raw_payload):
+                    return False
+                continue
+            if effective_tool in {
+                "inspect_python_environment",
+                "list_python_packages",
+                "python_symbol_doc",
+                "python_import_graph",
+                "list_windows",
+                "list_windows_advanced",
+                "get_active_terminal",
+                "list_processes",
+                "get_software_versions",
+                "project_memory",
+                "task_memory",
+                "failure_memory",
+                "recall",
+                "search_memory",
+                "read_bg_task_log",
+                "get_bg_task_details",
+                "check_bg_tasks",
+            }:
+                continue
+            return False
+        return True
+
+    def _normalize_inspection_guidance(self, reviewer_guidance: dict[str, Any] | None,
+                                       verification: dict[str, Any], tool_results: list[str]) -> dict[str, Any]:
+        guidance = copy.deepcopy(reviewer_guidance or {})
+        if any(self._tool_result_failed(result) for result in tool_results):
+            return guidance
+        if not verification.get("success", False):
+            return guidance
+        guidance["severity"] = "healthy"
+        guidance["confidence"] = "high"
+        guidance["verification_level"] = "light"
+        guidance["require_stronger_verification"] = False
+        guidance["redirect_to_inspection"] = False
+        guidance["mark_goal_blocked"] = False
+        guidance["blocked_reason"] = ""
+        return guidance
+
+    def _action_turn_fallback(self, response: str, tool_results: list[str],
+                              verification: dict[str, Any], reviewer_review: str,
+                              reviewer_guidance: dict[str, Any] | None = None,
+                              stronger_verification: dict[str, Any] | None = None) -> str:
+        guidance = reviewer_guidance or {}
+        stronger = stronger_verification or {}
+        blocked = (
+            any(self._tool_result_failed(result) for result in tool_results)
+            or not verification.get("success", False)
+            or bool(stronger.get("required") and not stronger.get("verified", False))
+            or guidance.get("severity") == "blocked"
+        )
+        if blocked:
+            detail = str(stronger.get("reason") or "").strip()
+            if not detail:
+                failed_result = next((result for result in tool_results if self._tool_result_failed(result)), tool_results[-1] if tool_results else "")
+                detail = self._tool_result_highlight(failed_result, prefer_error=True)
+            if not detail:
+                detail = "; ".join(str(item).strip() for item in verification.get("errors", []) if str(item).strip())
+            if not detail:
+                detail = str(verification.get("summary", "")).replace("Verification FAILED:", "").strip()
+            if not detail:
+                detail = str(guidance.get("blocked_reason") or "").strip()
+            if not detail and reviewer_review:
+                detail = reviewer_review.strip()
+            message = f"Blocked: {detail or 'One or more tool actions failed.'}".strip()
+        else:
+            success_result = next((result for result in reversed(tool_results) if not self._tool_result_failed(result)), tool_results[-1] if tool_results else "")
+            detail = self._tool_result_highlight(success_result, prefer_error=False)
+            if not detail:
+                detail = str(verification.get("summary", "")).replace("Verification OK:", "").strip()
+            if not detail:
+                detail = self._extract_consensus_text(response)
+            message = f"Completed: {detail or 'Tool actions completed successfully.'}".strip()
+        finalized, _ = self._trim_finalize_followup(message)
+        return finalized or message
+
+    def _finalize_action_turn(self, response: str, user_input: str, tool_results: list[str]) -> tuple[str, dict[str, Any]]:
+        self._update_runtime_heartbeat(current_mode="interactive", current_phase="verify", persist=True)
+        aggregated_result = self._build_action_turn_result(tool_results)
+        verification = self.verify_and_report(aggregated_result, context="action_turn")
+        reviewer_review = self._run_reviewer_pass("tools", user_input, aggregated_result, verification=verification)
+        reviewer_guidance = self._reviewer_guidance_from_text(reviewer_review)
+        inspection_only = self._inspection_only_turn(response, tool_results)
+        if inspection_only:
+            reviewer_guidance = self._normalize_inspection_guidance(reviewer_guidance, verification, tool_results)
+        stronger_verification = {
+            "required": False,
+            "verified": bool(verification.get("success", False)),
+            "confidence": reviewer_guidance.get("confidence", "medium"),
+            "reason": "",
+            "evidence": [],
+            "next_step": reviewer_guidance.get("next_step", ""),
+            "review": reviewer_review,
+        }
+        if reviewer_guidance.get("require_stronger_verification") and not inspection_only:
+            runner = getattr(self, "_run_stronger_verification", None)
+            if callable(runner):
+                stronger_verification = runner(user_input, tool_results, verification, reviewer_guidance)
+            else:
+                stronger_verification = {
+                    **stronger_verification,
+                    "required": True,
+                    "verified": False,
+                    "reason": reviewer_guidance.get("blocked_reason") or reviewer_review.strip(),
+                }
+
+        blocked = (
+            any(self._tool_result_failed(result) for result in tool_results)
+            or not verification.get("success", False)
+            or bool(stronger_verification.get("required") and not stronger_verification.get("verified", False))
+            or reviewer_guidance.get("severity") == "blocked"
+        )
+        target_prefix = "Blocked:" if blocked else "Completed:"
+        merged_guidance = copy.deepcopy(reviewer_guidance)
+        if stronger_verification.get("required") and not stronger_verification.get("verified", False):
+            merged_guidance["mark_goal_blocked"] = True
+            merged_guidance["redirect_to_inspection"] = merged_guidance.get("redirect_to_inspection") or str(stronger_verification.get("next_step", "")).strip().lower().startswith("inspect")
+            if stronger_verification.get("reason"):
+                merged_guidance["blocked_reason"] = str(stronger_verification.get("reason"))
+        goal_update = self._apply_reviewer_goal_guidance(merged_guidance, stronger_verification)
+        policy_feedback = self._update_execution_policy_feedback(merged_guidance, stronger_verification)
+
+        fallback = self._action_turn_fallback(
+            response,
+            tool_results,
+            verification,
+            reviewer_review,
+            reviewer_guidance=merged_guidance,
+            stronger_verification=stronger_verification,
+        )
+        finalized = fallback
+        used_llm = False
+        trimmed_menu = False
+        self._update_runtime_heartbeat(current_mode="interactive", current_phase="finalize", persist=True)
+
+        result_summary = self._summarize_tool_results(tool_results)
+        if result_summary:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the mandatory post-tool finalizer for an agent runtime. "
+                        "Tools have already run. Use only the actual execution results below. "
+                        "Return exactly one short plain-text message that starts with 'Completed:' or 'Blocked:'. "
+                        "Mention the most important stdout or stderr detail. Do not speculate. "
+                        "Do not include menus, choices, headings, or next-step lists."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User request:\n{user_input[:1200]}\n\n"
+                        f"Model draft before finalize:\n{self._extract_consensus_text(response)[:1200] or '(none)'}\n\n"
+                        f"Verification:\n{json.dumps(verification, ensure_ascii=False)[:1500]}\n\n"
+                        f"Reviewer:\n{reviewer_review[:1200] or '(none)'}\n\n"
+                        f"Reviewer guidance:\n{json.dumps(merged_guidance, ensure_ascii=False)[:1500]}\n\n"
+                        f"Stronger verification:\n{json.dumps(stronger_verification, ensure_ascii=False)[:1500]}\n\n"
+                        f"Actual tool results:\n{result_summary}\n\n"
+                        f"Write exactly one message starting with '{target_prefix}'. "
+                        "If blocked, name the blocker concretely. If completed, state what actually happened."
+                    ),
+                },
+            ]
+            try:
+                resp = self.client.chat(messages, temperature=0.1)
+                candidate = resp["choices"][0]["message"]["content"].strip()
+                if candidate:
+                    finalized = candidate
+                    used_llm = True
+            except Exception as e:
+                self._append_response_trace(
+                    "action_turn_finalize_failed",
+                    original=response,
+                    user_input=user_input,
+                    error=str(e),
+                )
+
+        finalized, trimmed_menu = self._trim_finalize_followup(finalized)
+        if finalized and not re.match(r'^(Completed|Blocked):', finalized):
+            cleaned = finalized.lstrip('-: ').strip()
+            finalized = f"{target_prefix} {cleaned}".strip()
+        if not finalized:
+            finalized = fallback
+
+        if blocked:
+            self._note_runtime_error(finalized, current_phase="blocked", persist=True)
+        else:
+            self._note_runtime_success(finalized, current_phase="completed", persist=True)
+
+        return finalized, {
+            "blocked": blocked,
+            "used_llm": used_llm,
+            "trimmed_menu": trimmed_menu,
+            "verification": verification,
+            "review": reviewer_review,
+            "reviewer_guidance": merged_guidance,
+            "stronger_verification": stronger_verification,
+            "policy_feedback": policy_feedback,
+            "confidence": stronger_verification.get("confidence") or reviewer_guidance.get("confidence", "medium"),
+            "redirect_to_inspection": bool(merged_guidance.get("redirect_to_inspection")),
+            "goal_update": goal_update,
+            "inspection_only": inspection_only,
+        }
+
+    def _mixed_consensus_fallback(self, response: str, tool_results: list[str]) -> str:
+        verification = {"success": not any(self._tool_result_failed(result) for result in tool_results), "summary": "", "errors": []}
+        return self._action_turn_fallback(response, tool_results, verification, "")
+
+    def _finalize_mixed_consensus(self, response: str, user_input: str, tool_results: list[str]) -> tuple[str, bool]:
+        if not tool_results or any(self._tool_result_failed(result) for result in tool_results):
+            return "", False
+
+        finalized, details = self._finalize_action_turn(response, user_input, tool_results)
+        return finalized, bool(details.get("used_llm") or details.get("trimmed_menu"))
+
+    def _accept_mixed_consensus(self, response: str, user_input: str, *, turn_num: int,
+                                turn_start: float, turn_start_data: dict[str, Any],
+                                tool_results: list[str]) -> str | None:
+        if not tool_results or any(self._tool_result_failed(result) for result in tool_results):
+            return None
+
+        draft, enriched = self._finalize_mixed_consensus(response, user_input, tool_results)
+        if not draft:
+            return None
+
+        self.state.log_event("assistant", draft)
+        self._append_response_trace(
+            "mixed_consensus_accepted",
+            original=response,
+            accepted=draft,
+            user_input=user_input,
+            enriched=enriched,
+        )
+        dur = time.time() - turn_start
+        meta = ["consensus", "mixed_consensus"]
+        if enriched:
+            meta.append("mixed_consensus_enriched")
+        self.logger.log_turn(
+            turn_num,
+            response,
+            self.state.calculate_diff(turn_start_data, self.state.data),
+            ["consensus", f"tools:{len(tool_results)}"],
+            duration=dur,
+            meta=meta,
+        )
+        return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{draft}"
+
+    def _should_return_after_action_turn(self, pending_consensus: str, finalize_meta: dict[str, Any]) -> bool:
+        if str(pending_consensus or "").strip():
+            return not bool(finalize_meta.get("blocked"))
+        if finalize_meta.get("strategy_shift"):
+            return True
+        return False
+
+    def _build_internal_action_continuation(self, finalized: str, finalize_meta: dict[str, Any]) -> str:
+        blocked = bool(finalize_meta.get("blocked"))
+        guidance = finalize_meta.get("reviewer_guidance") if isinstance(finalize_meta.get("reviewer_guidance"), dict) else {}
+        next_step = str(guidance.get("next_step", "") or "").strip()
+        if blocked:
+            detail = finalized.strip() or "Blocked action turn."
+            suffix = f" Next step hint: {next_step}" if next_step else ""
+            return (
+                f"Internal Continuation: {detail}{suffix} "
+                "Continue working internally if the blocker can be resolved from the workspace or tool output. "
+                "Use <consensus> only if you need user input or a decision."
+            ).strip()
+        return (
+            "Internal Continuation: The last action turn made progress but is not yet a user-facing final answer. "
+            "Continue with the next concrete step. Use <consensus> only when the task is complete or when you need user input."
+        )
 
     def _format_python_syntax_error(self, code: str, err: SyntaxError) -> str:
         line = ""
@@ -5173,6 +7405,7 @@ class FlexiBot:
         return {
             "status": "active",
             "timestamp": time.time(),
+            "heartbeat": self.runtime_heartbeat(),
             "metrics": {
                 "total_tokens": self.state.total_tokens,
                 "snapshots": len(list(self.state.snapshot_dir.glob("*.db"))),
@@ -5182,6 +7415,7 @@ class FlexiBot:
             "subagents": self.subagent_manager.get_load_stats(),
             "memory_keys": list(self.state.structured_memory.keys()),
             "background_task_ids": sorted(self.state.active_processes.keys()),
+            "background_task_summaries": [self._normalize_bg_task_record(pid, info) for pid, info in sorted(self.state.active_processes.items())],
             "reviewer_event_count": len(self.state.list_records(REVIEWER_EVENT_KEY)),
             "goal_count": len(self.state.goal_records()),
             "active_goals": [goal for goal in self.state.goal_records() if goal.get("status") in {GOAL_STATUS_ACTIVE, GOAL_STATUS_PENDING}],
@@ -5233,7 +7467,8 @@ class FlexiBot:
         return "\n".join(part for part in parts if part).strip()
 
     def _store_reviewer_event(self, subject: str, request_text: str, result_text: str,
-                              verification: dict[str, Any] | None, review: str):
+                              verification: dict[str, Any] | None, review: str,
+                              guidance: dict[str, Any] | None = None):
         event = {
             "id": str(uuid.uuid4()),
             "timestamp": datetime.now().isoformat(),
@@ -5242,12 +7477,62 @@ class FlexiBot:
             "result": self._tool_result_text(result_text)[:1000],
             "verification": verification or {},
             "review": review,
+            "guidance": copy.deepcopy(guidance or {}),
         }
         self.state.append_record(REVIEWER_EVENT_KEY, event, limit=200)
 
-    def _goal_record(self, text: str, *, status: str = GOAL_STATUS_PENDING, priority: int = 2) -> dict[str, Any]:
+    def _coerce_goal_evidence(self, evidence: Any) -> list[str]:
+        if evidence is None:
+            return []
+        if isinstance(evidence, str):
+            item = evidence.strip()
+            return [item] if item else []
+        if isinstance(evidence, (list, tuple, set)):
+            return [str(item).strip() for item in evidence if str(item).strip()]
+        item = str(evidence).strip()
+        return [item] if item else []
+
+    def _normalize_goal_record(self, goal_record: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(goal_record, dict):
+            raise TypeError("Goal record must be a dictionary.")
         now = datetime.now().isoformat()
-        return {
+        text = str(goal_record.get("text", "") or "").strip()
+        status = str(goal_record.get("status", GOAL_STATUS_PENDING) or GOAL_STATUS_PENDING).strip() or GOAL_STATUS_PENDING
+        completed_at = str(goal_record.get("completed_at", "") or "").strip()
+        if status in {GOAL_STATUS_COMPLETED, GOAL_STATUS_CANCELLED, GOAL_STATUS_FAILED} and not completed_at:
+            completed_at = now
+        if status in {GOAL_STATUS_PENDING, GOAL_STATUS_ACTIVE}:
+            completed_at = ""
+        normalized = {
+            "id": str(goal_record.get("id", "") or str(uuid.uuid4())[:8]).strip(),
+            "text": text,
+            "status": status,
+            "priority": int(goal_record.get("priority", 2) or 2),
+            "created_at": str(goal_record.get("created_at", "") or now),
+            "updated_at": str(goal_record.get("updated_at", "") or now),
+            "completed_at": completed_at,
+            "done_when": str(goal_record.get("done_when", "") or "").strip(),
+            "blocked_reason": str(goal_record.get("blocked_reason", "") or "").strip(),
+            "evidence": self._coerce_goal_evidence(goal_record.get("evidence", [])),
+            "parent_goal_id": str(goal_record.get("parent_goal_id", "") or "").strip(),
+            "next_action": str(goal_record.get("next_action", "") or text).strip(),
+            "verification_target": str(goal_record.get("verification_target", "") or "").strip(),
+            "workspace_path": str(goal_record.get("workspace_path", "") or str(Path.cwd())).strip(),
+        }
+        if not normalized["next_action"]:
+            normalized["next_action"] = normalized["text"]
+        return normalized
+
+    def _goal_sort_key(self, goal: dict[str, Any]) -> tuple[int, int, str]:
+        status_rank = 0 if goal.get("status") == GOAL_STATUS_ACTIVE else 1
+        return (status_rank, int(goal.get("priority", 2)), str(goal.get("created_at", "")))
+
+    def _goal_record(self, text: str, *, status: str = GOAL_STATUS_PENDING, priority: int = 2,
+                     done_when: str = "", blocked_reason: str = "", evidence: Any = None,
+                     parent_goal_id: str = "", next_action: str = "", verification_target: str = "",
+                     workspace_path: str = "") -> dict[str, Any]:
+        now = datetime.now().isoformat()
+        return self._normalize_goal_record({
             "id": str(uuid.uuid4())[:8],
             "text": text.strip(),
             "status": status,
@@ -5255,45 +7540,135 @@ class FlexiBot:
             "created_at": now,
             "updated_at": now,
             "completed_at": "",
-        }
+            "done_when": done_when,
+            "blocked_reason": blocked_reason,
+            "evidence": evidence,
+            "parent_goal_id": parent_goal_id,
+            "next_action": next_action,
+            "verification_target": verification_target,
+            "workspace_path": workspace_path,
+        })
 
-    def add_goal(self, text: str, *, priority: int = 2, status: str = GOAL_STATUS_PENDING) -> dict[str, Any]:
-        goal = self._goal_record(text, status=status, priority=priority)
+    def add_goal(self, text: str, *, priority: int = 2, status: str = GOAL_STATUS_PENDING,
+                 done_when: str = "", blocked_reason: str = "", evidence: Any = None,
+                 parent_goal_id: str = "", next_action: str = "", verification_target: str = "",
+                 workspace_path: str = "") -> dict[str, Any]:
+        goal = self._goal_record(
+            text,
+            status=status,
+            priority=priority,
+            done_when=done_when,
+            blocked_reason=blocked_reason,
+            evidence=evidence,
+            parent_goal_id=parent_goal_id,
+            next_action=next_action,
+            verification_target=verification_target,
+            workspace_path=workspace_path,
+        )
         self.state.upsert_goal(goal)
-        self.state.append_history("system", f"Goal added: {goal['id']} {goal['text']}", tags=["goal"])
+        self.state.append_history(
+            "system",
+            f"Goal added: {goal['id']} status={goal['status']} next_action={goal['next_action']} text={goal['text']}",
+            tags=["goal"],
+        )
         return goal
 
-    def update_goal(self, goal_id: str, *, status: str | None = None, text: str | None = None, priority: int | None = None) -> dict[str, Any] | None:
+    def update_goal(self, goal_id: str, *, status: str | None = None, text: str | None = None,
+                    priority: int | None = None, done_when: str | None = None,
+                    blocked_reason: str | None = None, evidence: Any = None,
+                    parent_goal_id: str | None = None, next_action: str | None = None,
+                    verification_target: str | None = None, workspace_path: str | None = None) -> dict[str, Any] | None:
         goal_id = str(goal_id).strip()
         for goal in self.state.goal_records():
             if str(goal.get("id", "")) != goal_id:
                 continue
-            updated = dict(goal)
+            updated = self._normalize_goal_record(goal)
             if status is not None:
                 updated["status"] = status
                 if status in {GOAL_STATUS_COMPLETED, GOAL_STATUS_CANCELLED, GOAL_STATUS_FAILED}:
                     updated["completed_at"] = datetime.now().isoformat()
+                else:
+                    updated["completed_at"] = ""
             if text is not None:
                 updated["text"] = text.strip()
             if priority is not None:
                 updated["priority"] = int(priority)
+            if done_when is not None:
+                updated["done_when"] = done_when.strip()
+            if blocked_reason is not None:
+                updated["blocked_reason"] = blocked_reason.strip()
+            if evidence is not None:
+                updated["evidence"] = self._coerce_goal_evidence(evidence)
+            if parent_goal_id is not None:
+                updated["parent_goal_id"] = parent_goal_id.strip()
+            if next_action is not None:
+                updated["next_action"] = next_action.strip()
+            if verification_target is not None:
+                updated["verification_target"] = verification_target.strip()
+            if workspace_path is not None:
+                updated["workspace_path"] = workspace_path.strip()
             updated["updated_at"] = datetime.now().isoformat()
+            updated = self._normalize_goal_record(updated)
             self.state.upsert_goal(updated)
-            self.state.append_history("system", f"Goal updated: {updated['id']} status={updated['status']} text={updated['text']}", tags=["goal"])
+            self.state.append_history(
+                "system",
+                f"Goal updated: {updated['id']} status={updated['status']} next_action={updated['next_action']} text={updated['text']}",
+                tags=["goal"],
+            )
             return updated
         return None
 
     def active_goals(self) -> list[dict[str, Any]]:
-        goals = [goal for goal in self.state.goal_records() if goal.get("status") in {GOAL_STATUS_PENDING, GOAL_STATUS_ACTIVE}]
-        return sorted(goals, key=lambda item: (int(item.get("priority", 2)), item.get("created_at", "")))
+        goals = [self._normalize_goal_record(goal) for goal in self.state.goal_records() if goal.get("status") in {GOAL_STATUS_PENDING, GOAL_STATUS_ACTIVE}]
+        return sorted(goals, key=self._goal_sort_key)
+
+    def current_goal(self) -> dict[str, Any] | None:
+        goals = self.active_goals()
+        return goals[0] if goals else None
+
+    def _render_current_goal_focus(self, goal: dict[str, Any] | None) -> str:
+        if not goal:
+            return ""
+        lines = [
+            "CURRENT EXECUTION TARGET:",
+            f"   - Goal: [{goal.get('id')}] {goal.get('text')}",
+            f"   - Status/Priority: {goal.get('status')} / {goal.get('priority')}",
+            f"   - Next Action: {goal.get('next_action') or goal.get('text')}",
+        ]
+        if goal.get("done_when"):
+            lines.append(f"   - Done When: {goal.get('done_when')}")
+        if goal.get("verification_target"):
+            lines.append(f"   - Verification Target: {goal.get('verification_target')}")
+        if goal.get("workspace_path"):
+            lines.append(f"   - Workspace Path: {goal.get('workspace_path')}")
+        if goal.get("blocked_reason"):
+            lines.append(f"   - Blocked Reason: {goal.get('blocked_reason')}")
+        if goal.get("parent_goal_id"):
+            lines.append(f"   - Parent Goal: {goal.get('parent_goal_id')}")
+        evidence = goal.get("evidence") or []
+        if evidence:
+            lines.append(f"   - Evidence: {', '.join(str(item) for item in evidence[:3])}")
+        return "\n" + "\n".join(lines)
 
     def render_goal_summary(self) -> str:
         goals = self.state.goal_records()
         if not goals:
             return "No persisted goals."
         lines = []
-        for goal in sorted(goals, key=lambda item: (item.get("status", ""), int(item.get("priority", 2)), item.get("created_at", ""))):
-            lines.append(f"[{goal.get('id')}] status={goal.get('status')} priority={goal.get('priority')} text={goal.get('text')}")
+        for goal in sorted((self._normalize_goal_record(item) for item in goals), key=lambda item: (item.get("status", ""), int(item.get("priority", 2)), item.get("created_at", ""))):
+            summary = (
+                f"[{goal.get('id')}] status={goal.get('status')} priority={goal.get('priority')} "
+                f"next_action={goal.get('next_action')} text={goal.get('text')}"
+            )
+            if goal.get("done_when"):
+                summary += f" done_when={goal.get('done_when')}"
+            if goal.get("verification_target"):
+                summary += f" verification_target={goal.get('verification_target')}"
+            if goal.get("workspace_path"):
+                summary += f" workspace_path={goal.get('workspace_path')}"
+            if goal.get("blocked_reason"):
+                summary += f" blocked_reason={goal.get('blocked_reason')}"
+            lines.append(summary)
         return "\n".join(lines)
 
     def render_reviewer_summary(self, limit: int = 10) -> str:
@@ -5304,7 +7679,12 @@ class FlexiBot:
         for event in events:
             if not isinstance(event, dict):
                 continue
-            lines.append(f"[{event.get('timestamp', '')}] {event.get('subject', '')}: {str(event.get('review', ''))[:300]}")
+            guidance = event.get("guidance", {}) if isinstance(event.get("guidance"), dict) else {}
+            summary = f"[{event.get('timestamp', '')}] {event.get('subject', '')}"
+            if guidance:
+                summary += f" severity={guidance.get('severity', '')} confidence={guidance.get('confidence', '')}"
+            summary += f": {str(event.get('review', ''))[:300]}"
+            lines.append(summary)
         return "\n".join(lines) if lines else "No reviewer events recorded."
 
     def render_history_summary(self, limit: int = 10) -> str:
@@ -5398,6 +7778,10 @@ class FlexiBot:
     def verify_and_report(self, result: str, context: str = "") -> Dict[str, Any]:
         """Run lightweight verification on textual tool output. Returns a summary dict and logs results.
         Looks for "Traceback", 'Error', 'FAILED', '✗', or other failure markers."""
+        if not context:
+            goal = self.current_goal()
+            if goal and goal.get("verification_target"):
+                context = str(goal.get("verification_target") or "").strip()
         try:
             payload = self._parse_tool_result_payload(result)
             errors = []
@@ -5448,6 +7832,162 @@ class FlexiBot:
             return self.reviewer_pass_after_tests
         return self.reviewer_pass_after_tools
 
+    def _reviewer_guidance_from_text(self, review: str) -> dict[str, Any]:
+        guidance: dict[str, Any] = {
+            "severity": "healthy",
+            "confidence": "medium",
+            "verification_level": "normal",
+            "next_step": "",
+            "require_stronger_verification": False,
+            "redirect_to_inspection": False,
+            "mark_goal_blocked": False,
+            "blocked_reason": "",
+        }
+        text = str(review or "")
+        if not text.strip():
+            return guidance
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            key = label.strip().lower()
+            payload = value.strip()
+            lowered = payload.lower()
+            if key == "assessment":
+                if "blocked" in lowered:
+                    guidance["severity"] = "blocked"
+                elif "risk" in lowered or "uncertain" in lowered:
+                    guidance["severity"] = "risky"
+                elif "healthy" in lowered or "ok" in lowered:
+                    guidance["severity"] = "healthy"
+                guidance["blocked_reason"] = payload
+            elif key == "confidence":
+                if "low" in lowered:
+                    guidance["confidence"] = "low"
+                elif "high" in lowered:
+                    guidance["confidence"] = "high"
+                else:
+                    guidance["confidence"] = "medium"
+            elif key == "verification":
+                if "strong" in lowered:
+                    guidance["verification_level"] = "strong"
+                elif "light" in lowered or "weak" in lowered:
+                    guidance["verification_level"] = "light"
+                else:
+                    guidance["verification_level"] = payload or "normal"
+            elif key == "next step":
+                guidance["next_step"] = payload
+                if "inspect" in lowered or "evidence" in lowered or "confirm" in lowered:
+                    guidance["redirect_to_inspection"] = True
+
+        guidance["require_stronger_verification"] = (
+            guidance["severity"] in {"risky", "blocked"}
+            or guidance["confidence"] == "low"
+            or guidance["verification_level"] == "strong"
+        )
+        if guidance["severity"] == "blocked":
+            guidance["mark_goal_blocked"] = True
+            if not guidance["blocked_reason"]:
+                guidance["blocked_reason"] = text.strip()
+        return guidance
+
+    def _apply_reviewer_goal_guidance(self, reviewer_guidance: dict[str, Any], stronger_verification: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        goal = self.current_goal()
+        if not goal:
+            return None
+
+        guidance = copy.deepcopy(reviewer_guidance or {})
+        stronger = copy.deepcopy(stronger_verification or {})
+        updated = copy.deepcopy(goal)
+        blocked_reason = str(guidance.get("blocked_reason") or stronger.get("reason") or "").strip()
+        next_step = str(guidance.get("next_step") or stronger.get("next_step") or "").strip()
+
+        if guidance.get("mark_goal_blocked") or (stronger.get("required") and not stronger.get("verified", False)):
+            updated["status"] = GOAL_STATUS_FAILED
+            updated["blocked_reason"] = blocked_reason or updated.get("blocked_reason", "")
+        elif blocked_reason and not updated.get("blocked_reason"):
+            updated["blocked_reason"] = blocked_reason
+
+        if next_step:
+            updated["next_action"] = next_step
+        updated["updated_at"] = datetime.now().isoformat()
+        self.state.upsert_goal(updated)
+        return updated
+
+    def _update_execution_policy_feedback(self, reviewer_guidance: dict[str, Any] | None = None,
+                                          stronger_verification: dict[str, Any] | None = None) -> dict[str, Any]:
+        guidance = copy.deepcopy(reviewer_guidance or {})
+        stronger = copy.deepcopy(stronger_verification or {})
+        target = self._scoped_verification_target()
+        feedback = {
+            "severity": str(guidance.get("severity", "healthy") or "healthy"),
+            "confidence": str(stronger.get("confidence") or guidance.get("confidence", "medium") or "medium"),
+            "require_stronger_verification": bool(guidance.get("require_stronger_verification") or stronger.get("required", False)),
+            "redirect_to_inspection": bool(guidance.get("redirect_to_inspection")),
+            "blocked_reason": str(guidance.get("blocked_reason") or stronger.get("reason") or "").strip(),
+            "next_step": str(guidance.get("next_step") or stronger.get("next_step") or "").strip(),
+            "verification_target": target,
+            "updated_at": datetime.now().isoformat(),
+        }
+        if (
+            feedback["severity"] == "healthy"
+            and feedback["confidence"] == "high"
+            and not feedback["require_stronger_verification"]
+            and not feedback["redirect_to_inspection"]
+        ):
+            self.execution_policy.clear_runtime_feedback()
+            return {}
+        self.execution_policy.set_runtime_feedback(feedback)
+        return feedback
+
+    def _run_stronger_verification(self, user_input: str, tool_results: list[str], verification: dict[str, Any],
+                                   reviewer_guidance: dict[str, Any]) -> dict[str, Any]:
+        target = self._scoped_verification_target()
+        next_step = str(reviewer_guidance.get("next_step", "") or "").strip()
+        if not target:
+            return {
+                "required": True,
+                "verified": False,
+                "confidence": "low",
+                "reason": "Reviewer requested stronger verification, but no scoped verification target is defined.",
+                "evidence": [],
+                "next_step": next_step or "Inspect the active goal, add a verification_target, and rerun verification.",
+                "target": "",
+                "review": "",
+            }
+
+        target_text = str(target or "").strip()
+        target_path = Path(target_text.strip('"'))
+        if "pytest" in target_text.lower() or "unittest" in target_text.lower() or "npm test" in target_text.lower() or " -m " in target_text or "::" in target_text:
+            verification_result = self.tool_run_tests(target_text)
+        elif target_path.exists() and target_path.suffix.lower() == ".py":
+            verification_result = self.tool_run_verification(target_script=str(target_path))
+        elif target_path.exists():
+            verification_result = self.tool_run_tests(f'"{sys.executable}" -m pytest -q "{target_path}"')
+        else:
+            verification_result = self.run_bash(target_text)
+
+        verification_summary = self.verify_and_report(verification_result, context=f"strong:{target_text}")
+        verified = bool(verification_summary.get("success", False)) and not self._tool_result_failed(verification_result)
+        evidence: list[str] = []
+        highlight = self._tool_result_highlight(verification_result, prefer_error=not verified)
+        if highlight:
+            evidence.append(highlight)
+        if verification_summary.get("summary"):
+            evidence.append(str(verification_summary.get("summary")))
+        return {
+            "required": True,
+            "verified": verified,
+            "confidence": "high" if verified else str(reviewer_guidance.get("confidence", "low") or "low"),
+            "reason": "" if verified else "; ".join(str(item).strip() for item in verification_summary.get("errors", []) if str(item).strip()) or str(verification_summary.get("summary", "") or "").strip(),
+            "evidence": evidence[:4],
+            "next_step": "" if verified else (next_step or f"Inspect why scoped verification failed for {target_text}."),
+            "target": target_text,
+            "review": verification_result,
+        }
+
     def _run_reviewer_pass(self, subject: str, request_text: str, result_text: str,
                            verification: dict[str, Any] | None = None) -> str:
         if not self._reviewer_pass_allowed(subject):
@@ -5460,8 +8000,8 @@ class FlexiBot:
             {
                 "role": "system",
                 "content": (
-                    "You are a concise runtime reviewer. Assess the execution result and say whether it looks healthy, "
-                    "risky, or blocked. Keep the response short and practical."
+                    "You are a concise runtime reviewer. Assess the execution result and decide whether it is healthy, risky, or blocked. "
+                    "Return exactly four lines labeled Assessment, Confidence, Verification, and Next step."
                 ),
             },
             {
@@ -5471,7 +8011,11 @@ class FlexiBot:
                     f"Request:\n{truncated_request}\n\n"
                     f"Result:\n{truncated_result}\n\n"
                     f"Verification:\n{verification_text}\n\n"
-                    "Respond with two lines: 'Assessment:' and 'Next step:'."
+                    "Format exactly as:\n"
+                    "Assessment: <healthy|risky|blocked> - <short reason>\n"
+                    "Confidence: <high|medium|low>\n"
+                    "Verification: <light|normal|strong>\n"
+                    "Next step: <short action>"
                 ),
             },
         ]
@@ -5480,7 +8024,8 @@ class FlexiBot:
             resp_data = self.client.chat(messages)
             review = resp_data["choices"][0]["message"]["content"].strip()
             if review:
-                self._store_reviewer_event(subject, request_text, result_text, verification, review)
+                guidance = self._reviewer_guidance_from_text(review)
+                self._store_reviewer_event(subject, request_text, result_text, verification, review, guidance=guidance)
                 self._append_response_trace(
                     "reviewer_pass",
                     subject=subject,
@@ -5488,6 +8033,7 @@ class FlexiBot:
                     result=self._tool_result_text(result_text)[:1000],
                     verification=verification or {},
                     review=review,
+                    guidance=guidance,
                 )
             return review
         except Exception as e:
@@ -5572,12 +8118,17 @@ class FlexiBot:
         """Run a shell command with smart platform translations and flexible executor selection.
         Returns a string containing STDOUT and STDERR."""
         if not cmd or not cmd.strip():
-            return self._structured_tool_result("bash", False, summary="No command provided.", errors=["No command provided."])
+            result = self._structured_tool_result("bash", False, summary="No command provided.", errors=["No command provided."])
+            self._note_runtime_error("bash: no command provided", current_phase="blocked", persist=True)
+            return result
 
+        self._note_tool_start("bash", cmd, persist=True)
         decision = self.execution_policy.evaluate("bash", cmd)
         if not decision.allowed:
             self.execution_policy.audit(decision, action="deny", status="blocked", payload=cmd)
-            return self._structured_tool_result("bash", False, summary="Execution blocked.", errors=[decision.reason], data={"command": cmd})
+            result = self._structured_tool_result("bash", False, summary="Execution blocked.", errors=[decision.reason], data={"command": cmd})
+            self._note_tool_result("bash", result, persist=True)
+            return result
 
         try:
             self._run_tool_hook('pre', 'bash', cmd)
@@ -5682,6 +8233,7 @@ class FlexiBot:
                     return self._structured_tool_result("bash", False, summary="Execution failed.", errors=[str(e)], data={"command": raw_cmd, "executor": executor, "translated_command": cmd_to_run})
 
         result = self._run_tool_with_wrapper('bash', cmd, _execute_core)
+        self._note_tool_result("bash", result, persist=True)
         result_payload = self._parse_tool_result_payload(result)
         self.execution_policy.audit(
             decision,
@@ -5762,6 +8314,228 @@ class FlexiBot:
             "recent_user_requests": [entry.get("content", "") for entry in recent_user],
         }
 
+    def _idle_last_test_result(self) -> dict[str, Any]:
+        value = self.state.get_runtime_value(LAST_TEST_RUN_KEY, {})
+        return copy.deepcopy(value) if isinstance(value, dict) else {}
+
+    def _idle_goal_has_known_prerequisite_gap(self, goal: dict[str, Any]) -> bool:
+        sample = " ".join(
+            str(goal.get(field, "") or "").strip().lower()
+            for field in ("blocked_reason", "next_action", "verification_target", "text")
+        )
+        if not sample:
+            return False
+        markers = (
+            "missing",
+            "not installed",
+            "dependency",
+            "module",
+            "package",
+            "command not found",
+            "prerequisite",
+            "credential",
+            "token",
+            "server",
+            "port",
+            "log",
+            "runtime",
+            "environment",
+            "evidence",
+            "verify",
+        )
+        return any(marker in sample for marker in markers)
+
+    def _idle_blocked_goals(self) -> list[dict[str, Any]]:
+        blocked: list[dict[str, Any]] = []
+        for goal in self.active_goals():
+            blocked_reason = str(goal.get("blocked_reason", "") or "").strip()
+            if not blocked_reason:
+                continue
+            blocked.append(
+                {
+                    "id": str(goal.get("id", "") or "").strip(),
+                    "text": str(goal.get("text", "") or "").strip(),
+                    "blocked_reason": blocked_reason,
+                    "next_action": str(goal.get("next_action", "") or "").strip(),
+                    "verification_target": str(goal.get("verification_target", "") or "").strip(),
+                    "known_missing_prerequisite": self._idle_goal_has_known_prerequisite_gap(goal),
+                }
+            )
+        return blocked
+
+    def _idle_stale_background_tasks(self) -> list[dict[str, Any]]:
+        stale: list[dict[str, Any]] = []
+        now = time.time()
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            psutil = None
+
+        for pid_str, info in sorted(self.state.active_processes.items()):
+            task = self._normalize_bg_task_record(pid_str, info)
+            ready_condition = task.get("ready_condition", {}) if isinstance(task.get("ready_condition"), dict) else {}
+            ready_status = str(ready_condition.get("status", "") or "").strip().lower()
+            launch_spec = task.get("launch_spec", {}) if isinstance(task.get("launch_spec"), dict) else {}
+            status = str(task.get("status", "") or "").strip().lower()
+            start_time = float(task.get("start_time", 0.0) or 0.0)
+            timeout_seconds = int(
+                ready_condition.get("timeout_seconds", 0) or launch_spec.get("timeout_seconds", 0) or 0
+            )
+            age_seconds = max(0.0, now - start_time) if start_time else 0.0
+            reason = ""
+
+            if psutil is not None:
+                try:
+                    proc = psutil.Process(int(pid_str))
+                    proc_status = str(proc.status()).lower()
+                    if proc_status in {"zombie", "dead"}:
+                        reason = f"process is {proc_status}"
+                except psutil.NoSuchProcess:
+                    reason = "registered task is no longer running"
+                except Exception:
+                    pass
+
+            if not reason and status in {"finished", "stopped", "terminated", "failed"}:
+                reason = f"task status is {status}"
+            if not reason and ready_status in {"timeout", "terminated", "failed"}:
+                reason = f"ready condition is {ready_status}"
+            if not reason and timeout_seconds and age_seconds > max(timeout_seconds * 2, 900):
+                if ready_status in {"pending", "timeout", "not_configured"}:
+                    reason = f"task exceeded readiness window ({int(age_seconds)}s > {timeout_seconds}s)"
+
+            if not reason:
+                continue
+
+            stale.append(
+                {
+                    "pid": str(task.get("pid", "") or pid_str),
+                    "type": str(task.get("type", "") or "").strip(),
+                    "status": str(task.get("status", "") or "").strip(),
+                    "reason": reason,
+                    "goal": copy.deepcopy(task.get("goal", {})),
+                    "ready_condition": copy.deepcopy(ready_condition),
+                    "log_path": str(task.get("log_path", "") or "").strip(),
+                    "age_seconds": int(age_seconds),
+                }
+            )
+        return stale
+
+    def _idle_failing_tests(self, active_goals: list[dict[str, Any]]) -> dict[str, Any]:
+        result = self._idle_last_test_result()
+        if not result or bool(result.get("success", True)):
+            return {}
+
+        active_goal_ids = {str(goal.get("id", "") or "").strip() for goal in active_goals if str(goal.get("id", "") or "").strip()}
+        recorded_goal = result.get("goal", {}) if isinstance(result.get("goal"), dict) else {}
+        recorded_goal_id = str(recorded_goal.get("id", "") or "").strip()
+        if active_goal_ids and recorded_goal_id and recorded_goal_id not in active_goal_ids:
+            return {}
+
+        timestamp = float(result.get("timestamp", 0.0) or 0.0)
+        if timestamp and time.time() - timestamp > 6 * 60 * 60:
+            return {}
+
+        return {
+            "command": str(result.get("command", "") or "").strip(),
+            "summary": str(result.get("summary", "") or "").strip(),
+            "errors": [str(item).strip() for item in result.get("errors", []) if str(item).strip()][:5],
+            "goal": copy.deepcopy(recorded_goal),
+            "timestamp": timestamp,
+        }
+
+    def _idle_external_work_scan(self, resume_context: dict[str, Any] | None = None) -> dict[str, Any]:
+        active_goals = self.active_goals()
+        blocked_goals = self._idle_blocked_goals()
+        blocked_with_prereqs = [goal for goal in blocked_goals if goal.get("known_missing_prerequisite")]
+        stale_tasks = self._idle_stale_background_tasks()
+        failing_tests = self._idle_failing_tests(active_goals)
+        pending_plans = list((resume_context or {}).get("pending_plans", []))
+
+        priority = "proposal_fallback"
+        if blocked_with_prereqs:
+            priority = "blocked_goals"
+        elif stale_tasks:
+            priority = "stale_background_tasks"
+        elif failing_tests:
+            priority = "failing_tests"
+        elif active_goals:
+            priority = "active_goals"
+
+        has_external_work = bool(active_goals or blocked_with_prereqs or stale_tasks or failing_tests)
+        return {
+            "has_external_work": has_external_work,
+            "priority": priority,
+            "active_goals": [copy.deepcopy(goal) for goal in active_goals[:5]],
+            "blocked_goals": blocked_with_prereqs[:5],
+            "stale_background_tasks": stale_tasks[:5],
+            "failing_tests": copy.deepcopy(failing_tests),
+            "pending_plans": pending_plans[:5],
+            "recent_user_requests": list((resume_context or {}).get("recent_user_requests", []))[:5],
+        }
+
+    def _idle_external_work_prompt(self, scan: dict[str, Any], resume_context: dict[str, Any] | None = None) -> str:
+        lines = [
+            "Idle mode detected meaningful external work.",
+            "Do not start self-improvement proposals or rewrite the runtime unless all user-facing work is exhausted.",
+            "Prioritize the current workspace and active goals.",
+            "",
+        ]
+
+        active_goals = scan.get("active_goals", []) if isinstance(scan.get("active_goals"), list) else []
+        if active_goals:
+            lines.append("Active goals:")
+            for goal in active_goals[:3]:
+                lines.append(
+                    f"- [{goal.get('id', '')}] {goal.get('text', '')} | next_action={goal.get('next_action', '')} | blocked_reason={goal.get('blocked_reason', '')}"
+                )
+            lines.append("")
+
+        blocked_goals = scan.get("blocked_goals", []) if isinstance(scan.get("blocked_goals"), list) else []
+        if blocked_goals:
+            lines.append("Blocked goals with known missing prerequisites:")
+            for goal in blocked_goals[:3]:
+                lines.append(
+                    f"- [{goal.get('id', '')}] reason={goal.get('blocked_reason', '')} | next_action={goal.get('next_action', '')} | verification_target={goal.get('verification_target', '')}"
+                )
+            lines.append("")
+
+        stale_tasks = scan.get("stale_background_tasks", []) if isinstance(scan.get("stale_background_tasks"), list) else []
+        if stale_tasks:
+            lines.append("Stale background tasks:")
+            for task in stale_tasks[:3]:
+                lines.append(
+                    f"- pid={task.get('pid', '')} status={task.get('status', '')} reason={task.get('reason', '')} log_path={task.get('log_path', '')}"
+                )
+            lines.append("")
+
+        failing_tests = scan.get("failing_tests", {}) if isinstance(scan.get("failing_tests"), dict) else {}
+        if failing_tests:
+            lines.append("Recent failing tests tied to active work:")
+            lines.append(f"- command={failing_tests.get('command', '')}")
+            lines.append(f"- summary={failing_tests.get('summary', '')}")
+            for error in failing_tests.get("errors", [])[:3]:
+                lines.append(f"- error={error}")
+            lines.append("")
+
+        pending_plans = list((resume_context or {}).get("pending_plans", []))[:3]
+        if pending_plans:
+            lines.append("Pending plans from recent history:")
+            for item in pending_plans:
+                lines.append(f"- {str(item)[:240]}")
+            lines.append("")
+
+        lines.extend(
+            [
+                "Act on the highest-value external work first:",
+                "1. unblock blocked goals by inspecting or satisfying missing prerequisites,",
+                "2. inspect, stop, or restart stale background tasks if they affect active goals,",
+                "3. investigate failing tests before making unrelated changes,",
+                "4. if none of the above block progress, continue the highest-priority active goal.",
+                "Avoid broad introspection loops and avoid self-rewrite work in this turn.",
+            ]
+        )
+        return "\n".join(lines).strip()
+
     def _idle_llm_text(self, system_prompt: str, user_prompt: str, fallback: str) -> str:
         try:
             resp = self.client.chat([
@@ -5839,23 +8613,60 @@ class FlexiBot:
         path = self._idle_artifact_path(proposal_path, suffix, "json")
         try:
             # Write atomically and set restrictive permissions to avoid accidental leakage in working dirs.
-            import tempfile, os
+            import tempfile, os, hmac, hashlib
             data = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+            # ensure parent dir exists with conservative permissions
             path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=str(path.parent), delete=False) as tf:
-                tf.write(data)
-                tf.flush()
+            try:
+                os.chmod(path.parent, 0o700)
+            except Exception:
+                # best-effort; don't fail on platforms that don't support chmod
+                pass
+
+            # Use mkstemp+fdopen to write atomically and control permission setting
+            fd, tmpname = tempfile.mkstemp(dir=str(path.parent))
+            try:
                 try:
-                    os.fsync(tf.fileno())
+                    os.fchmod(fd, 0o600)
+                except Exception:
+                    # best-effort: platforms may not support fchmod; continue and ensure final chmod below
+                    pass
+                with os.fdopen(fd, "wb") as tf:
+                    tf.write(data)
+                    tf.flush()
+                    try:
+                        os.fsync(tf.fileno())
+                    except Exception:
+                        pass
+                os.replace(tmpname, str(path))
+                try:
+                    os.chmod(str(path), 0o600)
                 except Exception:
                     pass
-                tmpname = tf.name
-            os.replace(tmpname, str(path))
+            finally:
+                # Ensure leftover temp file is removed on failure paths
+                if os.path.exists(tmpname):
+                    try:
+                        os.unlink(tmpname)
+                    except Exception:
+                        pass
+
+            # Optional HMAC signature sidecar to detect tampering of generated artifacts.
             try:
-                os.chmod(str(path), 0o600)
+                signing_key = os.environ.get("SIGNING_KEY")
+                if signing_key:
+                    sig = hmac.new(signing_key.encode("utf-8"), data, hashlib.sha256).hexdigest()
+                    sig_path = str(path) + ".sig"
+                    with open(sig_path, "w", encoding="utf-8") as sf:
+                        sf.write(sig + "\n")
+                    try:
+                        os.chmod(sig_path, 0o600)
+                    except Exception:
+                        pass
             except Exception:
-                # best-effort; don't fail the whole operation if chmod isn't supported on the platform
+                # Non-fatal: signature best-effort only; avoid failing artifact write for environment issues.
                 pass
+
             return path
         except Exception as e:
             ConsoleOutput.warning(f"Could not write idle artifact {path.name}: {e}")
@@ -5998,6 +8809,53 @@ class FlexiBot:
 
         return {"ok": not errors, "archived": archived, "errors": errors, "kept_recent": kept}
 
+    def _idle_collect_proposal_files(self, proposal_path: Path, artifact_paths: dict[str, str] | None = None) -> list[Path]:
+        collected: list[Path] = []
+        seen: set[Path] = set()
+
+        def add_path(path: Path | None):
+            if path is None:
+                return
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if resolved in seen or not path.exists() or not path.is_file():
+                return
+            seen.add(resolved)
+            collected.append(path)
+
+        add_path(proposal_path)
+        for candidate in proposal_path.parent.glob(f"{proposal_path.stem}.*"):
+            if candidate == proposal_path or candidate.suffix == ".sig":
+                add_path(candidate)
+                continue
+            add_path(candidate)
+        for raw_path in (artifact_paths or {}).values():
+            if raw_path:
+                add_path(Path(raw_path))
+                sig_path = Path(str(raw_path) + ".sig")
+                add_path(sig_path)
+        return collected
+
+    def _idle_promote_proposal(self, proposal_path: Path, artifact_paths: dict[str, str], destination_dir: Path) -> dict[str, Any]:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[str] = []
+        errors: list[str] = []
+        for source in self._idle_collect_proposal_files(proposal_path, artifact_paths):
+            destination = destination_dir / source.name
+            try:
+                shutil.copy2(source, destination)
+                copied.append(str(destination))
+            except Exception as e:
+                errors.append(f"{source.name}: {e}")
+        return {
+            "ok": not errors,
+            "destination": str(destination_dir),
+            "files": copied,
+            "errors": errors,
+        }
+
     def _idle_generate_rewrite_plan(self, proposal_path: Path, analysis_text: str, audit_text: str, change_plan_text: str) -> dict[str, Any]:
         sections = self._idle_rewrite_sections(proposal_path)
         scope_preview = self._idle_rewrite_scope_preview(sections)
@@ -6028,6 +8886,13 @@ class FlexiBot:
         if not isinstance(edits, list):
             edits = []
         bounded_edits = []
+        # Denylist of risky runtime operations; any proposed replacement containing these
+        # substrings will be skipped to avoid introducing dynamic execution, unsafe
+        # deserialization, or unrestricted subprocess/network calls.
+        disallowed = [
+            "pickle.loads", "pickle.load", "pickle.", "importlib", "exec(", "eval(", "__import__",
+            "subprocess", "os.system", "os.exec", "shutil.rmtree", "socket", "ctypes", "requests", "urllib",
+        ]
         for item in edits[:3]:
             if not isinstance(item, dict):
                 continue
@@ -6038,6 +8903,14 @@ class FlexiBot:
             if not section or not search.strip() or not replace.strip():
                 continue
             if len(search) > 4000 or len(replace) > 4000:
+                continue
+            lower_replace = replace.lower()
+            if any(pat in lower_replace for pat in disallowed):
+                # Surface skipped edits in the notes so operators can inspect and approve manually.
+                try:
+                    parsed.setdefault("notes", []).append(f"Skipped edit for section '{section}': contains disallowed pattern.")
+                except Exception:
+                    pass
                 continue
             bounded_edits.append({"section": section, "search": search, "replace": replace, "rationale": rationale})
         notes = parsed.get("notes", []) if isinstance(parsed, dict) else []
@@ -6092,7 +8965,23 @@ class FlexiBot:
 
         if applied:
             try:
-                proposal_path.write_text(updated, encoding="utf-8")
+                # Write updated proposal atomically to avoid corrupting the live source on interruptions.
+                import tempfile, os
+                data = updated.encode("utf-8")
+                proposal_path.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=str(proposal_path.parent), delete=False) as tf:
+                    tf.write(data)
+                    tf.flush()
+                    try:
+                        os.fsync(tf.fileno())
+                    except Exception:
+                        pass
+                    tmpname = tf.name
+                os.replace(tmpname, str(proposal_path))
+                try:
+                    os.chmod(str(proposal_path), 0o600)
+                except Exception:
+                    pass
             except Exception as e:
                 return {"ok": False, "applied": [], "skipped": skipped + [{"reason": f"Could not write proposal: {e}"}]}
 
@@ -6229,41 +9118,43 @@ class FlexiBot:
 
 
     def idle_proposal_workflow(self, auto_propose: bool = False, auto_confirm: bool | None = None):
-        """Idle-triggered workflow following a staged proposal architecture.
+        """Idle-triggered workflow that prioritizes external work before self-improvement.
 
         Flow:
-        1. Resume pending work from history when possible.
-        2. Copy the live runtime into proposals/.
-        3. Analyze the latest proposal and suggest improvements/features.
-        4. Audit the proposal and suggest improvements/features.
-        5. Plan change steps from the analysis and audit.
-        6. Execute safe proposal updates.
-        7. Review the updated proposal.
-        8. Test the updated proposal.
-        9. Run a final review after testing.
-        10. Optionally update the live code based on auto_propose/auto_confirm.
+        1. Inspect active goals, blocked goals, stale background tasks, and recent failing tests.
+        2. Resume meaningful external work when any of those signals are present.
+        3. Only when there is no meaningful external work, fall back to the staged proposal pipeline.
         """
         try:
             workflow_trace: dict[str, Any] = {"steps": []}
+            resume_context = self._idle_resume_context(limit=5)
+            idle_scan = self._idle_external_work_scan(resume_context)
+            self.state.set_runtime_value(IDLE_TRIAGE_RECORD_KEY, idle_scan, persist=True)
+            workflow_trace["idle_scan"] = idle_scan
+            workflow_trace["steps"].append({"step": "idle_triage", "ok": True, "summary": json.dumps(idle_scan, ensure_ascii=False)[:1200]})
 
-            # 0. plan generation step
+            if idle_scan.get("has_external_work"):
+                external_prompt = self._idle_external_work_prompt(idle_scan, resume_context)
+                ConsoleOutput.system(f"Idle workflow: prioritizing external work via {idle_scan.get('priority', 'active_goals')}.")
+                external_result = self.handle_turn(external_prompt)
+                workflow_trace["external_work_prompt"] = external_prompt
+                workflow_trace["external_work_result"] = external_result
+                workflow_trace["steps"].append(
+                    {
+                        "step": "resume_external_work",
+                        "ok": True,
+                        "summary": str(external_result)[:1200],
+                    }
+                )
+                return (
+                    f"Idle mode resumed external work ({idle_scan.get('priority', 'active_goals')}): "
+                    f"{str(external_result)[:600]}"
+                )
+
             plan_text = self.generate_improvement_plan()
             self.logger.log_plan_event(plan_text, context="idle_proposal_workflow")
             ConsoleOutput.system("Idle workflow plan generated.")
             workflow_trace["steps"].append({"step": "generate_plan", "ok": True, "summary": plan_text[:500]})
-
-            # 1. context check for pending plan
-            resume_context = self._idle_resume_context(limit=5)
-            open_plans = resume_context.get("pending_plans", [])
-            resumed_pending_work = False
-            if open_plans:
-                ConsoleOutput.system("Idle workflow: found pending plan entries, attempting to resume.")
-                try:
-                    self.handle_turn("continue")
-                    resumed_pending_work = True
-                except Exception:
-                    pass
-            workflow_trace["steps"].append({"step": "resume_pending_tasks", "ok": True, "summary": json.dumps({"resumed": resumed_pending_work, **resume_context})[:1000]})
 
             # 2. proposal creation (unique name each run for persistent history)
             source_path = Path(__file__).resolve()
@@ -6347,153 +9238,75 @@ class FlexiBot:
             # 8. evaluation: compile check then SDLC test/review pass
             compile_res = self.run_bash(f'"{sys.executable}" -m py_compile "{proposal_path}"')
             compile_ok = not self._tool_result_failed(compile_res)
-            if not compile_ok:
-                ConsoleOutput.warning("Proposal evaluation: compile check failed.")
-                evaluation_ok = False
-            else:
-                ConsoleOutput.system("Proposal evaluation: compile check succeeded.")
-                evaluation_ok = True
-            workflow_trace["steps"].append({"step": "compile_check", "ok": evaluation_ok, "summary": self._tool_result_text(compile_res)[:1000]})
+            workflow_trace["compile"] = compile_res
+            workflow_trace["steps"].append({"step": "compile", "ok": compile_ok, "summary": self._tool_result_text(compile_res)[:1000]})
 
-            sdlc_ok = False
-            sdlc_details: dict[str, Any] = {"overall_ok": False}
-            if proposal_ok and evaluation_ok:
-                sdlc_details = self.run_proposal_sdlc(proposal_path, return_details=True)
-                sdlc_ok = bool(sdlc_details.get("overall_ok", False))
-            else:
-                ConsoleOutput.warning("Skipping full SDLC due to earlier audit/compile failures.")
+            sdlc_details = self.run_proposal_sdlc(proposal_path, return_details=True)
             workflow_trace["sdlc"] = sdlc_details
-            workflow_trace["steps"].append({"step": "test_and_review", "ok": sdlc_ok, "summary": json.dumps(sdlc_details, indent=2)[:1200]})
+            workflow_trace["steps"].append({"step": "sdlc", "ok": bool(sdlc_details.get("overall_ok", False)), "summary": json.dumps(sdlc_details)[:1200]})
 
-            # 9. final review after testing
             final_review = self._idle_review_summary(
                 proposal_path,
                 "post-test-review",
-                f"Pre-test review:\n{pre_test_review}\n\nSDLC details:\n{json.dumps(sdlc_details, indent=2)}",
+                f"Pre-test review:\n{pre_test_review}\n\nCompile:\n{self._tool_result_text(compile_res)}\n\nSDLC:\n{json.dumps(sdlc_details, indent=2)}",
             )
             workflow_trace["final_review"] = final_review
             workflow_trace["steps"].append({"step": "final_review", "ok": True, "summary": final_review[:1000]})
-            artifact_paths["pre_test_review"] = str(self._idle_write_artifact_text(proposal_path, "review-pre-test", "Idle Proposal Review Before Test", pre_test_review) or "")
-            artifact_paths["final_review"] = str(self._idle_write_artifact_text(proposal_path, "review-final", "Idle Proposal Final Review", final_review) or "")
-            artifact_paths["workflow_trace"] = str(self._idle_write_artifact_json(proposal_path, "workflow-trace", workflow_trace) or "")
-            artifact_status = {
-                "proposal_ok": proposal_ok,
-                "evaluation_ok": evaluation_ok,
-                "sdlc_ok": sdlc_ok,
-                "rewrite_applied": rewrite_result.get("applied_count", 0),
-                "patch_applied": patch_applied,
-                "notes_applied": notes_applied,
-            }
-            summary_body = self._idle_render_artifact_summary(proposal_path, artifact_paths, artifact_status)
-            artifact_paths["summary"] = str(self._idle_write_artifact_text(proposal_path, "summary", f"Idle Proposal Summary: {proposal_path.name}", summary_body) or "")
-            rotation_result = self._idle_rotate_old_proposal_artifacts(proposals_dir)
-            workflow_trace["artifact_rotation"] = rotation_result
-            artifact_paths["workflow_trace"] = str(self._idle_write_artifact_json(proposal_path, "workflow-trace", workflow_trace) or artifact_paths["workflow_trace"])
 
-            # Log proposal summary in evolution log
-            try:
-                notes = "proposal, compile and SDLC check" if (proposal_ok and evaluation_ok and sdlc_ok) else "audit/compile/SDLC issue"
-                self.logger.log_proposal_event(proposal_path, proposal_ok and evaluation_ok and sdlc_ok,
-                                               notes=notes)
-            except Exception:
-                pass
+            evaluation_ok = compile_ok and bool(sdlc_details.get("overall_ok", False))
+            approved_dir = proposals_dir / "approved"
+            promoted = {"ok": False, "destination": "", "files": [], "errors": []}
+            updated = False
 
-            # decide outcome
-            confirmed = False
-            if proposal_ok and evaluation_ok and sdlc_ok:
-                if auto_propose:
-                    # Auto proposal mode: keep proposal, do not replace core file
-                    ConsoleOutput.system(f"Auto-proposal mode: proposal saved as {proposal_path}, no replacement applied.")
-                    confirmed = False
-                elif auto_confirm is True:
-                    confirmed = True
-                elif auto_confirm is False:
-                    confirmed = False
-                else:
+            if evaluation_ok and proposal_ok and auto_propose:
+                promoted = self._idle_promote_proposal(proposal_path, artifact_paths, approved_dir)
+                workflow_trace["promotion"] = promoted
+                workflow_trace["steps"].append({"step": "promote_proposal", "ok": bool(promoted.get("ok", False)), "summary": json.dumps(promoted)[:1200]})
+                should_apply = bool(auto_confirm)
+                if should_apply and promoted.get("ok", False):
                     try:
-                        response = input("[Awaiting confirmation] Apply proposalAgent.py as new flexiFocus.py? [y/N]: ").strip().lower()
-                        confirmed = response == "y"
-                    except Exception:
-                        confirmed = False
+                        patch_target = Path(__file__).resolve()
+                        shutil.copy2(proposal_path, patch_target)
+                        updated = True
+                        ConsoleOutput.system(f"Idle workflow auto-applied proposal {proposal_path.name} to flexiFocus.py")
+                    except Exception as e:
+                        ConsoleOutput.error(f"Idle workflow failed to auto-apply proposal: {e}")
+                        workflow_trace["steps"].append({"step": "auto_apply", "ok": False, "summary": str(e)[:1000]})
+                elif should_apply and not promoted.get("ok", False):
+                    ConsoleOutput.warning("Idle workflow wanted to auto-apply but proposal promotion failed.")
+            else:
+                workflow_trace["steps"].append({"step": "promote_proposal", "ok": False, "summary": "Proposal not promoted (evaluation failed or auto_propose disabled)."})
 
-            if not auto_propose:
-                if confirmed:
-                    shutil.copy2(proposal_path, source_path)
-                    ConsoleOutput.system(f"flexiFocus.py updated from {proposal_path}.")
-                else:
-                    ConsoleOutput.system(f"Kept existing flexiFocus.py. Proposal left as {proposal_path}.")
+            rotation = self._idle_rotate_old_proposal_artifacts(proposals_dir)
+            workflow_trace["rotation"] = rotation
+            workflow_trace["steps"].append({"step": "rotate_artifacts", "ok": bool(rotation.get("ok", False)), "summary": json.dumps(rotation)[:1000]})
 
-            workflow_trace["proposal_ok"] = proposal_ok
-            workflow_trace["evaluation_ok"] = evaluation_ok
-            workflow_trace["sdlc_ok"] = sdlc_ok
-            workflow_trace["updated"] = confirmed
+            artifact_summary = self._idle_render_artifact_summary(
+                proposal_path,
+                artifact_paths,
+                {
+                    "proposal_ok": proposal_ok,
+                    "evaluation_ok": evaluation_ok,
+                    "updated": updated,
+                    "promoted": promoted.get("ok", False),
+                },
+            )
+            summary_path = self._idle_write_artifact_text(proposal_path, "summary", "Idle Proposal Workflow Summary", artifact_summary)
+            if summary_path:
+                artifact_paths["summary"] = str(summary_path)
 
             return {
                 "proposal_ok": proposal_ok,
                 "evaluation_ok": evaluation_ok,
-                "sdlc_ok": sdlc_ok,
-                "updated": confirmed,
-                "analysis": analysis_text[:300],
-                "audit": proposal_audit_text[:300],
-                "plan": change_plan_text[:300],
-                "final_review": final_review[:300],
-                "rewrite_applied": rewrite_result.get("applied_count", 0),
-                "artifacts": artifact_paths,
+                "updated": updated,
+                "promoted": promoted,
+                "proposal_path": str(proposal_path),
+                "artifact_paths": artifact_paths,
+                "review": final_review,
             }
-
         except Exception as e:
             ConsoleOutput.error(f"Idle proposal workflow failed: {e}")
             return {"proposal_ok": False, "evaluation_ok": False, "updated": False, "error": str(e)}
-
-    def tool_list_processes(self, filter_text: str = None):
-        """Returns a list of running processes. Uses psutil if available, otherwise tasklist/ps."""
-        try:
-            import psutil
-            procs = []
-            for proc in psutil.process_iter(['pid', 'name', 'username']):
-                try:
-                    info = proc.info
-                    name = str(info['name'] or "")
-                    if filter_text and filter_text.lower() not in name.lower(): continue
-                    procs.append(info)
-                except (psutil.NoSuchProcess, psutil.AccessDenied): pass
-            limited = procs[:100]
-            warnings = [] if len(procs) <= 100 else [f"Truncated process list to first 100 of {len(procs)} entries."]
-            return self._structured_tool_result("list_processes", True, summary=f"Listed {len(limited)} process(es).", data={"processes": limited, "filter_text": filter_text or ""}, warnings=warnings)
-        except ImportError:
-            # Fallback to shell
-            cmd = "tasklist" if os.name == "nt" else "ps aux"
-            if filter_text:
-                cmd += f" | findstr /i {filter_text}" if os.name == "nt" else f" | grep -i {filter_text}"
-            return self.run_bash(cmd)
-
-    def tool_get_software_versions(self):
-        """Checks versions for common development tools."""
-        tools = ["python", "node", "npm", "npx", "yarn", "git", "docker", "prisma", "pip", "tsc", "rustc", "cargo"]
-        results = {}
-        for t in tools:
-            # Try --version
-            try:
-                p = subprocess.run([t, "--version"], capture_output=True, text=True, shell=True, timeout=5, encoding='utf-8', errors='replace')
-                if p.returncode == 0:
-                    results[t] = p.stdout.strip() or p.stderr.strip()
-                else:
-                    results[t] = "Not installed or failed"
-            except Exception:
-                results[t] = "Not found"
-        return self._structured_tool_result("get_software_versions", True, summary=f"Checked {len(results)} tool version(s).", data={"versions": results})
-
-    def tool_inspect_python_environment(self):
-        return rlm_inspect_python_environment()
-
-    def tool_list_python_packages(self, limit: int = 500):
-        return rlm_list_python_packages(limit=limit)
-
-    def tool_python_symbol_doc(self, symbol_name: str, filepath: str = "", root: str = ".", max_results: int = 10):
-        return rlm_python_symbol_doc(symbol_name=symbol_name, filepath=filepath, root=root, max_results=max_results)
-
-    def tool_python_import_graph(self, filepath: str, root: str = "."):
-        return rlm_python_import_graph(filepath=filepath, root=root)
 
     def tool_validate_python_snippet(self, code: str, mode: str = "exec"):
         return rlm_validate_python_snippet(code=code, mode=mode)
@@ -6647,9 +9460,288 @@ class FlexiBot:
             )
             return self._structured_tool_result("install_python_package", False, summary="Package install failed.", errors=[str(e)], data={"package": package, "upgrade": bool(upgrade)})
 
+    def tool_inspect_python_environment(self):
+        try:
+            return rlm_inspect_python_environment()
+        except Exception as e:
+            return self._structured_tool_result(
+                "inspect_python_environment",
+                False,
+                summary="Failed to inspect Python environment.",
+                errors=[str(e)],
+            )
+
+    def tool_list_python_packages(self, limit: int = 500):
+        try:
+            return rlm_list_python_packages(limit=limit)
+        except Exception as e:
+            return self._structured_tool_result(
+                "list_python_packages",
+                False,
+                summary="Failed to list Python packages.",
+                errors=[str(e)],
+                data={"limit": int(limit or 500)},
+            )
+
+    def tool_python_symbol_doc(self, name: str, filepath: str = "", root: str = "."):
+        try:
+            return rlm_python_symbol_doc(name=name, filepath=filepath, root=root)
+        except Exception as e:
+            return self._structured_tool_result(
+                "python_symbol_doc",
+                False,
+                summary="Failed to inspect Python symbol documentation.",
+                errors=[str(e)],
+                data={"name": name, "filepath": filepath, "root": root},
+            )
+
+    def tool_python_import_graph(self, filepath: str, root: str = "."):
+        try:
+            return rlm_python_import_graph(filepath=filepath, root=root)
+        except Exception as e:
+            return self._structured_tool_result(
+                "python_import_graph",
+                False,
+                summary="Failed to build Python import graph.",
+                errors=[str(e)],
+                data={"filepath": filepath, "root": root},
+            )
+
     def _bg_task_log_path(self, pid: str | int) -> Path:
         BG_TASK_LOG_DIR.mkdir(parents=True, exist_ok=True)
         return BG_TASK_LOG_DIR / f"bg_task_{pid}.log"
+
+    def _recent_user_request_text(self) -> str:
+        history = getattr(self.state, "history", []) or []
+        for entry in reversed(history[-20:]):
+            if str(entry.get("role", "")) != "user":
+                continue
+            text = str(entry.get("content", "") or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _current_goal_reference(self) -> dict[str, Any]:
+        goal = self.current_goal()
+        if not goal:
+            return {}
+        return {
+            "id": str(goal.get("id", "") or "").strip(),
+            "text": str(goal.get("text", "") or "").strip(),
+            "status": str(goal.get("status", "") or "").strip(),
+            "next_action": str(goal.get("next_action", "") or "").strip(),
+            "verification_target": str(goal.get("verification_target", "") or "").strip(),
+            "workspace_path": str(goal.get("workspace_path", "") or "").strip(),
+        }
+
+    def _current_spawn_request_context(self) -> dict[str, Any]:
+        ctx = copy.deepcopy(getattr(self, "current_request_context", {}) or {})
+        request_text = str(ctx.get("user_input", "") or "").strip()
+        if not request_text:
+            request_text = self._recent_user_request_text()
+        request_signature = str(ctx.get("request_signature", "") or "").strip()
+        if not request_signature and request_text:
+            request_signature = self._progress_request_signature(request_text)
+        try:
+            heartbeat = self.runtime_heartbeat()
+        except Exception:
+            heartbeat = {}
+        return {
+            "request_signature": request_signature,
+            "request_excerpt": request_text[:240],
+            "turn_counter": int(ctx.get("turn_counter", getattr(self, "turn_counter", 0)) or 0),
+            "last_user_input_at": float(heartbeat.get("last_user_input_at", 0.0) or 0.0),
+        }
+
+    def _build_task_spawn_context(self, *, source: str, actor: str = "agent", source_id: str = "",
+                                  goal: dict[str, Any] | None = None, parent: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_context = self._current_spawn_request_context()
+        spawned_by = {
+            "actor": actor,
+            "source": source,
+            "source_id": str(source_id or "").strip(),
+            "request_signature": request_context.get("request_signature", ""),
+            "request_excerpt": request_context.get("request_excerpt", ""),
+            "turn_counter": int(request_context.get("turn_counter", 0) or 0),
+            "spawned_at": datetime.now().isoformat(),
+        }
+        if parent:
+            parent_pid = str(parent.get("pid", "") or "").strip()
+            if parent_pid:
+                spawned_by["parent_pid"] = parent_pid
+        return {
+            "spawned_by": spawned_by,
+            "goal": copy.deepcopy(goal) if isinstance(goal, dict) else self._current_goal_reference(),
+        }
+
+    def _workspace_lock_area(self, *, work_dir: str = ".", goal: dict[str, Any] | None = None) -> str:
+        if isinstance(goal, dict):
+            workspace_path = str(goal.get("workspace_path", "") or "").strip()
+            if workspace_path:
+                return str(Path(workspace_path).resolve())
+        return str(Path(work_dir or ".").resolve())
+
+    def _workspace_paths_overlap(self, left: str, right: str) -> bool:
+        try:
+            left_path = os.path.normcase(str(Path(left).resolve()))
+            right_path = os.path.normcase(str(Path(right).resolve()))
+            common = os.path.commonpath([left_path, right_path])
+            return common in {left_path, right_path}
+        except Exception:
+            return str(left).strip() == str(right).strip()
+
+    def _active_workspace_lock(self, area: str, *, holder: str = "") -> dict[str, Any] | None:
+        if not hasattr(self.state, "workspace_locks"):
+            return None
+        now_iso = datetime.now().isoformat()
+        active_locks: list[dict[str, Any]] = []
+        conflict: dict[str, Any] | None = None
+        for lock in self.state.workspace_locks():
+            payload = asdict(lock)
+            expires_at = str(payload.get("expires_at", "") or "").strip()
+            if expires_at and expires_at <= now_iso:
+                continue
+            active_locks.append(payload)
+            if holder and str(payload.get("holder", "") or "").strip() == holder:
+                continue
+            if self._workspace_paths_overlap(str(payload.get("area", "") or ""), area):
+                conflict = payload
+        if len(active_locks) != len(self.state.workspace_locks()):
+            self.state.remember(WORKSPACE_LOCKS_KEY, active_locks)
+        return conflict
+
+    def _acquire_workspace_lock(self, area: str, holder: str, *, goal: dict[str, Any] | None = None,
+                                reason: str = "", metadata: dict[str, Any] | None = None,
+                                ttl_seconds: int = 900) -> tuple[str, dict[str, Any] | None]:
+        normalized_area = str(Path(area).resolve())
+        conflict = self._active_workspace_lock(normalized_area, holder=holder)
+        if conflict:
+            return "", conflict
+        lock = self.state.acquire_workspace_lock(
+            normalized_area,
+            holder,
+            goal_id=str((goal or {}).get("id", "") or "").strip(),
+            reason=reason,
+            metadata=copy.deepcopy(metadata or {}),
+            ttl_seconds=ttl_seconds,
+        )
+        return str(lock.id), None
+
+    def _release_workspace_lock(self, lock_id: str):
+        if lock_id and hasattr(self.state, "release_workspace_lock"):
+            self.state.release_workspace_lock(lock_id)
+
+    def _default_task_lifecycle_policy(self, *, restart_supported: bool,
+                                       kill_mode: str = "graceful_then_force",
+                                       restart_mode: str = "manual") -> dict[str, Any]:
+        return {
+            "kill": {
+                "mode": kill_mode,
+                "force_supported": True,
+                "default_force": False,
+            },
+            "restart": {
+                "supported": bool(restart_supported),
+                "mode": restart_mode,
+                "attempts": 0,
+            },
+        }
+
+    def _default_ready_condition(self, *, marker: str = "", timeout_seconds: int = 0,
+                                 kind: str = "output_marker", path: str = "") -> dict[str, Any]:
+        marker_text = str(marker or "").strip()
+        ready_kind = kind if kind == "result_file" else ("output_marker" if marker_text else "none")
+        status = "pending" if ready_kind in {"output_marker", "result_file"} and (marker_text or ready_kind == "result_file") else "not_configured"
+        return {
+            "kind": ready_kind,
+            "marker": marker_text,
+            "path": str(path or "").strip(),
+            "status": status,
+            "timeout_seconds": int(timeout_seconds or 0),
+            "observed_at": "",
+        }
+
+    def _python_bg_preamble(self) -> str:
+        return "import sys, os, time\ntry:\n    import flexi\nexcept Exception:\n    pass\n\n"
+
+    def _recover_python_bg_source(self, code: str) -> str:
+        text = str(code or "")
+        prefix = self._python_bg_preamble()
+        if text.startswith(prefix):
+            return text[len(prefix):]
+        return text
+
+    def _normalize_bg_task_record(self, pid: str | int, info: dict[str, Any] | None) -> dict[str, Any]:
+        record = copy.deepcopy(info or {})
+        pid_str = str(pid or record.get("pid", "") or "").strip()
+        record["pid"] = pid_str
+        log_path = str(record.get("log_path") or record.get("expected_log_path") or self._bg_task_log_path(pid_str or "unknown"))
+        record["log_path"] = log_path
+        record["expected_log_path"] = str(record.get("expected_log_path") or log_path)
+        record["working_directory"] = str(record.get("working_directory") or ".")
+        record["type"] = str(record.get("type", "") or "").strip()
+        goal = record.get("goal")
+        record["goal"] = copy.deepcopy(goal) if isinstance(goal, dict) else {}
+        spawned_by = record.get("spawned_by")
+        if isinstance(spawned_by, dict):
+            record["spawned_by"] = copy.deepcopy(spawned_by)
+        else:
+            record["spawned_by"] = {
+                "actor": "unknown",
+                "source": "legacy_task",
+                "source_id": pid_str,
+                "request_signature": "",
+                "request_excerpt": "",
+                "turn_counter": 0,
+                "spawned_at": "",
+            }
+
+        launch_spec = copy.deepcopy(record.get("launch_spec") or {})
+        if not launch_spec:
+            launch_spec = {
+                "tool": "spawn_background" if record.get("type") == "shell" else "run_python_bg" if record.get("type") == "python_bg" else "",
+                "cmd": str(record.get("cmd", "") or ""),
+                "script_path": str(record.get("script_path", "") or ""),
+                "timeout_seconds": int(record.get("timeout_seconds", 0) or 0),
+                "stop_marker": str(record.get("stop_marker", "") or ""),
+            }
+        launch_spec.setdefault("cmd", str(record.get("cmd", "") or ""))
+        launch_spec.setdefault("script_path", str(record.get("script_path", "") or ""))
+        launch_spec.setdefault("timeout_seconds", int(record.get("timeout_seconds", 0) or 0))
+        launch_spec.setdefault("stop_marker", str(record.get("stop_marker", "") or ""))
+        record["launch_spec"] = launch_spec
+
+        ready_condition = record.get("ready_condition")
+        if isinstance(ready_condition, dict):
+            ready = copy.deepcopy(ready_condition)
+        else:
+            ready = self._default_ready_condition(
+                marker=str(launch_spec.get("stop_marker", "") or ""),
+                timeout_seconds=int(launch_spec.get("timeout_seconds", 0) or 0),
+            )
+        ready.setdefault("kind", "output_marker" if ready.get("marker") else "none")
+        ready.setdefault("marker", str(launch_spec.get("stop_marker", "") or ""))
+        ready.setdefault("path", "")
+        ready.setdefault("status", "pending" if ready.get("marker") else "not_configured")
+        ready.setdefault("timeout_seconds", int(launch_spec.get("timeout_seconds", 0) or 0))
+        ready.setdefault("observed_at", "")
+        record["ready_condition"] = ready
+
+        lifecycle_policy = record.get("lifecycle_policy")
+        if isinstance(lifecycle_policy, dict):
+            policy = copy.deepcopy(lifecycle_policy)
+        else:
+            policy = self._default_task_lifecycle_policy(restart_supported=record.get("type") in {"shell", "python_bg"})
+        policy.setdefault("kill", {})
+        policy.setdefault("restart", {})
+        policy["kill"].setdefault("mode", "graceful_then_force")
+        policy["kill"].setdefault("force_supported", True)
+        policy["kill"].setdefault("default_force", False)
+        policy["restart"].setdefault("supported", record.get("type") in {"shell", "python_bg"})
+        policy["restart"].setdefault("mode", "manual")
+        policy["restart"].setdefault("attempts", 0)
+        record["lifecycle_policy"] = policy
+        return record
 
     def tool_get_bg_task_details(self, pid: str = ""):
         active = self.state.active_processes
@@ -6657,17 +9749,22 @@ class FlexiBot:
             info = active.get(str(pid))
             if not info:
                 return self._structured_tool_result("get_bg_task_details", False, summary="Background task not found.", errors=[f"No background task found for PID {pid}"], data={"pid": str(pid)})
-            return self._structured_tool_result("get_bg_task_details", True, summary=f"Background task details for PID {pid}.", data={"pid": str(pid), "task": info})
-        return self._structured_tool_result("get_bg_task_details", True, summary=f"Listed {len(active)} background task(s).", data={"tasks": list(active.values())})
+            task = self._normalize_bg_task_record(pid, info)
+            return self._structured_tool_result("get_bg_task_details", True, summary=f"Background task details for PID {pid}.", data={"pid": str(pid), "task": task})
+        tasks = [self._normalize_bg_task_record(pid_str, info) for pid_str, info in sorted(active.items())]
+        return self._structured_tool_result("get_bg_task_details", True, summary=f"Listed {len(active)} background task(s).", data={"tasks": tasks})
 
     def tool_read_bg_task_log(self, pid: str, lines: int = 50):
-        log_path = self._bg_task_log_path(pid)
+        pid_str = str(pid)
+        info = self.state.active_processes.get(pid_str)
+        task = self._normalize_bg_task_record(pid_str, info) if info else None
+        log_path = Path(task.get("log_path")) if task else self._bg_task_log_path(pid)
         if not log_path.exists():
             return self._structured_tool_result("read_bg_task_log", False, summary="Background log not found.", errors=[f"No log file found for background task {pid}."], data={"pid": str(pid), "lines": int(lines)})
         try:
             content = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
             tail_lines = content[-max(1, int(lines)):]
-            return self._structured_tool_result("read_bg_task_log", True, summary=f"Read {len(tail_lines)} log line(s) for PID {pid}.", data={"pid": str(pid), "lines": tail_lines, "log_path": str(log_path)})
+            return self._structured_tool_result("read_bg_task_log", True, summary=f"Read {len(tail_lines)} log line(s) for PID {pid}.", data={"pid": str(pid), "lines": tail_lines, "log_path": str(log_path), "task": task})
         except Exception as e:
             return self._structured_tool_result("read_bg_task_log", False, summary="Background log read failed.", errors=[str(e)], data={"pid": str(pid), "log_path": str(log_path)})
 
@@ -6678,6 +9775,7 @@ class FlexiBot:
         if not info:
             return self._structured_tool_result("stop_bg_task", False, summary="Background task not found.", errors=[f"No background task found for PID {pid_str}."], data={"pid": pid_str, "force": bool(force)})
         try:
+            task = self._normalize_bg_task_record(pid_str, info)
             if os.name == 'nt':
                 cmd = ["taskkill", "/PID", pid_str]
                 if force:
@@ -6685,11 +9783,13 @@ class FlexiBot:
                 subprocess.run(cmd, capture_output=True, text=True, timeout=20, encoding='utf-8', errors='replace')
             else:
                 os.kill(int(pid_str), signal.SIGKILL if force else signal.SIGTERM)
-            info["status"] = "stopped"
-            info["stopped_at"] = time.time()
-            self.state.set_active_process(pid_str, info, persist=False)
+            task["status"] = "stopped"
+            task["stopped_at"] = time.time()
+            task["lifecycle_policy"]["kill"]["last_requested_force"] = bool(force)
+            task["lifecycle_policy"]["kill"]["last_stop_at"] = datetime.now().isoformat()
+            self.state.set_active_process(pid_str, task, persist=False)
             self.state.save()
-            return self._structured_tool_result("stop_bg_task", True, summary=f"Stopped background task {pid_str}.", data={"pid": pid_str, "force": bool(force), "task": info})
+            return self._structured_tool_result("stop_bg_task", True, summary=f"Stopped background task {pid_str}.", data={"pid": pid_str, "force": bool(force), "task": task})
         except Exception as e:
             return self._structured_tool_result("stop_bg_task", False, summary="Failed to stop background task.", errors=[str(e)], data={"pid": pid_str, "force": bool(force)})
 
@@ -6699,34 +9799,63 @@ class FlexiBot:
         info = active.get(pid_str)
         if not info:
             return self._structured_tool_result("restart_bg_task", False, summary="Background task not found.", errors=[f"No background task found for PID {pid_str}."], data={"pid": pid_str})
-        task_type = info.get("type")
+        task = self._normalize_bg_task_record(pid_str, info)
+        task_type = task.get("type")
+        restart_policy = task.get("lifecycle_policy", {}).get("restart", {})
+        if not restart_policy.get("supported", False):
+            return self._structured_tool_result("restart_bg_task", False, summary="Restart not supported.", errors=[f"Restart not supported for background task type '{task_type}'."], data={"pid": pid_str, "task": task})
+
+        metadata = {
+            "spawned_by": self._build_task_spawn_context(
+                source="restart_bg_task",
+                actor="agent",
+                source_id=pid_str,
+                goal=task.get("goal", {}),
+                parent=task,
+            ).get("spawned_by", {}),
+            "goal": copy.deepcopy(task.get("goal", {})),
+            "ready_condition": copy.deepcopy(task.get("ready_condition", {})),
+            "lifecycle_policy": copy.deepcopy(task.get("lifecycle_policy", {})),
+            "launch_spec": copy.deepcopy(task.get("launch_spec", {})),
+        }
+        metadata["lifecycle_policy"].setdefault("restart", {})
+        metadata["lifecycle_policy"]["restart"]["attempts"] = int(metadata["lifecycle_policy"]["restart"].get("attempts", 0) or 0) + 1
+        metadata["lifecycle_policy"]["restart"]["last_restart_at"] = datetime.now().isoformat()
+        metadata["spawned_by"]["restart_of_pid"] = pid_str
         if task_type == "shell":
             self.tool_stop_bg_task(pid_str, force=False)
-            restarted = self.tool_spawn_background(info.get("cmd", ""), timeout=30)
+            launch_spec = task.get("launch_spec", {})
+            restarted = self.tool_spawn_background(
+                task.get("cmd", ""),
+                stop_marker=str(launch_spec.get("stop_marker", "") or "") or None,
+                timeout=int(launch_spec.get("timeout_seconds", 30) or 30),
+                metadata=metadata,
+            )
             restarted_payload = self._parse_tool_result_payload(restarted) or {"raw": restarted}
             return self._structured_tool_result(
                 "restart_bg_task",
                 bool(restarted_payload.get("ok", False)),
                 summary="Restarted shell background task." if restarted_payload.get("ok", False) else "Failed to restart shell background task.",
                 errors=restarted_payload.get("errors", []),
-                data={"pid": pid_str, "previous_task": info, "restart_result": restarted_payload},
+                data={"pid": pid_str, "previous_task": task, "restart_result": restarted_payload},
             )
-        if task_type == "python_bg" and info.get("script_path"):
+        if task_type == "python_bg" and task.get("script_path"):
             try:
-                code = Path(info["script_path"]).read_text(encoding='utf-8', errors='replace')
+                code = Path(task["script_path"]).read_text(encoding='utf-8', errors='replace')
+                code = self._recover_python_bg_source(code)
             except Exception as e:
-                return self._structured_tool_result("restart_bg_task", False, summary="Failed to reload background script.", errors=[str(e)], data={"pid": pid_str, "script_path": info.get("script_path")})
+                return self._structured_tool_result("restart_bg_task", False, summary="Failed to reload background script.", errors=[str(e)], data={"pid": pid_str, "script_path": task.get("script_path")})
             self.tool_stop_bg_task(pid_str, force=False)
-            restarted = self.tool_run_python_bg(code)
+            restarted = self.tool_run_python_bg(code, metadata=metadata)
             restarted_payload = self._parse_tool_result_payload(restarted) or {"raw": restarted}
             return self._structured_tool_result(
                 "restart_bg_task",
                 bool(restarted_payload.get("ok", False)),
                 summary="Restarted python background task." if restarted_payload.get("ok", False) else "Failed to restart python background task.",
                 errors=restarted_payload.get("errors", []),
-                data={"pid": pid_str, "previous_task": info, "restart_result": restarted_payload},
+                data={"pid": pid_str, "previous_task": task, "restart_result": restarted_payload},
             )
-        return self._structured_tool_result("restart_bg_task", False, summary="Restart not supported.", errors=[f"Restart not supported for background task type '{task_type}'."], data={"pid": pid_str, "task": info})
+        return self._structured_tool_result("restart_bg_task", False, summary="Restart not supported.", errors=[f"Restart not supported for background task type '{task_type}'."], data={"pid": pid_str, "task": task})
 
     def subagent(self, task: str, work_dir: str = ".", priority: int = 2, agent_type: str = "generic") -> str:
         """Isolated subagent loop delegated to SubagentManager."""
@@ -6741,6 +9870,18 @@ class FlexiBot:
             time.sleep(1)
 
     # --- TOOL METHODS ---
+    def tool_project_memory(self):
+        payload = self._project_memory_payload()
+        return self._structured_tool_result("project_memory", True, summary="Retrieved project memory.", data=payload)
+
+    def tool_task_memory(self):
+        payload = self._task_memory_payload()
+        return self._structured_tool_result("task_memory", True, summary="Retrieved task memory.", data=payload)
+
+    def tool_failure_memory(self):
+        payload = self._failure_memory_payload()
+        return self._structured_tool_result("failure_memory", True, summary="Retrieved failure memory.", data=payload)
+
     def tool_remember(self, tag: str, content: str):
         # Legacy compat: Use KV cache as structured memory
         current = self.state.recall(tag) or []
@@ -6750,6 +9891,13 @@ class FlexiBot:
         return self._structured_tool_result("remember", True, summary=f"Stored memory under tag '{tag}'.", data={"tag": tag, "item_count": len(current)})
 
     def tool_recall(self, tag: str):
+        lowered = str(tag or "").strip().lower()
+        if lowered in {"project", "project_memory"}:
+            return self.tool_project_memory()
+        if lowered in {"task", "task_memory"}:
+            return self.tool_task_memory()
+        if lowered in {"failure", "failure_memory"}:
+            return self.tool_failure_memory()
         items = self.state.recall(tag)
         if not items:
             return self._structured_tool_result("recall", False, summary="No memory found.", errors=[f"No memory found for tag '{tag}'"], data={"tag": tag})
@@ -6758,18 +9906,19 @@ class FlexiBot:
         return self._structured_tool_result("recall", True, summary="Recalled memory value.", data={"tag": tag, "items": [str(items)]})
 
     def tool_search_memory(self, query: str):
-        # Scan kv cache directly
         results = []
+        results.extend(self._search_typed_memory(query))
         mem = self.state.memory
         for tag, items in mem.items():
-            if tag == "active_processes": continue
+            if tag in {"active_processes", PROJECT_MEMORY_KEY, TASK_MEMORY_KEY, FAILURE_MEMORY_KEY}:
+                continue
             if isinstance(items, list):
                 for item in items:
                     if query.lower() in str(item).lower():
                         results.append(f"[{tag}] {item}")
             elif query.lower() in str(items).lower():
                 results.append(f"[{tag}] {items}")
-        return self._structured_tool_result("search_memory", True, summary=f"Found {len(results)} matching memory entr{'y' if len(results) == 1 else 'ies' }.", data={"query": query, "matches": results}, warnings=[] if results else [f"No memories found matching '{query}'"])
+        return self._structured_tool_result("search_memory", True, summary=f"Found {len(results)} matching memory entr{'y' if len(results) == 1 else 'ies' }.", data={"query": query, "matches": results[:80]}, warnings=[] if results else [f"No memories found matching '{query}'"])
 
     def tool_save_skill(self, name: str, code: str):
         path = SKILLS_DIR / f"{name}.py"
@@ -6792,6 +9941,10 @@ class FlexiBot:
 
     def tool_run_tests(self, command: str = ""):
         test_command = command.strip()
+        if not test_command:
+            goal = self.current_goal()
+            if goal and goal.get("verification_target"):
+                test_command = str(goal.get("verification_target") or "").strip()
         if not test_command:
             test_candidates = list(Path(".").glob("test_*.py")) + list(Path("tests").glob("**/test*.py")) if Path("tests").exists() else list(Path(".").glob("test_*.py"))
             if not test_candidates:
@@ -6844,6 +9997,19 @@ class FlexiBot:
             result = self.run_bash(test_command)
         verification = self.verify_and_report(result, context=f"tests:{test_command}")
         self._run_reviewer_pass("tests", test_command, result, verification=verification)
+        self.state.set_runtime_value(
+            LAST_TEST_RUN_KEY,
+            {
+                "timestamp": time.time(),
+                "command": test_command,
+                "success": bool(verification.get("success", False)),
+                "summary": str(verification.get("summary", "") or "").strip(),
+                "errors": [str(item).strip() for item in verification.get("errors", []) if str(item).strip()][:10],
+                "goal": self._current_goal_reference(),
+                "result": copy.deepcopy(self._parse_tool_result_payload(result) or {"raw": str(result)[:4000]}),
+            },
+            persist=True,
+        )
         return self._structured_tool_result(
             "run_tests",
             verification.get("success", False),
@@ -7202,13 +10368,168 @@ if __name__ == "__main__":
         info = get_terminal_environment()
         return self._structured_tool_result("get_active_terminal", True, summary="Collected active terminal metadata.", data=info)
 
+    def tool_list_processes(self, filter_text: str = "", limit: int = 100):
+        """Lists running processes with a bounded result size."""
+        filter_value = str(filter_text or "").strip().lower()
+        try:
+            capped_limit = max(1, min(int(limit or 100), 200))
+        except Exception:
+            capped_limit = 100
+
+        processes = []
+        warnings = []
+        try:
+            import psutil  # type: ignore
+
+            for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+                try:
+                    info = proc.info or {}
+                except Exception:
+                    continue
+                name = str(info.get("name") or "").strip()
+                exe = str(info.get("exe") or "").strip()
+                cmdline_parts = info.get("cmdline") or []
+                cmdline = " ".join(str(part) for part in cmdline_parts if str(part or "").strip())
+                haystack = " ".join(part for part in [name, exe, cmdline] if part).lower()
+                if filter_value and filter_value not in haystack:
+                    continue
+                processes.append({
+                    "pid": int(info.get("pid") or 0),
+                    "name": name,
+                    "exe": exe,
+                    "cmdline": cmdline,
+                })
+        except Exception:
+            command = ["tasklist", "/FO", "CSV"] if os.name == "nt" else ["ps", "-eo", "pid=,comm=,args="]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            if completed.returncode != 0:
+                stderr_text = str(completed.stderr or "").strip()
+                return self._structured_tool_result(
+                    "list_processes",
+                    False,
+                    summary="Failed to list processes.",
+                    errors=[stderr_text or "Process listing command failed."],
+                    data={"filter_text": filter_text or "", "limit": capped_limit},
+                )
+            output_lines = [line.strip() for line in str(completed.stdout or "").splitlines() if line.strip()]
+            if os.name == "nt":
+                reader = csv.reader(output_lines)
+                next(reader, None)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    name = str(row[0] or "").strip()
+                    pid_text = str(row[1] or "0").strip()
+                    haystack = name.lower()
+                    if filter_value and filter_value not in haystack:
+                        continue
+                    try:
+                        pid_value = int(pid_text)
+                    except Exception:
+                        pid_value = 0
+                    processes.append({
+                        "pid": pid_value,
+                        "name": name,
+                        "exe": "",
+                        "cmdline": "",
+                    })
+            else:
+                for line in output_lines:
+                    parts = line.split(None, 2)
+                    if len(parts) < 2:
+                        continue
+                    pid_text = str(parts[0] or "0").strip()
+                    name = str(parts[1] or "").strip()
+                    cmdline = str(parts[2] or "").strip() if len(parts) > 2 else ""
+                    haystack = f"{name} {cmdline}".lower()
+                    if filter_value and filter_value not in haystack:
+                        continue
+                    try:
+                        pid_value = int(pid_text)
+                    except Exception:
+                        pid_value = 0
+                    processes.append({
+                        "pid": pid_value,
+                        "name": name,
+                        "exe": "",
+                        "cmdline": cmdline,
+                    })
+
+        total_count = len(processes)
+        if total_count > capped_limit:
+            warnings.append(f"Truncated process list to first {capped_limit} entries.")
+            processes = processes[:capped_limit]
+        return self._structured_tool_result(
+            "list_processes",
+            True,
+            summary=f"Listed {len(processes)} process(es).",
+            data={"filter_text": filter_text or "", "limit": capped_limit, "total": total_count, "processes": processes},
+            warnings=warnings,
+        )
+
+    def tool_get_software_versions(self, programs: list[str] | None = None):
+        """Collects versions for a bounded set of common developer tools."""
+        requested = programs if isinstance(programs, list) and programs else [
+            "python",
+            "py",
+            "git",
+            "node",
+            "npm",
+            "pip",
+        ]
+        results = []
+        for program in requested[:20]:
+            name = str(program or "").strip()
+            if not name:
+                continue
+            executable = shutil.which(name)
+            if not executable:
+                results.append({"program": name, "found": False, "version": "", "path": ""})
+                continue
+            version_text = ""
+            for args in ([name, "--version"], [name, "-V"]):
+                try:
+                    completed = subprocess.run(
+                        args,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=10,
+                    )
+                except Exception:
+                    continue
+                output = str(completed.stdout or completed.stderr or "").strip()
+                if completed.returncode == 0 and output:
+                    version_text = output.splitlines()[0].strip()
+                    break
+            results.append({
+                "program": name,
+                "found": True,
+                "version": version_text,
+                "path": executable,
+            })
+        return self._structured_tool_result(
+            "get_software_versions",
+            True,
+            summary=f"Collected version info for {len(results)} program(s).",
+            data={"programs": results},
+        )
+
     def tool_find_consuming_port(self, port: int):
         """Finds which PID is holding a port and returns details."""
         result = SystemAutomation.find_consuming_port(port)
         return self._structured_tool_result("find_consuming_port", "error" not in str(result).lower() and "no process found" not in str(result).lower(), summary=f"Port inspection for {port} completed.", errors=[] if "error" not in str(result).lower() else [str(result)], data={"port": int(port), "result": str(result)}, warnings=[str(result)] if "no process found" in str(result).lower() else [])
 
     @ErrorHandler.handle(severity=ErrorSeverity.CRITICAL, code=ErrorCode.EXEC_ERROR)
-    def tool_spawn_background(self, cmd: str, stop_marker: str = None, timeout: int = 30):
+    def tool_spawn_background(self, cmd: str, stop_marker: str = None, timeout: int = 30, metadata: dict[str, Any] | None = None):
         """Spawns a background process and waits for a stop_marker (blocking) or just returns PID.
         Registers the process in state for persistence."""
         print(f"\n[System]: Spawning background process: {cmd}")
@@ -7239,17 +10560,41 @@ if __name__ == "__main__":
                 **self.execution_policy.subprocess_kwargs(decision),
             )
             log_path = self._bg_task_log_path(p.pid)
-            
-            # Register in state
             pid_str = str(p.pid)
-            self.state.set_active_process(pid_str, {
+            spawn_meta = metadata or {}
+            default_context = self._build_task_spawn_context(source="spawn_background", actor="agent", source_id=str(p.pid))
+            task_record = {
+                "pid": pid_str,
                 "cmd": cmd,
                 "start_time": time.time(),
                 "type": "shell",
                 "status": "running",
                 "log_path": str(log_path),
+                "expected_log_path": str(spawn_meta.get("expected_log_path") or log_path),
                 "working_directory": decision.isolation_rules.get("working_directory", "."),
-            }, persist=False)
+                "spawned_by": copy.deepcopy(spawn_meta.get("spawned_by") or default_context.get("spawned_by", {})),
+                "goal": copy.deepcopy(spawn_meta.get("goal") or default_context.get("goal", {})),
+                "ready_condition": copy.deepcopy(
+                    spawn_meta.get("ready_condition")
+                    or self._default_ready_condition(marker=stop_marker or "", timeout_seconds=decision.timeout_seconds)
+                ),
+                "lifecycle_policy": copy.deepcopy(
+                    spawn_meta.get("lifecycle_policy")
+                    or self._default_task_lifecycle_policy(restart_supported=True)
+                ),
+                "launch_spec": copy.deepcopy(
+                    spawn_meta.get("launch_spec")
+                    or {
+                        "tool": "spawn_background",
+                        "cmd": cmd,
+                        "timeout_seconds": decision.timeout_seconds,
+                        "stop_marker": stop_marker or "",
+                    }
+                ),
+            }
+            
+            # Register in state
+            self.state.set_active_process(pid_str, task_record, persist=False)
             self.state.save()
             
             if not stop_marker:
@@ -7276,7 +10621,8 @@ if __name__ == "__main__":
                     except Exception as e:
                         ErrorHandler.log(e, severity=ErrorSeverity.RECOVERABLE, context="tool_spawn_background.drain", code=ErrorCode.IO_ERROR)
                 threading.Thread(target=drain, args=(p,), daemon=True).start()
-                return self._structured_tool_result("spawn_background", True, summary=msg, data={"pid": p.pid, "cmd": cmd, "status": "running", "log_path": str(log_path), "stop_marker": stop_marker})
+                task_record = self._normalize_bg_task_record(pid_str, self.state.active_processes.get(pid_str))
+                return self._structured_tool_result("spawn_background", True, summary=msg, data={"pid": p.pid, "cmd": cmd, "status": "running", "log_path": str(log_path), "stop_marker": stop_marker, "task": task_record})
             
             # Non-blocking wait logic (Polled for the timeout duration)
             start_time = time.time()
@@ -7293,6 +10639,11 @@ if __name__ == "__main__":
                         msg = f"Process reached stop marker '{stop_marker}'."
                         self.tool_remember("processes", f"Spawned '{cmd}' - Ready seen at {time.ctime()}")
                         self.state.log_event("system", f"Background process '{cmd}' reached marker '{stop_marker}'.")
+                        task_record = self._normalize_bg_task_record(pid_str, self.state.active_processes.get(pid_str))
+                        task_record["ready_condition"]["status"] = "observed"
+                        task_record["ready_condition"]["observed_at"] = datetime.now().isoformat()
+                        self.state.set_active_process(pid_str, task_record, persist=False)
+                        self.state.save()
                         result = self.execution_policy.trim_output(decision, "Success: Process reached marker. Last few lines:\n" + "\n".join(captured[-5:]))
                         self.execution_policy.audit(
                             decision,
@@ -7303,9 +10654,13 @@ if __name__ == "__main__":
                             duration_ms=int((time.time() - start_time) * 1000),
                             extra={"pid": p.pid, "stop_marker": stop_marker, "log_path": str(log_path)},
                         )
-                        return self._structured_tool_result("spawn_background", True, summary=msg, data={"pid": p.pid, "cmd": cmd, "status": "running", "stop_marker": stop_marker, "log_path": str(log_path), "output": result})
+                        return self._structured_tool_result("spawn_background", True, summary=msg, data={"pid": p.pid, "cmd": cmd, "status": "running", "stop_marker": stop_marker, "log_path": str(log_path), "output": result, "task": task_record})
             
             result = f"Started background process (PID {p.pid}), but marker '{stop_marker}' was not seen in {decision.timeout_seconds}s. It continues to run."
+            task_record = self._normalize_bg_task_record(pid_str, self.state.active_processes.get(pid_str))
+            task_record["ready_condition"]["status"] = "timeout"
+            self.state.set_active_process(pid_str, task_record, persist=False)
+            self.state.save()
             self.execution_policy.audit(
                 decision,
                 action="finish",
@@ -7315,7 +10670,7 @@ if __name__ == "__main__":
                 duration_ms=int((time.time() - start_time) * 1000),
                 extra={"pid": p.pid, "stop_marker": stop_marker, "log_path": str(log_path)},
             )
-            return self._structured_tool_result("spawn_background", True, summary="Background process started without observing stop marker.", data={"pid": p.pid, "cmd": cmd, "status": "running", "stop_marker": stop_marker, "log_path": str(log_path), "output": result})
+            return self._structured_tool_result("spawn_background", True, summary="Background process started without observing stop marker.", data={"pid": p.pid, "cmd": cmd, "status": "running", "stop_marker": stop_marker, "log_path": str(log_path), "output": result, "task": task_record})
         except Exception as e:
             self.execution_policy.audit(
                 decision,
@@ -7329,7 +10684,7 @@ if __name__ == "__main__":
             return self._structured_tool_result("spawn_background", False, summary="Background spawn failed.", errors=[str(e)], data={"cmd": cmd, "stop_marker": stop_marker, "log_path": str(log_path)})
 
     @ErrorHandler.handle(severity=ErrorSeverity.CRITICAL, code=ErrorCode.EXEC_ERROR)
-    def tool_run_python_bg(self, code: str):
+    def tool_run_python_bg(self, code: str, metadata: dict[str, Any] | None = None):
         """Writes Python code to a temp file and runs it in a detached background process.
         Returns the PID. This is safer for unstable scripts."""
         decision = self.execution_policy.evaluate(
@@ -7350,7 +10705,7 @@ if __name__ == "__main__":
             script_path = task_dir / f"task_{ts}.py"
             
             # Add some preamble imports to help standalone scripts
-            safe_code = "import sys, os, time\ntry:\n    import flexi\nexcept Exception:\n    pass\n\n" + code
+            safe_code = self._python_bg_preamble() + code
             script_path.write_text(safe_code, encoding="utf-8")
             
             # Launch
@@ -7367,17 +10722,43 @@ if __name__ == "__main__":
                 **self.execution_policy.subprocess_kwargs(decision),
             ) 
             log_path = self._bg_task_log_path(p.pid)
-            
-            # Register
-            self.state.set_active_process(str(p.pid), {
+            spawn_meta = metadata or {}
+            default_context = self._build_task_spawn_context(source="run_python_bg", actor="agent", source_id=str(p.pid))
+            task_record = {
+                "pid": str(p.pid),
                 "cmd": f"python {script_path.name}",
                 "start_time": time.time(),
                 "type": "python_bg",
                 "script_path": str(script_path),
                 "status": "running",
                 "log_path": str(log_path),
+                "expected_log_path": str(spawn_meta.get("expected_log_path") or log_path),
                 "working_directory": decision.isolation_rules.get("working_directory", "."),
-            }, persist=False)
+                "spawned_by": copy.deepcopy(spawn_meta.get("spawned_by") or default_context.get("spawned_by", {})),
+                "goal": copy.deepcopy(spawn_meta.get("goal") or default_context.get("goal", {})),
+                "ready_condition": copy.deepcopy(
+                    spawn_meta.get("ready_condition")
+                    or self._default_ready_condition(marker="", timeout_seconds=0)
+                ),
+                "lifecycle_policy": copy.deepcopy(
+                    spawn_meta.get("lifecycle_policy")
+                    or self._default_task_lifecycle_policy(restart_supported=True)
+                ),
+                "launch_spec": copy.deepcopy(
+                    spawn_meta.get("launch_spec")
+                    or {
+                        "tool": "run_python_bg",
+                        "cmd": cmd,
+                        "script_path": str(script_path),
+                        "timeout_seconds": decision.timeout_seconds,
+                        "stop_marker": "",
+                        "code_sha256": hashlib.sha256(code.encode("utf-8")).hexdigest()[:16],
+                    }
+                ),
+            }
+            
+            # Register
+            self.state.set_active_process(str(p.pid), task_record, persist=False)
             self.state.save()
             def drain(proc):
                 try:
@@ -7401,7 +10782,8 @@ if __name__ == "__main__":
                 duration_ms=int((time.time() - start_time) * 1000),
                 extra={"pid": p.pid, "script_path": str(script_path), "log_path": str(log_path)},
             )
-            return self._structured_tool_result("run_python_bg", True, summary=result, data={"pid": p.pid, "script_path": str(script_path), "status": "running", "log_path": str(log_path)})
+            task_record = self._normalize_bg_task_record(str(p.pid), self.state.active_processes.get(str(p.pid)))
+            return self._structured_tool_result("run_python_bg", True, summary=result, data={"pid": p.pid, "script_path": str(script_path), "status": "running", "log_path": str(log_path), "task": task_record})
         except Exception as e:
             self.execution_policy.audit(
                 decision,
@@ -7426,12 +10808,15 @@ if __name__ == "__main__":
             import psutil
             for pid_str, info in active.items():
                 pid = int(pid_str)
+                task = self._normalize_bg_task_record(pid_str, info)
                 try:
                     proc = psutil.Process(pid)
                     status = proc.status()
-                    report.append({"pid": pid, "type": info.get("type"), "status": f"running:{status}", "cmd": info.get("cmd"), "log_path": info.get("log_path")})
+                    task["status"] = f"running:{status}"
+                    report.append(task)
                 except psutil.NoSuchProcess:
-                    report.append({"pid": pid, "type": info.get("type"), "status": "finished", "cmd": info.get("cmd"), "log_path": info.get("log_path")})
+                    task["status"] = "finished"
+                    report.append(task)
                     to_remove.append(pid_str)
         except ImportError:
             return self._structured_tool_result("check_bg_tasks", False, summary="Cannot check background tasks.", errors=["psutil missing. Cannot check PIDs."])
@@ -7489,10 +10874,13 @@ if __name__ == "__main__":
 
     @ErrorHandler.handle(severity=ErrorSeverity.CRITICAL, code=ErrorCode.EXEC_ERROR)
     def run_python(self, code: str) -> str:
+        self._note_tool_start("python", code, persist=True)
         decision = self.execution_policy.evaluate("python", code, requested_timeout=self.PYTHON_EXEC_TIMEOUT)
         if not decision.allowed:
             self.execution_policy.audit(decision, action="deny", status="blocked", payload=code)
-            return self._structured_tool_result("python", False, summary="Execution blocked.", errors=[decision.reason], data={"code": code[:2000]})
+            result = self._structured_tool_result("python", False, summary="Execution blocked.", errors=[decision.reason], data={"code": code[:2000]})
+            self._note_tool_result("python", result, persist=True)
+            return result
 
         try:
             self._run_tool_hook('pre', 'python', code)
@@ -7533,6 +10921,7 @@ if __name__ == "__main__":
                 offset=err.offset,
                 message=err.msg,
             )
+            self._note_tool_result("python", result, persist=True)
             return result
 
         def _execute():
@@ -7552,7 +10941,7 @@ if __name__ == "__main__":
                     except EOFError:
                         return self._structured_tool_result("python", False, summary="Execution blocked.", errors=["Execution blocked (No Input)."], data={"code": orig_code[:2000]})
                     
-                    if choice == RestartPolicy.ALWAYS:
+                    if choice == "always":
                         self.state.set_runtime_value("safety_always_allow", True)
                         self.state.save()
                         print(f"{Colors.GREEN}Always-allow enabled for this session.{Colors.ENDC}")
@@ -7563,6 +10952,14 @@ if __name__ == "__main__":
                 current_globals = self.state.globals.copy()
             
             stdout_buf = io.StringIO()
+            max_output_chars = int(decision.resource_ceilings.get("max_output_chars", 12000))
+            print_max_chars_per_call = int(decision.resource_ceilings.get("print_max_chars_per_call", 3000))
+            inspect_max_depth = int(decision.resource_ceilings.get("inspect_max_depth", 2))
+            inspect_max_items = int(decision.resource_ceilings.get("inspect_max_items", 20))
+            inspect_max_fields = int(decision.resource_ceilings.get("inspect_max_fields", 24))
+            inspect_max_string_chars = int(decision.resource_ceilings.get("inspect_max_string_chars", 240))
+            inspect_file_chunk_lines = int(decision.resource_ceilings.get("inspect_file_chunk_lines", 120))
+            output_truncated = False
             
             def _bridge_subagent(task, priority=2, agent_type="generic"):
                 return self.subagent(task, priority=priority, agent_type=agent_type)
@@ -7572,13 +10969,63 @@ if __name__ == "__main__":
 
             def _load_skill_shim(name): return self.tool_load_skill(name, env)
 
+            def _render_print_arg(value):
+                if isinstance(value, str):
+                    return _rlm_limit_text(value, max_chars=print_max_chars_per_call)
+                rendered = _rlm_safe_preview_data(
+                    value,
+                    max_depth=inspect_max_depth,
+                    max_items=inspect_max_items,
+                    max_fields=inspect_max_fields,
+                    max_string_chars=inspect_max_string_chars,
+                )
+                return _rlm_limit_text(json.dumps(rendered, ensure_ascii=False, default=str, indent=2), max_chars=print_max_chars_per_call)
+
+            def safe_inspect(target=None, *, label="", start_line=1, chunk_lines=None, prefer_file_reads=True):
+                return rlm_safe_inspect(
+                    target,
+                    label=label,
+                    start_line=start_line,
+                    chunk_lines=chunk_lines or inspect_file_chunk_lines,
+                    max_depth=inspect_max_depth,
+                    max_items=inspect_max_items,
+                    max_fields=inspect_max_fields,
+                    max_string_chars=inspect_max_string_chars,
+                    prefer_file_reads=prefer_file_reads,
+                    max_chars=max_output_chars,
+                )
+
+            def inspect_file_chunk(path, start_line=1, chunk_lines=None):
+                return rlm_inspect_file_chunk(
+                    path,
+                    start_line=start_line,
+                    chunk_lines=chunk_lines or inspect_file_chunk_lines,
+                    max_chars=max_output_chars,
+                )
+
             def guarded_print(*args, **kwargs):
+                nonlocal output_truncated
                 if "file" in kwargs: builtins.print(*args, **kwargs); return
                 sep = kwargs.get('sep', ' '); end = kwargs.get('end', '\n')
-                stdout_buf.write(sep.join(map(str, args)) + end)
+                chunk = sep.join(_render_print_arg(arg) for arg in args) + end
+                remaining = max_output_chars - stdout_buf.tell()
+                if remaining <= 0:
+                    if not output_truncated:
+                        stdout_buf.write("\n... [PYTHON PRINT OUTPUT TRUNCATED] ...\n")
+                        output_truncated = True
+                    return
+                if len(chunk) <= remaining:
+                    stdout_buf.write(chunk)
+                    return
+                stdout_buf.write(chunk[:remaining])
+                if not output_truncated:
+                    stdout_buf.write("\n... [PYTHON PRINT OUTPUT TRUNCATED] ...\n")
+                    output_truncated = True
 
             env = {
                 "print": guarded_print,
+                "safe_inspect": safe_inspect,
+                "inspect_file_chunk": inspect_file_chunk,
                 **current_globals,
                 "memory": self.state.memory,
                 "remember": self.tool_remember,
@@ -7599,8 +11046,8 @@ if __name__ == "__main__":
                 "capture_window_advanced": self.tool_capture_window_advanced,
                 "list_windows_advanced": self.tool_list_windows_advanced,
                 "get_active_terminal": self.tool_get_active_terminal,
-                "list_processes": self.tool_list_processes,
-                "get_software_versions": self.tool_get_software_versions,
+                "list_processes": getattr(self, "tool_list_processes", lambda *args, **kwargs: self._structured_tool_result("list_processes", False, summary="Process listing tool is unavailable.", errors=["tool_list_processes is not available."], data={"args": list(args), "kwargs": kwargs})),
+                "get_software_versions": getattr(self, "tool_get_software_versions", lambda *args, **kwargs: self._structured_tool_result("get_software_versions", False, summary="Software version tool is unavailable.", errors=["tool_get_software_versions is not available."], data={"args": list(args), "kwargs": kwargs})),
                 "spawn_background": self.tool_spawn_background,
                 "spawn_bg": self.tool_spawn_background,
                 "run_python_bg": self.tool_run_python_bg,
@@ -7615,11 +11062,11 @@ if __name__ == "__main__":
                 "validate_json": self.tool_validate_json,
                 "validate_python_snippet": self.tool_validate_python_snippet,
                 "run_tests": self.tool_run_tests,
-                "inspect_python_environment": self.tool_inspect_python_environment,
-                "list_python_packages": self.tool_list_python_packages,
+                "inspect_python_environment": getattr(self, "tool_inspect_python_environment", lambda *args, **kwargs: self._structured_tool_result("inspect_python_environment", False, summary="Python environment inspection tool is unavailable.", errors=["tool_inspect_python_environment is not available."], data={"args": list(args), "kwargs": kwargs})),
+                "list_python_packages": getattr(self, "tool_list_python_packages", lambda *args, **kwargs: self._structured_tool_result("list_python_packages", False, summary="Python package listing tool is unavailable.", errors=["tool_list_python_packages is not available."], data={"args": list(args), "kwargs": kwargs})),
                 "install_python_package": self.tool_install_python_package,
-                "python_symbol_doc": self.tool_python_symbol_doc,
-                "python_import_graph": self.tool_python_import_graph,
+                "python_symbol_doc": getattr(self, "tool_python_symbol_doc", lambda *args, **kwargs: self._structured_tool_result("python_symbol_doc", False, summary="Python symbol documentation tool is unavailable.", errors=["tool_python_symbol_doc is not available."], data={"args": list(args), "kwargs": kwargs})),
+                "python_import_graph": getattr(self, "tool_python_import_graph", lambda *args, **kwargs: self._structured_tool_result("python_import_graph", False, summary="Python import graph tool is unavailable.", errors=["tool_python_import_graph is not available."], data={"args": list(args), "kwargs": kwargs})),
                 "python_refactor_symbol": self.tool_python_refactor_symbol,
                 "cleanup_unused_imports": self.tool_python_cleanup_unused_imports,
                 "python_type_assist": self.tool_python_type_annotation_assist,
@@ -7655,6 +11102,8 @@ if __name__ == "__main__":
             "search_workspace": rlm_search_workspace,
             "find_symbol": rlm_find_symbol,
             "peek": rlm_peek,
+            "safe_inspect_raw": rlm_safe_inspect,
+            "inspect_file_chunk_raw": rlm_inspect_file_chunk,
             "read_file": rlm_read,
             "read_range": rlm_read_range,
             "write": rlm_write,
@@ -7795,6 +11244,7 @@ if __name__ == "__main__":
                 return self._structured_tool_result("python", False, summary="Python execution failed.", errors=[str(e)], data={"code": raw_code[:2000]})
 
         result = self._run_tool_with_wrapper('python', code, _execute_core)
+        self._note_tool_result("python", result, persist=True)
         self.execution_policy.audit(
             decision,
             action="finish",
@@ -7815,17 +11265,23 @@ if __name__ == "__main__":
         summary_text = self.state.compressed_summary
         summary_block = f"\nTECHNICAL BACKGROUND (SUMMARY): {summary_text}" if summary_text else ""
         active_goals = self.active_goals()
+        current_goal = self.current_goal()
+        current_goal_block = self._render_current_goal_focus(current_goal)
         goal_block = ""
         if active_goals:
-            goal_lines = [f"   - [{goal.get('id')}] priority={goal.get('priority')} status={goal.get('status')} text={goal.get('text')}" for goal in active_goals[:8]]
+            goal_lines = [
+                f"   - [{goal.get('id')}] priority={goal.get('priority')} status={goal.get('status')} "
+                f"next_action={goal.get('next_action')} text={goal.get('text')}"
+                for goal in active_goals[:8]
+            ]
             goal_block = "\nACTIVE GOALS:\n" + "\n".join(goal_lines)
-        
-        # System Info Injection
+
         sys_info = f"OS: {os.name} | Platform: {sys.platform}"
-        if os.name == 'nt': sys_info += " (Windows)"
-        else: sys_info += " (Linux/Unix)"
-        
-        # Environmental Context
+        if os.name == 'nt':
+            sys_info += " (Windows)"
+        else:
+            sys_info += " (Linux/Unix)"
+
         cwd = os.getcwd()
         py_path = sys.executable
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -7833,25 +11289,23 @@ if __name__ == "__main__":
             user = os.getlogin()
         except Exception:
             user = os.environ.get("USER", "unknown")
-        
+
         env_context = (f"   - **Environment**: CWD='{cwd}' | User='{user}' | Time='{timestamp}'\n"
                        f"   - **Runtime**: Python='{py_path}'")
 
-        # Memory Intelligence
-        mem = self.state.structured_memory
-        
-        available_agents = ", ".join(self.subagent_manager.agent_registry.keys())
-        
-        mem_keys = list(mem.keys())
-        mem_hint = ""
-        if mem_keys:
-            mem_hint = f"\n   - **🧠 Known Memory Tags**: {', '.join(mem_keys)} (Use `recall(tag)` to read)"
-            for key in ["user", "user_profile", "name", "identity"]:
-                if key in mem:
-                    info = "; ".join(mem[key])
-                    mem_hint += f"\n   - **Active Context ({key})**: {info[:300]}"
+        try:
+            self._refresh_project_memory(persist=True)
+            project_brief = self._refresh_project_brief(persist=True)
+            task_graph = self._refresh_task_graph(persist=False)
+        except Exception:
+            project_brief = self.state.project_brief() if hasattr(self.state, "project_brief") else ProjectBrief()
+            task_graph = self.state.task_graph() if hasattr(self.state, "task_graph") else TaskGraph()
+        memory_block = self._render_memory_context()
+        project_brief_block = self._render_project_brief_block(project_brief)
+        task_graph_block = self._render_task_graph_block(task_graph)
 
-        # Tool Documentation
+        available_agents = ", ".join(self.subagent_manager.agent_registry.keys())
+
         tools_doc = (
             "   - **Terminal**: Use <bash>cmd</bash> for shell commands.\n"
             "   - **Code Engine**: Use <python>code</python> for script logic.\n"
@@ -7859,15 +11313,16 @@ if __name__ == "__main__":
             "   - **Windows/Env**: `list_windows_advanced()`, `list_processes()`, `get_software_versions()`, `find_port(port)`.\n"
             "   - **Background**: `spawn_bg(cmd)`, `run_python_bg(code)`, `check_bg_tasks()`, `get_bg_task_details(pid='')`, `read_bg_task_log(pid)`, `stop_bg_task(pid)`, `restart_bg_task(pid)`.\n"
             "   - **Environment**: `inspect_python_environment()`, `list_python_packages()`, `install_python_package(name, upgrade=False)`, `get_software_versions()`.\n"
-            "   - **Python Language**: `python_symbol_doc(name, filepath='', root='.')`, `python_import_graph(filepath, root='.')`, `validate_python_snippet(code, mode='exec')`, `python_refactor_symbol(filepath, old_name, new_name, apply=False)`, `cleanup_unused_imports(filepath, apply=False)`, `python_type_assist(filepath)`.\n"
+            "   - **Python Language**: `python_symbol_doc(name, filepath='', root='.')`, `python_import_graph(filepath, root='.')`, `validate_python_snippet(code, mode='exec')`, `python_refactor_symbol(filepath, old_name, new_name, apply=False)`, `cleanup_unused_imports(filepath, apply=False)`, `python_type_assist(filepath)`, `safe_inspect(obj, label='', start_line=1, chunk_lines=120)`.\n"
             "   - **Git/Project**: `git_changed_files(repo='.')`, `git_diff_analysis(repo='.', src='HEAD', dst='')`, `git_commit_message_draft(repo='.')`, `git_blame_context(file, line, repo='.')`, `git_review_summary(repo='.')`, `git_diff(repo, src, dst)`, `git_summary(repo)`, `map_deps(path)`, `project_map(root)`, `project_map_tool(root='.')`, `project_relationships(root='.')`.\n"
             "   - **Notebook**: `notebook_summary(path)`, `notebook_edit_cell(path, index, source='', cell_type='code', operation='replace')`, `notebook_run(path, cell_index=None, persist_output=True)`, `notebook_kernel_info(path)`, `notebook_session_status(path)`, `notebook_clear_session(path)`, `notebook_install_package(path, package, upgrade=False)`.\n"
             "   - **Database**: `db_save_profile(name, database_path, kind='sqlite')`, `db_list_profiles()`, `db_schema(profile_name='', database_path='')`, `db_query(query, profile_name='', database_path='')`, `db_migration_status(root='.')`.\n"
             "   - **Web/Docs**: `fetch_webpage(url)`, `extract_web_structure(url)`, `extract_doc_section(url, query)`, `summarize_web_reference(url)`, `research_web(query, urls=None)`.\n"
             "   - **Utility**: `to_clip(text)`, `from_clip()`.\n"
-            "   - **State**: Variables persist; `remember(tag, txt)`, `recall(tag)`, `search_memory(query)`.\n"
+            "   - **State**: Variables persist; `remember(tag, txt)`, `recall(tag)`, `search_memory(query)`, `project_memory()`, `task_memory()`, `failure_memory()`.\n"
             "   - **Search**: `search_workspace(query, root='.', pattern='*')`, `find_symbol(name, root='.', pattern='*.py')`, `find_references(name, root='.', patterns='')`, `find_implementations(name, root='.', patterns='')`, `preview_symbol_rename(old, new, root='.', patterns='')`, `grep(pattern, file)`, `find_files(glob)`, `tree(root)`.\n"
-            "   - **Filesystem**: `read_file(path)`, `read_range(path, start, end)`, `write(path, content)`, `create_file(path, content, overwrite=False)`, `move_file(src, dst)`, `delete_file(path)`, `patch(path, old, new)`, `edit_lines(path, s, e, txt)`, `peek(file)`.\n"
+            "   - **Filesystem**: `read_file(path)`, `read_range(path, start, end)`, `write(path, content)`, `create_file(path, content, overwrite=False)`, `move_file(src, dst)`, `delete_file(path)`, `patch(path, old, new)`, `edit_lines(path, s, e, txt)`, `peek(file)`, `inspect_file_chunk(path, start_line=1, chunk_lines=120)`.\n"
+            "   - **Inspection Guidance**: For inspection, prefer `safe_inspect(...)`, `inspect_file_chunk(...)`, `read_range(...)`, or `peek(...)` over printing giant module dumps, large JSON blobs, or full file contents in one turn.\n"
             "   - **Validation**: `validate_python(filepath='', code='')`, `validate_python_snippet(code, mode='exec')`, `validate_json(filepath='', content='')`, `run_tests(command='')`, `verify_work(script_path)`.\n"
             "   - **Recursion**: `subagent(task, agent_type='generic')` spawns a bot. Types: [" + available_agents + "].\n"
             "   - **Background**: `batch_implement(proposal_file)` runs tasks in `subies/`; `check_subagents()` to monitor progress."
@@ -7882,19 +11337,23 @@ if __name__ == "__main__":
 
         return (f"You are FlexiBot, a recursive automation agent.\n"
                 f"SYSTEM INFO: {sys_info}.\n"
-                f"{env_context}\n\n"
+                f"{env_context}{project_brief_block}{task_graph_block}{current_goal_block}\n\n"
                 f"AVAILABLE TOOLS (Access via <python>): \n{tools_doc}\n\n"
-            f"DECLARED SKILLS:{skill_capability_block}\n"
+                f"DECLARED SKILLS:{skill_capability_block}\n"
                 f"INSTRUCTIONS:\n"
                 f"1. Use <plan> to outline steps.\n"
                 f"2. Use <bash> or <python> for execution.\n"
+                f"2a. Stay anchored to the CURRENT EXECUTION TARGET. Execute its next action before taking side work unless the user explicitly changes priorities.\n"
                 f"3. **STRICT**: Only use these control tags: <plan>, <bash>, <python>, <ack_observation>, and <consensus>. To run functions, use <python>tool_name()</python>.\n"
                 f"4. **LOCKING**: If the system says 'Awaiting Acknowledgement', you MUST output <ack_observation> to unlock the turn.\n"
                 f"5. **VALIDATION**: If you write code, you MUST wait for turn output before calling <consensus>.\n"
                 f"6. **INTERACTION**: To ask the user a question or present a menu, use <consensus>Question text...</consensus>. DO NOT print menus with <python> and wait.\n"
                 f"7. **FINALITY**: Use <consensus>final response</consensus> ONLY when the task is complete.\n"
                 f"8. **DIRECT ANSWERS**: If the user asks for simple factual information already present in SYSTEM INFO or Environment, answer directly with <consensus> and do not call tools.\n"
-            f"{goal_block}{summary_block}{mem_hint}{skill_prompt_block}")
+                f"9. **FOLLOW-UPS**: After a successful task, end with a concise result. Do NOT append A/B/C menus or next-step option lists unless you are blocked, the request is ambiguous, or the user explicitly asks for choices.\n"
+                f"10. **ACTION TURNS**: If you use <bash> or <python>, do the inspection and action only. The runtime will verify and finalize from the actual tool output, so do not add speculative success text or option menus after tool calls.\n"
+                f"11. **AUTO-CONTINUE**: After tool output, the runtime may continue internally. If the task is not complete, keep working on the next turn. Use <consensus> only when the task is complete or when you need user input.\n"
+                f"{goal_block}{summary_block}{memory_block}{skill_prompt_block}")
 
     def handle_turn(self, user_input: str):
         # convenience getters for skills/prompts
@@ -7914,6 +11373,17 @@ if __name__ == "__main__":
             self.state.log_event("user", user_input)
             # also record the user prompt in the evolution log with metadata
             self.logger.log_user(user_input)
+            request_signature = self._progress_request_signature(user_input)
+            self.current_request_context = {
+                "user_input": user_input,
+                "request_signature": request_signature,
+                "turn_counter": self.turn_counter,
+            }
+            if request_signature and request_signature != "__continue__" and request_signature != self.last_progress_request_signature:
+                self.low_progress_turns = 0
+                self.last_progress_evaluation = {}
+            if request_signature and request_signature != "__continue__":
+                self.last_progress_request_signature = request_signature
             # trigger any hooks for incoming user text
             try:
                 self.on_user_input(user_input)
@@ -7938,6 +11408,7 @@ if __name__ == "__main__":
                 # increment global turn counter so each log entry gets a unique number
                 self.turn_counter += 1
                 turn_num = self.turn_counter
+                self.current_request_context["turn_counter"] = turn_num
                 turn_start = time.time()
                 try:
                     turn_start_data = self.state.export_state()
@@ -7980,6 +11451,7 @@ if __name__ == "__main__":
                     py = re.findall(r"<python>(.*?)</python>", resp, re.S)
                     plan = re.findall(r"<plan>(.*?)</plan>", resp, re.S)
                     ack = "<ack_observation>" in resp
+                    pending_consensus = self._extract_consensus_text(resp) if "<consensus>" in resp else ""
                     normalized_bash = [self._normalize_tool_payload(item) for item in bash]
                     normalized_py = [self._normalize_tool_payload(item) for item in py]
                     self._append_response_trace(
@@ -8007,16 +11479,25 @@ if __name__ == "__main__":
                             continue
 
                         if has_tools:
-                            # Agent tried to act and conclude simultaneously
-                            print(f"{Colors.RED}⚠️ Mixed Consensus and Action detected. Prioritizing Action.{Colors.ENDC}")
-                            obs_prefix = "System Warning: You provided <consensus> but also used tools. The consensus was IGNORED. You must wait for the tool output before finalizing.\n"
+                            print(f"{Colors.YELLOW}⚠️ Mixed Consensus and Action detected. Attempting to salvage final answer after tool execution.{Colors.ENDC}")
+                            obs_prefix = "System Notice: You provided <consensus> with tools. The consensus will be accepted if the tool results succeed.\n"
                         else:
                             # Valid pure consensus
-                            draft = re.search(r"<consensus>(.*?)</consensus>", resp, re.S).group(1).strip()
+                            draft = pending_consensus
+                            draft, trimmed_menu = self._trim_menu_heavy_followup(draft, user_input)
+                            if trimmed_menu:
+                                self._append_response_trace(
+                                    "consensus_trimmed",
+                                    original=resp,
+                                    trimmed=draft,
+                                    user_input=user_input,
+                                )
                             self.state.log_event("assistant", draft)
                             # log consensus turn with metadata
                             dur = time.time() - turn_start
                             meta = ["consensus"]
+                            if trimmed_menu:
+                                meta.append("trimmed_menu")
                             # no tools used for pure consensus
                             self.logger.log_turn(turn_num, resp, self.state.calculate_diff(turn_start_data, self.state.data), ["consensus"], duration=dur, meta=meta)
                             # Final response should not include the user label prefix
@@ -8024,8 +11505,11 @@ if __name__ == "__main__":
                     else:
                         obs_prefix = ""
 
+                    progress_baseline = self._capture_turn_progress_baseline() if has_tools else None
+
                     # 4. Execute Tools
                     obs = ""
+                    tool_results: list[str] = []
                     for p in plan: 
                         print(f"{Colors.BLUE}📋 Plan:{Colors.ENDC} {p}")
                         obs += f"Plan: {p}\n" 
@@ -8033,8 +11517,11 @@ if __name__ == "__main__":
                     for b in bash: 
                         print(f"{Colors.CYAN}💻 Bash:{Colors.ENDC} {b}")
                         res = self.run_bash(b)
-                        print(f"{Colors.DIM}  -> Tool exit OK.{Colors.ENDC}")
+                        tool_results.append(res)
+                        bash_failed = self._report_tool_execution_status(res)
                         obs += f"Bash: {res}\n"
+                        if bash_failed:
+                            obs += "\nSYSTEM ALERT: ⚠️ A bash tool error occurred. Inspect the result before continuing.\n"
                         try:
                             self.on_tool_output("bash", res)
                         except Exception:
@@ -8043,10 +11530,10 @@ if __name__ == "__main__":
                     for p in py:
                         print(f"{Colors.GREEN}🐍 Python:{Colors.ENDC} {p}")
                         out = self.run_python(p)
-                        print(f"{Colors.DIM}  -> Tool exit OK.{Colors.ENDC}")
+                        tool_results.append(out)
+                        python_failed = self._report_tool_execution_status(out)
                         obs += f"Python: {out}\n"
-                        if self._tool_result_failed(out):
-                            print(f"{Colors.RED}❌ Tool Error detected.{Colors.ENDC}")
+                        if python_failed:
                             obs += "\nSYSTEM ALERT: ⚠️ An error occurred. Analyze and FIX the code.\n"
                         try:
                             self.on_tool_output("python", out)
@@ -8100,6 +11587,107 @@ if __name__ == "__main__":
                     else:
                         self.last_observation = obs
                         self.state.log_event("system", f"Observation: {obs}")
+
+                    if bash or py:
+                        finalized, finalize_meta = self._finalize_action_turn(resp, user_input, tool_results)
+                        progress_eval = self._evaluate_turn_progress(progress_baseline or {}, finalize_meta, tool_results)
+                        if progress_eval.get("low_progress"):
+                            self.low_progress_turns += 1
+                        else:
+                            self.low_progress_turns = 0
+                        progress_eval["consecutive_low_progress"] = self.low_progress_turns
+                        self.last_progress_evaluation = progress_eval
+
+                        finalize_meta = dict(finalize_meta)
+                        finalize_meta["strategy_shift"] = False
+                        if progress_eval.get("low_progress") and self.low_progress_turns >= 2:
+                            finalized = self._low_progress_strategy_message(progress_eval)
+                            finalize_meta["blocked"] = True
+                            finalize_meta["strategy_shift"] = True
+                            self.last_observation = finalized
+                            self.state.log_event("system", finalized)
+                            self._note_runtime_error(finalized, current_phase="blocked", persist=True)
+
+                        return_to_user = self._should_return_after_action_turn(pending_consensus, finalize_meta)
+                        continuation_note = ""
+                        if return_to_user:
+                            self.state.log_event("assistant", finalized)
+                        else:
+                            continuation_note = self._build_internal_action_continuation(finalized, finalize_meta)
+                            self.state.log_event("system", continuation_note)
+                        self._append_response_trace(
+                            "action_turn_finalized",
+                            original=resp,
+                            finalized=finalized,
+                            user_input=user_input,
+                            blocked=bool(finalize_meta.get("blocked")),
+                            used_llm=bool(finalize_meta.get("used_llm")),
+                            trimmed_menu=bool(finalize_meta.get("trimmed_menu")),
+                            confidence=str(finalize_meta.get("confidence", "high")),
+                            verification=finalize_meta.get("verification", {}),
+                            review=finalize_meta.get("review", ""),
+                            reviewer_guidance=finalize_meta.get("reviewer_guidance", {}),
+                            stronger_verification=finalize_meta.get("stronger_verification", {}),
+                            goal_update=finalize_meta.get("goal_update", {}),
+                            tool_count=len(tool_results),
+                            progress_score=int(progress_eval.get("score", 0)),
+                            low_progress=bool(progress_eval.get("low_progress")),
+                            consecutive_low_progress=int(progress_eval.get("consecutive_low_progress", 0)),
+                            changed_files=progress_eval.get("changed_files", []),
+                            changed_state=progress_eval.get("changed_state", []),
+                            resolved_error=bool(progress_eval.get("resolved_error")),
+                            goal_advances=progress_eval.get("goal_advances", []),
+                            redirect_to_inspection=bool(finalize_meta.get("redirect_to_inspection")),
+                            strategy_shift=bool(finalize_meta.get("strategy_shift")),
+                            returned_to_user=bool(return_to_user),
+                            continuation_note=continuation_note,
+                        )
+                        dur = time.time() - turn_start
+                        meta = []
+                        if bash:
+                            meta.append("tool:bash")
+                        if py:
+                            meta.append("tool:python")
+                        if ack:
+                            meta.append("ack:true")
+                        meta.append("action")
+                        meta.append("finalized_action")
+                        meta.append("blocked" if finalize_meta.get("blocked") else "completed")
+                        meta.append("low_progress" if progress_eval.get("low_progress") else "progress")
+                        if pending_consensus:
+                            meta.append("mixed_consensus")
+                        if finalize_meta.get("used_llm"):
+                            meta.append("finalizer_llm")
+                        if finalize_meta.get("trimmed_menu"):
+                            meta.append("trimmed_menu")
+                        if str(finalize_meta.get("confidence", "high")) != "high":
+                            meta.append(f"confidence:{finalize_meta.get('confidence')}")
+                        if finalize_meta.get("redirect_to_inspection"):
+                            meta.append("inspect_redirect")
+                        stronger_verification = finalize_meta.get("stronger_verification", {})
+                        if isinstance(stronger_verification, dict) and stronger_verification.get("required"):
+                            meta.append("strong_verify")
+                        if finalize_meta.get("strategy_shift"):
+                            meta.append("strategy_shift")
+                        if return_to_user:
+                            meta.append("returned_to_user")
+                        else:
+                            meta.append("continued_internal")
+                        self.logger.log_turn(
+                            turn_num,
+                            resp,
+                            self.state.calculate_diff(turn_start_data, self.state.data),
+                            [f"bash:{len(bash)}", f"python:{len(py)}", f"ack:{int(ack)}", f"tools:{len(tool_results)}"],
+                            duration=dur,
+                            meta=meta,
+                        )
+                        try:
+                            self.auto_summarize_history()
+                        except Exception:
+                            pass
+                        if return_to_user:
+                            return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{finalized}"
+                        continue
 
                     # 6. Log and Continue
                     self.state.log_event("assistant", resp)
@@ -8195,6 +11783,10 @@ def bootstrap_runtime(log_step):
         ConsoleOutput.system("Tip: Run `pip install pyreadline3` to enable Up-Arrow command history.")
     else:
         log_step("history support ok")
+        if load_command_history():
+            log_step("command history loaded")
+        else:
+            log_step("command history unavailable")
 
     log_step("before registering global error hooks")
     ErrorHandler.register_global_handler()
@@ -8211,8 +11803,11 @@ def start_input_thread(input_queue: queue.Queue):
     def input_worker():
         while True:
             try:
-                input_queue.put(input())
+                user_text = input()
+                input_queue.put(user_text)
+                save_command_history()
             except EOFError:
+                save_command_history()
                 input_queue.put(None)
                 break
 
@@ -8224,7 +11819,12 @@ def start_input_thread(input_queue: queue.Queue):
 def shutdown_runtime(bot: Optional[FlexiBot], reason: str = ""):
     if reason:
         ConsoleOutput.system(reason)
+    save_command_history()
     if bot is not None:
+        try:
+            bot.stop_runtime_heartbeat(reason)
+        except Exception:
+            pass
         try:
             bot.unload_skills()
         except Exception:
@@ -8238,9 +11838,11 @@ def shutdown_runtime(bot: Optional[FlexiBot], reason: str = ""):
 def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle_timeout: int = 300):
     stdin_closed = False
     log_step("enter input loop")
-    effective_idle = bot.idle_proposal_interval_seconds if getattr(bot, 'idle_proposal_enabled', False) else idle_timeout
+    # Respect both an explicit bot attribute and a module-level environment-controlled toggle.
+    effective_idle = bot.idle_proposal_interval_seconds if (getattr(bot, 'idle_proposal_enabled', False) or globals().get("AUTO_IDLE_PROPOSAL_ENABLED", False)) else idle_timeout
     while True:
         log_step("loop iteration start")
+        bot._update_runtime_heartbeat(current_mode="interactive", current_phase="awaiting_input", persist=True)
         ConsoleOutput.user_output("", end="")
         ConsoleOutput.prompt()
 
@@ -8254,23 +11856,40 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
                     break
                 except queue.Empty:
                     if time.time() - last_activity > effective_idle:
+                        bot._update_runtime_heartbeat(current_mode="idle", current_phase="idle", persist=True)
                         ConsoleOutput.warning(f"User idle for {effective_idle}s. Resuming...")
                         last_activity = time.time()
 
                         # trigger auto-proposal workflow and apply confirmed patch (guarded + lightweight safety)
-                        # Only run the workflow when explicitly enabled; avoid blocking the input loop.
-                        if getattr(bot, "idle_proposal_enabled", False) and getattr(bot, "idle_proposal_interval_seconds", 0) > 0:
-                            try:
-                                start_time = time.time()
-                                # call with configured auto_confirm flag if present; keep the call synchronous but observe duration
-                                workflow_result = bot.idle_proposal_workflow(auto_propose=False, auto_confirm=getattr(bot, "idle_proposal_auto_confirm", None))
-                                ConsoleOutput.system(f"Idle workflow result: {workflow_result}")
-                                elapsed = time.time() - start_time
-                                # log unusually long runs to aid debugging and avoid silent hangs
-                                if elapsed > max(10, effective_idle * 2):
-                                    ConsoleOutput.warning(f"Idle workflow completed but took long: {elapsed:.1f}s")
-                            except Exception as e:
-                                ConsoleOutput.error(f"Idle workflow error: {e}")
+                        # Run the workflow only when explicitly allowed; invoke in a background thread to avoid blocking the input loop.
+                        if (getattr(bot, "idle_proposal_enabled", False) or globals().get("AUTO_IDLE_PROPOSAL_ENABLED", False)) and getattr(bot, "idle_proposal_interval_seconds", 0) > 0:
+                            import threading
+
+                            def _run_idle_workflow_bg():
+                                try:
+                                    bot._update_runtime_heartbeat(current_mode="idle", current_phase="idle_workflow", persist=True)
+                                    start_time = time.time()
+                                    # Force a conservative default: auto_confirm must be explicit on the bot to allow on-disk changes.
+                                    # If the attribute is missing or falsy, treat as dry-run to avoid accidental code application.
+                                    auto_confirm_attr = bool(getattr(bot, "idle_proposal_auto_confirm", False))
+                                    env_allow = os.environ.get("ALLOW_IDLE_AUTO_APPLY", "false").lower() in ("1", "true", "yes")
+                                    auto_confirm_arg = auto_confirm_attr and env_allow
+                                    if auto_confirm_attr and not env_allow:
+                                        ConsoleOutput.warning("idle_proposal_auto_confirm set on bot but ALLOW_IDLE_AUTO_APPLY env var not set; forcing dry-run.")
+                                    res = bot.idle_proposal_workflow(auto_propose=False, auto_confirm=auto_confirm_arg)
+                                    bot._note_runtime_success(str(res), current_phase="idle", current_mode="idle", persist=True)
+                                    if not auto_confirm_arg:
+                                        ConsoleOutput.warning("Idle workflow executed in dry-run mode (auto_confirm=False); no code was auto-applied.")
+                                    ConsoleOutput.system(f"Idle workflow result: {res}")
+                                    elapsed = time.time() - start_time
+                                    if elapsed > max(10, effective_idle * 2):
+                                        ConsoleOutput.warning(f"Idle workflow completed but took long: {elapsed:.1f}s")
+                                except Exception as e:
+                                    bot._note_runtime_error(f"Idle workflow error: {e}", current_phase="idle", current_mode="idle", persist=True)
+                                    ConsoleOutput.error(f"Idle workflow error: {e}")
+
+                            t = threading.Thread(target=_run_idle_workflow_bg, daemon=True)
+                            t.start()
                         else:
                             ConsoleOutput.system("Idle proposal workflow disabled or misconfigured; skipping automated run.")
 
@@ -8284,11 +11903,13 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
             if not stdin_closed:
                 stdin_closed = True
                 log_step("stdin_closed flag set")
+                bot._update_runtime_heartbeat(current_mode="interactive", current_phase="stdin_closed", persist=True)
                 ConsoleOutput.system("stdin closed, continuing to run. Type 'exit' or press Ctrl+C to quit.")
             time.sleep(0.5)
             continue
 
         if user_input.strip() == "__STATUS__":
+            bot._update_runtime_heartbeat(current_mode="interactive", current_phase="status_probe", persist=True)
             ConsoleOutput.system("STATUS PROBE")
             ConsoleOutput.user_output(json.dumps(bot.get_runtime_status(), indent=2))
             continue
@@ -8296,18 +11917,23 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
         stripped_input = user_input.strip()
         if stripped_input.startswith(OPERATOR_COMMAND_PREFIX):
             try:
+                bot._update_runtime_heartbeat(current_mode="interactive", current_phase="operator_command", last_user_input_at=time.time(), persist=True)
                 ConsoleOutput.user_output(bot.handle_operator_command(stripped_input))
+                bot._note_runtime_success(stripped_input, current_phase="awaiting_input", persist=True)
             except Exception as e:
+                bot._note_runtime_error(f"Operator command error: {e}", current_phase="blocked", persist=True)
                 ConsoleOutput.error(f"Operator command error: {e}")
             continue
 
         if user_input.lower() in ["exit", "quit"]:
+            bot._update_runtime_heartbeat(current_mode="shutdown", current_phase="shutdown", last_user_input_at=time.time(), persist=True)
             break
 
         try:
             result = bot.handle_turn(user_input)
             ConsoleOutput.user_output(result)
         except Exception as e:
+            bot._note_runtime_error(f"Fatal runtime error: {e}", current_phase="blocked", persist=True)
             ConsoleOutput.error(f"FATAL ERROR: {e}")
             traceback.print_exc()
             shutdown_runtime(bot, "Attempting to save state before exit...")
