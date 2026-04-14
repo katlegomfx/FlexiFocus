@@ -37,6 +37,7 @@ import warnings
 import importlib.util
 import tokenize
 import html
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -109,11 +110,13 @@ RUNTIME_HEARTBEAT_KEY = "runtime_heartbeat"
 PROJECT_MEMORY_KEY = "project_memory"
 TASK_MEMORY_KEY = "task_memory"
 FAILURE_MEMORY_KEY = "failure_memory"
+INSPECTION_LEDGER_KEY = "inspection_ledger"
 PROJECT_BRIEF_KEY = "project_brief"
 TASK_GRAPH_KEY = "task_graph"
 WORKSPACE_LOCKS_KEY = "workspace_locks"
 LAST_TEST_RUN_KEY = "last_test_run"
 IDLE_TRIAGE_RECORD_KEY = "idle_triage"
+RUNTIME_IMPROVEMENT_BACKLOG_KEY = "runtime_improvement_backlog"
 GOAL_STATUS_ACTIVE = "active"
 GOAL_STATUS_PENDING = "pending"
 GOAL_STATUS_COMPLETED = "completed"
@@ -124,6 +127,7 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5
 OPERATOR_COMMANDS = {
     "/health",
     "/history",
+    "/improvements",
     "/reviews",
     "/goals",
     "/goal",
@@ -133,12 +137,19 @@ OPERATOR_COMMANDS = {
 EVOLUTION_LOG = STATE_DIR / "evolution_log.md"
 MAX_SNAPSHOTS = 5
 TOKEN_THRESHOLD = 368000 # Your specific requirement for summary trigger
+PROMPT_DIVIDER = "-" * 60
 PROMPT_LABEL = "[Awaiting user input] > "
 
 # automatic history summarisation parameters
 AUTO_SUMMARY_THRESHOLD = 2000  # if history entries exceed this
 AUTO_SUMMARY_KEEP = 500        # keep this many recent entries intact
 PROPOSAL_ARTIFACT_KEEP_RECENT = 8
+MAX_PLAN_ATTEMPTS_PER_REQUEST = 8
+MAX_STRATEGY_FAMILY_ATTEMPTS_PER_REQUEST = 12
+MAX_BLOCKER_ATTEMPTS_PER_REQUEST = 12
+BLOCKER_REPEAT_SUMMARIES_THRESHOLD = 2
+INSPECTION_LEDGER_KEEP = 40
+INSPECTION_ALLOWANCE_WINDOW_SECONDS = 20 * 60
 PROPOSAL_ARTIFACT_ARCHIVE_DIRNAME = "archive"
 IDLE_REWRITE_SECTION_NAMES = {
     "idle_proposal_workflow",
@@ -1007,8 +1018,12 @@ class ConsoleOutput:
             ConsoleOutput._emit(message, color=Colors.BLUE, prefix="[Debug] ", end=end, flush=flush)
 
     @staticmethod
+    def prompt_text() -> str:
+        return f"\n{PROMPT_DIVIDER}\n{PROMPT_LABEL}"
+
+    @staticmethod
     def prompt():
-        ConsoleOutput._emit(PROMPT_LABEL, color=Colors.GREEN + Colors.BOLD, end="", flush=True)
+        ConsoleOutput._emit(ConsoleOutput.prompt_text(), color=Colors.GREEN + Colors.BOLD, end="", flush=True)
 
     @staticmethod
     def user_output(message: str, *, end: str = "\n", flush: bool = False):
@@ -1306,6 +1321,95 @@ class ExecutionPolicyLayer:
     def _feedback_snapshot(self) -> dict[str, Any]:
         return copy.deepcopy(self.runtime_feedback or {})
 
+    def _normalize_feedback_path(self, value: str) -> str:
+        text = str(value or "").strip().strip('"\'')
+        if not text:
+            return ""
+        candidate = text.replace("\\", "/")
+        try:
+            path = Path(candidate)
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            else:
+                path = path.resolve()
+            candidate = path.as_posix()
+        except Exception:
+            candidate = candidate.lstrip("./")
+        return candidate.lower().rstrip("/")
+
+    def _feedback_paths_overlap(self, left: str, right: str) -> bool:
+        left_key = self._normalize_feedback_path(left)
+        right_key = self._normalize_feedback_path(right)
+        if not left_key or not right_key:
+            return False
+        return (
+            left_key == right_key
+            or left_key.startswith(right_key + "/")
+            or right_key.startswith(left_key + "/")
+        )
+
+    def _feedback_payload_paths(self, payload: str) -> list[str]:
+        raw = str(payload or "")
+        if not raw:
+            return []
+        patterns = [
+            r"[A-Za-z]:[\\/][^\s\"'\]\[\)\(\}\{,;]+",
+            r"(?:(?:projects|tests|scripts|proposals|development_files|scanner|aiohttp)[/\\][^\s\"'\]\[\)\(\}\{,;]+)",
+            r"(?:[^\s\"'\]\[\)\(\}\{,;]+\.(?:py|json|md|txt|yaml|yml|toml|ini))",
+        ]
+        matches: list[str] = []
+        seen: set[str] = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, raw):
+                candidate = str(match).strip().strip('"\'.,;()[]{}')
+                key = self._normalize_feedback_path(candidate)
+                if not key or key in seen:
+                    continue
+                matches.append(candidate)
+                seen.add(key)
+        return matches
+
+    def _consume_inspection_allowance(self, tool_name: str, payload: str) -> dict[str, Any] | None:
+        runtime_feedback = self.runtime_feedback if isinstance(self.runtime_feedback, dict) else {}
+        allowances = list(runtime_feedback.get("inspection_allowances", []) or [])
+        if not allowances:
+            return None
+        payload_paths = self._feedback_payload_paths(payload)
+        if not payload_paths:
+            return None
+        consumed_keys = [str(item).strip() for item in runtime_feedback.get("consumed_inspection_keys", []) if str(item).strip()]
+        consumed_set = set(consumed_keys)
+        now = time.time()
+        matched: dict[str, Any] | None = None
+        for allowance in allowances:
+            if not isinstance(allowance, dict):
+                continue
+            allowance_key = str(allowance.get("allowance_key", "") or "").strip()
+            if allowance_key and allowance_key in consumed_set:
+                continue
+            expires_at = float(allowance.get("expires_at", 0) or 0)
+            if expires_at and expires_at < now:
+                continue
+            remaining = int(allowance.get("remaining_mutations", 0) or 0)
+            if remaining <= 0:
+                continue
+            target_paths = list(allowance.get("paths", []) or []) + list(allowance.get("scope_paths", []) or [])
+            if not target_paths:
+                continue
+            overlap = any(
+                self._feedback_paths_overlap(left, right)
+                for left in payload_paths
+                for right in target_paths
+            )
+            if not overlap:
+                continue
+            matched = copy.deepcopy(allowance)
+            if allowance_key and allowance_key not in consumed_set:
+                consumed_keys.append(allowance_key)
+                runtime_feedback["consumed_inspection_keys"] = consumed_keys[-64:]
+            break
+        return matched
+
     def describe(self) -> dict[str, Any]:
         return {
             "allowed_tools": copy.deepcopy(self.allowed_tools),
@@ -1393,6 +1497,7 @@ class ExecutionPolicyLayer:
         ceilings = self._tool_ceilings(tool_name)
         feedback = self._feedback_snapshot()
         env, rules = self._build_environment(tool_name)
+        decision_reason = "allowed"
         blocked_reason = self._payload_block_reason(tool_name, payload, rules)
         if blocked_reason:
             return ExecutionPolicyDecision(
@@ -1407,19 +1512,24 @@ class ExecutionPolicyLayer:
             )
 
         if feedback.get("redirect_to_inspection") and self._mutating_payload(tool_name, payload):
-            return ExecutionPolicyDecision(
-                tool_name=tool_name,
-                allowed=False,
-                reason=(
-                    "Reviewer guidance requires inspection before more changes. "
-                    f"Blocked mutating {tool_name} payload until stronger evidence is collected."
-                ),
-                timeout_seconds=0,
-                resource_ceilings=ceilings,
-                environment=env,
-                isolation_rules=rules,
-                audit_format=copy.deepcopy(self.audit_logging),
-            )
+            allowance = self._consume_inspection_allowance(tool_name, payload)
+            if allowance is not None:
+                decision_reason = "allowed after recent inspection evidence"
+                feedback = self._feedback_snapshot()
+            else:
+                return ExecutionPolicyDecision(
+                    tool_name=tool_name,
+                    allowed=False,
+                    reason=(
+                        "Reviewer guidance requires inspection before more changes. "
+                        f"Blocked mutating {tool_name} payload until stronger evidence is collected."
+                    ),
+                    timeout_seconds=0,
+                    resource_ceilings=ceilings,
+                    environment=env,
+                    isolation_rules=rules,
+                    audit_format=copy.deepcopy(self.audit_logging),
+                )
 
         if feedback.get("severity") == "blocked" and tool_name in {"spawn_background", "run_python_bg", "install_python_package"}:
             return ExecutionPolicyDecision(
@@ -1478,7 +1588,7 @@ class ExecutionPolicyLayer:
         return ExecutionPolicyDecision(
             tool_name=tool_name,
             allowed=True,
-            reason="allowed",
+            reason=decision_reason,
             timeout_seconds=max(1, timeout_seconds),
             resource_ceilings=ceilings,
             environment=env,
@@ -1522,11 +1632,66 @@ class ExecutionPolicyLayer:
 
 # --- HELPER FUNCTIONS (RLM STYLE) ---
 
+RLM_IGNORED_DIR_NAMES = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".flexi",
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    "site-packages",
+    "dist-packages",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".eggs",
+    "__pypackages__",
+    "node_modules",
+}
+
+
+def _rlm_should_ignore_part(part: str) -> bool:
+    normalized = str(part or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in {".", ".."}:
+        return False
+    if normalized == ".github":
+        return False
+    if normalized in RLM_IGNORED_DIR_NAMES:
+        return True
+    if normalized.endswith(".egg-info"):
+        return True
+    return normalized.startswith(".")
+
+
+def _rlm_is_visible_path(path: Path, root: Path | None = None) -> bool:
+    candidate = path
+    if root is not None:
+        try:
+            candidate = path.relative_to(root)
+        except Exception:
+            candidate = path
+    return not any(_rlm_should_ignore_part(part) for part in candidate.parts)
+
+
+def _rlm_visible_dirnames(dirnames: list[str]) -> list[str]:
+    return [name for name in dirnames if not _rlm_should_ignore_part(name)]
+
 def _rlm_collect_files(root: str = ".", pattern: str = "*") -> list[Path]:
     root_path = Path(root)
     if not root_path.exists():
         return []
-    return [path for path in root_path.rglob(pattern) if path.is_file() and not any(part.startswith('.') for part in path.parts)]
+    return [
+        path
+        for path in root_path.rglob(pattern)
+        if path.is_file() and _rlm_is_visible_path(path, root_path)
+    ]
 
 
 def _rlm_collect_files_multi(root: str = ".", patterns: list[str] | None = None) -> list[Path]:
@@ -2558,7 +2723,10 @@ def rlm_edit_lines(filepath, start_line, end_line, new_content):
 def rlm_find_files(pattern, root="."):
     matches = []
     try:
-        for path in Path(root).rglob(pattern):
+        root_path = Path(root)
+        for path in root_path.rglob(pattern):
+            if not _rlm_is_visible_path(path, root_path):
+                continue
             matches.append(str(path))
         return _rlm_result("find_files", data={"root": root, "pattern": pattern, "matches": matches}, match_count=len(matches), warnings=[] if matches else ["No files found."])
     except Exception as e:
@@ -2572,7 +2740,8 @@ def rlm_tree(root=".", depth=2):
             if current_depth > int(depth): return
             entries = sorted([x for x in path.iterdir()], key=lambda x: (not x.is_dir(), x.name))
             for entry in entries:
-                if entry.name.startswith("."): continue # sensitive/hidden skip
+                if _rlm_should_ignore_part(entry.name):
+                    continue
                 indent = "  " * current_depth
                 marker = "[DIR] " if entry.is_dir() else ""
                 output.append(f"{indent}{marker}{entry.name}")
@@ -2674,7 +2843,8 @@ def rlm_project_summary(root: str = "."):
 
     summary.append("\n## Structure Overview")
     for item in sorted(root_path.iterdir()):
-        if item.name.startswith(".") or item.name == "__pycache__": continue
+        if _rlm_should_ignore_part(item.name):
+            continue
         marker = "[DIR]" if item.is_dir() else "     "
         summary.append(f"{marker} {item.name}")
 
@@ -2987,7 +3157,7 @@ def rlm_project_map(root: str = "."):
         languages = _rlm_detect_languages(root)
         structure = []
         for item in sorted(root_path.iterdir()):
-            if item.name.startswith('.') or item.name == '__pycache__':
+            if _rlm_should_ignore_part(item.name):
                 continue
             structure.append({
                 "name": item.name,
@@ -5658,7 +5828,12 @@ class FlexiBot:
         self.low_progress_turns = 0
         self.last_progress_evaluation: dict[str, Any] = {}
         self.last_progress_request_signature = ""
+        self.active_request_signature = ""
         self.current_request_context: dict[str, Any] = {}
+        self._plan_attempt_history: dict[str, list[dict[str, Any]]] = {}
+        self._strategy_family_history: dict[str, list[dict[str, Any]]] = {}
+        self._blocker_signature_history: dict[str, list[dict[str, Any]]] = {}
+        self._turn_active = False
         # persistent turn counter used for logging; increments across handle_turn calls
         self.turn_counter = 0
         self.last_observation = ""
@@ -5934,7 +6109,7 @@ class FlexiBot:
         lines: list[str] = []
         if (root / "flexiFocus.py").exists():
             lines.append("flexiFocus.py is the main agent runtime and orchestration entrypoint.")
-        top_dirs = [path.name for path in sorted(root.iterdir()) if path.is_dir() and not path.name.startswith(".")]
+        top_dirs = [path.name for path in sorted(root.iterdir()) if path.is_dir() and not _rlm_should_ignore_part(path.name)]
         if top_dirs:
             lines.append(f"Top-level directories: {', '.join(top_dirs[:8])}")
         top_py = [path.name for path in sorted(root.glob("*.py")) if path.is_file() and not path.name.startswith(".")]
@@ -5948,13 +6123,12 @@ class FlexiBot:
         root = Path.cwd()
         stdlib_modules = set(getattr(sys, "stdlib_module_names", set()))
         local_modules = {path.stem for path in root.glob("*.py")}
-        local_modules.update(path.name for path in root.iterdir() if path.is_dir())
-        skip_dirs = {".git", ".flexi", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"}
+        local_modules.update(path.name for path in root.iterdir() if path.is_dir() and not _rlm_should_ignore_part(path.name))
         python_files: list[Path] = []
         for current_root, dirs, files in os.walk(root):
-            dirs[:] = [name for name in dirs if name not in skip_dirs and not name.startswith(".")]
+            dirs[:] = _rlm_visible_dirnames(dirs)
             for file_name in files:
-                if not file_name.endswith(".py") or file_name.startswith("."):
+                if not file_name.endswith(".py") or _rlm_should_ignore_part(file_name):
                     continue
                 python_files.append(Path(current_root) / file_name)
                 if len(python_files) >= max_files:
@@ -6093,24 +6267,205 @@ class FlexiBot:
         if workspace_path:
             files.append(workspace_path)
         verification_target = str(goal.get("verification_target", "") or "").strip()
-        if verification_target and "/" in verification_target or "\\" in verification_target or verification_target.endswith(".py"):
+        if verification_target and ("/" in verification_target or "\\" in verification_target or verification_target.endswith(".py")):
             files.append(verification_target)
         goal_id = str(goal.get("id", "") or "").strip()
         if task_memory is not None and goal_id and task_memory.active_goal_id == goal_id:
             files.extend(task_memory.touched_files)
         return self._merge_memory_items([], files, limit=12, max_chars=220)
 
-    def _scoped_verification_target(self) -> str:
+    def _user_requested_full_validation(self, user_input: str = "") -> bool:
+        request_context = getattr(self, "current_request_context", {}) or {}
+        text = " ".join(
+            str(value or "")
+            for value in (
+                user_input,
+                request_context.get("user_input"),
+                request_context.get("request_signature"),
+            )
+        ).lower()
+        if not text:
+            return False
+        markers = (
+            "full validation",
+            "full verify",
+            "full verification",
+            "full test suite",
+            "entire test suite",
+            "all tests",
+            "whole test suite",
+            "workspace-wide pytest",
+            "run the full suite",
+            "run full pytest",
+        )
+        return any(marker in text for marker in markers)
+
+    def _candidate_verification_paths(self) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[str] = set()
+
+        def add_candidate(value: str):
+            text = str(value or "").strip().strip('"\'')
+            if not text:
+                return
+            try:
+                path = Path(text)
+                if not path.is_absolute():
+                    path = (Path.cwd() / path).resolve()
+                else:
+                    path = path.resolve()
+            except Exception:
+                return
+            if not path.exists():
+                return
+            key = path.as_posix().lower()
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(path)
+
+        node = self._current_task_graph_node()
+        if node:
+            for value in list(node.target_files or [])[:12]:
+                add_candidate(value)
+
+        goal = self.current_goal()
+        task_memory = self.state.task_memory() if hasattr(self.state, "task_memory") else TaskMemory()
+        if goal:
+            for value in self._goal_target_files(goal, task_memory=task_memory):
+                add_candidate(value)
+
+        for value in list(task_memory.touched_files or [])[:12]:
+            add_candidate(value)
+
+        return candidates[:20]
+
+    def _path_has_tests(self, path: Path) -> bool:
+        try:
+            if path.is_file():
+                lowered_parts = [part.lower() for part in path.parts]
+                return path.name.startswith("test") or "tests" in lowered_parts
+            if not path.is_dir():
+                return False
+            for _ in path.glob("**/test*.py"):
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _related_test_targets(self, path: Path) -> list[Path]:
+        if not path.exists() or not path.is_file() or path.suffix.lower() != ".py":
+            return []
+        root = Path.cwd()
+        stem = path.stem
+        candidates: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path_candidate: Path):
+            try:
+                resolved = path_candidate.resolve()
+            except Exception:
+                resolved = path_candidate
+            if not resolved.exists() or not resolved.is_file():
+                return
+            key = resolved.as_posix().lower()
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(resolved)
+
+        sibling_tests = [
+            path.with_name(f"test_{stem}.py"),
+            path.with_name(f"{stem}_test.py"),
+        ]
+        for candidate in sibling_tests:
+            add(candidate)
+
+        tests_root = root / "tests"
+        if tests_root.exists():
+            patterns = [f"**/test_{stem}.py", f"**/*{stem}*.py"]
+            for pattern in patterns:
+                for candidate in tests_root.glob(pattern):
+                    add(candidate)
+                    if len(candidates) >= 6:
+                        return candidates
+
+        if "tests" in [part.lower() for part in path.parts]:
+            add(path)
+        return candidates[:6]
+
+    def _resolve_scoped_verification_spec(self, *, allow_full_fallback: bool = True) -> dict[str, Any]:
         node = self._current_task_graph_node()
         if node and str(node.verification_target or "").strip():
-            return str(node.verification_target or "").strip()
+            return {"type": "explicit", "value": str(node.verification_target or "").strip(), "source": "task_graph"}
         goal = self.current_goal()
         if goal and str(goal.get("verification_target", "") or "").strip():
-            return str(goal.get("verification_target", "") or "").strip()
-        brief = self._refresh_project_brief(persist=True)
-        if brief.test_commands:
-            return str(brief.test_commands[0] or "").strip()
-        return ""
+            return {"type": "explicit", "value": str(goal.get("verification_target", "") or "").strip(), "source": "goal"}
+
+        if self._user_requested_full_validation():
+            brief = self._refresh_project_brief(persist=True)
+            if brief.test_commands:
+                return {"type": "command", "value": str(brief.test_commands[0] or "").strip(), "source": "explicit_full_validation"}
+
+        for candidate in self._candidate_verification_paths():
+            if candidate.is_file() and candidate.suffix.lower() == ".py":
+                if self._path_has_tests(candidate):
+                    return {
+                        "type": "command",
+                        "value": f'"{sys.executable}" -m pytest -q "{candidate}"',
+                        "source": "direct_test_file",
+                    }
+                related_tests = self._related_test_targets(candidate)
+                if related_tests:
+                    joined = " ".join(f'"{path}"' for path in related_tests[:3])
+                    return {
+                        "type": "command",
+                        "value": f'"{sys.executable}" -m pytest -q {joined}',
+                        "source": "related_tests",
+                    }
+                return {"type": "path", "value": str(candidate), "source": "python_file"}
+            if candidate.is_dir() and self._path_has_tests(candidate):
+                return {
+                    "type": "command",
+                    "value": f'"{sys.executable}" -m pytest -q "{candidate}"',
+                    "source": "test_directory",
+                }
+
+        if allow_full_fallback:
+            brief = self._refresh_project_brief(persist=True)
+            if brief.test_commands:
+                return {"type": "command", "value": str(brief.test_commands[0] or "").strip(), "source": "project_default"}
+        return {"type": "", "value": "", "source": ""}
+
+    def _scoped_verification_target(self) -> str:
+        return str(self._resolve_scoped_verification_spec(allow_full_fallback=True).get("value", "") or "").strip()
+
+    def _verification_scope_paths(self, context: str = "") -> list[str]:
+        scope_items: list[str] = []
+        goal = self.current_goal()
+        task_memory = self.state.task_memory() if hasattr(self.state, "task_memory") else TaskMemory()
+        if goal:
+            scope_items.extend(self._goal_target_files(goal, task_memory=task_memory))
+        scoped_target = self._scoped_verification_target()
+        if scoped_target:
+            scope_items.append(scoped_target)
+        if context:
+            scope_items.append(str(context))
+        request_context = getattr(self, "current_request_context", {}) or {}
+        if request_context.get("user_input"):
+            scope_items.append(str(request_context.get("user_input")))
+        if request_context.get("request_signature"):
+            scope_items.append(str(request_context.get("request_signature")))
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in scope_items:
+            for candidate in self._extract_path_candidates(str(item or "")) or [str(item or "")]:
+                key = self._normalize_compare_path(candidate)
+                if not key or key in seen:
+                    continue
+                normalized.append(candidate)
+                seen.add(key)
+        return normalized[:24]
 
     def _refresh_task_graph(self, *, persist: bool = True) -> TaskGraph:
         state = getattr(self, "state", None)
@@ -6490,6 +6845,522 @@ class FlexiBot:
             return "__continue__"
         return lowered[:240]
 
+    def _normalize_plan_signature(self, plan_text: str) -> str:
+        text = str(plan_text or "").replace("\r\n", "\n").lower()
+        text = re.sub(r"^\s*\d+[\.)]\s*", "", text, flags=re.M)
+        text = re.sub(r"^\s*[-*]\s*", "", text, flags=re.M)
+        text = re.sub(r"\bi will\b", " ", text)
+        text = re.sub(r"\b(?:start|begin) with step \d+\b", " ", text)
+        text = re.sub(r"\b(?:next turn|if possible|if needed|if necessary)\b", " ", text)
+        text = re.sub(r"[^a-z0-9_./\-\s]", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()[:400]
+
+    def _plan_signatures(self, plan_blocks: list[str] | None) -> list[str]:
+        signatures: list[str] = []
+        seen: set[str] = set()
+        for block in plan_blocks or []:
+            normalized = self._normalize_plan_signature(block)
+            if not normalized or normalized in seen:
+                continue
+            signatures.append(normalized)
+            seen.add(normalized)
+        return signatures
+
+    def _effective_request_signature(self, request_signature: str = "") -> str:
+        normalized = str(request_signature or "").strip()
+        if normalized and normalized != "__continue__":
+            return normalized
+        active = str(getattr(self, "active_request_signature", "") or "").strip()
+        if active:
+            return active
+        return "__session__"
+
+    def _remember_plan_attempt(self, request_signature: str, plan_blocks: list[str],
+                               progress_eval: dict[str, Any], finalize_meta: dict[str, Any]):
+        effective_signature = self._effective_request_signature(request_signature)
+        signatures = self._plan_signatures(plan_blocks)
+        if not signatures:
+            return
+        attempts = list(self._plan_attempt_history.get(effective_signature, []))
+        attempts.append({
+            "timestamp": time.time(),
+            "combined_signature": " || ".join(signatures),
+            "signatures": signatures,
+            "score": int(progress_eval.get("score", 0) or 0),
+            "low_progress": bool(progress_eval.get("low_progress")),
+            "changed_files": list(progress_eval.get("changed_files", []) or [])[:20],
+            "changed_state": list(progress_eval.get("changed_state", []) or [])[:10],
+            "goal_advances": list(progress_eval.get("goal_advances", []) or [])[:10],
+            "blocked": bool(finalize_meta.get("blocked")),
+        })
+        self._plan_attempt_history[effective_signature] = attempts[-MAX_PLAN_ATTEMPTS_PER_REQUEST:]
+
+    def _duplicate_plan_block_message(self, request_signature: str, plan_blocks: list[str]) -> str:
+        effective_signature = self._effective_request_signature(request_signature)
+        signatures = self._plan_signatures(plan_blocks)
+        if not signatures:
+            return ""
+        combined = " || ".join(signatures)
+        attempts = list(self._plan_attempt_history.get(effective_signature, []))
+        if not attempts:
+            return ""
+        last_attempt = attempts[-1]
+        if str(last_attempt.get("combined_signature", "")) != combined:
+            return ""
+        if not bool(last_attempt.get("low_progress")):
+            return ""
+        if last_attempt.get("changed_files") or last_attempt.get("changed_state") or last_attempt.get("goal_advances"):
+            return ""
+        repeat_count = 1
+        for attempt in reversed(attempts[:-1]):
+            if str(attempt.get("combined_signature", "")) != combined:
+                break
+            repeat_count += 1
+        lead = "Blocked" if bool(last_attempt.get("blocked")) else "System Warning"
+        return (
+            f"{lead}: Duplicate plan suppressed. The last attempt used the same plan and made no measurable progress. "
+            f"Repeat count for this plan: {repeat_count + 1}. Switch strategy before acting again: narrow verification, edit a target file, "
+            "inspect a different dependency boundary, or return a concise blocker summary instead of repeating the same steps."
+        )
+
+    def _strategy_family_threshold(self, family: str) -> int:
+        thresholds = {
+            "shim": 2,
+            "install_dependency": 2,
+            "edit_imports": 2,
+            "scope_tests": 2,
+            "inspect": 3,
+            "ask_user": 2,
+        }
+        return int(thresholds.get(str(family or "").strip(), 3))
+
+    def _infer_strategy_families(self, plan_blocks: list[str] | None, bash_payloads: list[str] | None,
+                                 python_payloads: list[str] | None, consensus_text: str = "") -> list[str]:
+        families: list[str] = []
+        seen: set[str] = set()
+
+        def add_family(name: str):
+            if name and name not in seen:
+                families.append(name)
+                seen.add(name)
+
+        plans = [str(item or "") for item in (plan_blocks or [])]
+        bash_items = [self._normalize_tool_payload(item) for item in (bash_payloads or []) if str(item or "").strip()]
+        python_items = [self._normalize_tool_payload(item) for item in (python_payloads or []) if str(item or "").strip()]
+        combined = "\n".join([*plans, *bash_items, *python_items, str(consensus_text or "")]).lower()
+        tool_payloads = [("bash", item) for item in bash_items] + [("python", item) for item in python_items]
+
+        if consensus_text:
+            lowered_consensus = str(consensus_text).lower()
+            if any(marker in lowered_consensus for marker in ("what would you like", "would you like", "please confirm", "choose", "pick one", "reply with")):
+                add_family("ask_user")
+
+        install_markers = (
+            "pip install",
+            "install_python_package",
+            "npm install",
+            "poetry add",
+            "conda install",
+        )
+        if any(marker in combined for marker in install_markers):
+            add_family("install_dependency")
+
+        shim_markers = (
+            "shim",
+            "stub",
+            "re-export",
+            "re export",
+            "minimal package",
+            "minimal local",
+            "__init__.py",
+            "compatibility package",
+        )
+        if any(marker in combined for marker in shim_markers):
+            add_family("shim")
+
+        edit_import_markers = (
+            "edit import",
+            "fix import",
+            "adjust import",
+            "replace import",
+            "cleanup_unused_imports",
+            "python_refactor_symbol",
+        )
+        if any(marker in combined for marker in edit_import_markers):
+            add_family("edit_imports")
+        elif any(
+            any(token in payload.lower() for token in ("from ", "import "))
+            and any(token in payload.lower() for token in ("patch(", "edit_lines(", "write(", "replace", "cleanup_unused_imports"))
+            for _, payload in tool_payloads
+        ):
+            add_family("edit_imports")
+
+        scoped_test_markers = (
+            "pytest -q",
+            "::",
+            "run_verification",
+            "validate_python",
+            "py_compile",
+            "focused pytest",
+            "scoped verification",
+        )
+        if any(marker in combined for marker in scoped_test_markers):
+            add_family("scope_tests")
+
+        if tool_payloads:
+            inspection_like_count = 0
+            for tool_name, payload in tool_payloads:
+                if self.execution_policy._inspection_like_payload(tool_name, payload) and not self.execution_policy._mutating_payload(tool_name, payload):
+                    inspection_like_count += 1
+            if inspection_like_count == len(tool_payloads):
+                add_family("inspect")
+        elif any(token in combined for token in ("inspect", "read ", "read_file", "grep", "search", "find ", "tree(", "peek(", "safe_inspect", "inspect_file_chunk")):
+            add_family("inspect")
+
+        return families
+
+    def _remember_strategy_family_attempt(self, request_signature: str, families: list[str],
+                                          progress_eval: dict[str, Any], finalize_meta: dict[str, Any]):
+        if not families:
+            return
+        effective_signature = self._effective_request_signature(request_signature)
+        attempts = list(self._strategy_family_history.get(effective_signature, []))
+        attempts.append({
+            "timestamp": time.time(),
+            "families": list(families)[:8],
+            "primary_family": str(families[0] or "").strip(),
+            "score": int(progress_eval.get("score", 0) or 0),
+            "low_progress": bool(progress_eval.get("low_progress")),
+            "changed_files": list(progress_eval.get("changed_files", []) or [])[:20],
+            "changed_state": list(progress_eval.get("changed_state", []) or [])[:10],
+            "goal_advances": list(progress_eval.get("goal_advances", []) or [])[:10],
+            "blocked": bool(finalize_meta.get("blocked")),
+        })
+        self._strategy_family_history[effective_signature] = attempts[-MAX_STRATEGY_FAMILY_ATTEMPTS_PER_REQUEST:]
+
+    def _strategy_family_escalation_message(self, request_signature: str, families: list[str]) -> str:
+        if not families:
+            return ""
+        effective_signature = self._effective_request_signature(request_signature)
+        attempts = list(self._strategy_family_history.get(effective_signature, []))
+        if not attempts:
+            return ""
+        primary_family = str(families[0] or "").strip()
+        if not primary_family:
+            return ""
+
+        def _plan_intent_map(self, plan_blocks: list[str] | None) -> dict[str, list[str]]:
+            intents: dict[str, list[str]] = {
+                "create": [],
+                "edit": [],
+                "install": [],
+                "run_tests": [],
+                "inspect": [],
+            }
+            markers = {
+                "create": ("create", "add ", "new file", "scaffold", "write ", "generate "),
+                "edit": ("edit", "modify", "change", "update", "patch", "refactor", "rename", "fix "),
+                "install": ("install", "dependency", "package", "pip ", "poetry add", "conda install", "npm install"),
+                "run_tests": ("run tests", "test ", "pytest", "unittest", "verify", "verification", "validate", "py_compile", "compile check", "import check"),
+                "inspect": ("inspect", "read ", "search", "grep", "find ", "review", "map ", "list ", "peek", "tree"),
+            }
+            seen: dict[str, set[str]] = {key: set() for key in intents}
+            for block in plan_blocks or []:
+                text = self._normalize_tool_payload(block)
+                lowered = text.lower()
+                if not lowered:
+                    continue
+                snippet = text[:160]
+                for intent, tokens in markers.items():
+                    if any(token in lowered for token in tokens):
+                        key = lowered[:200]
+                        if key in seen[intent]:
+                            continue
+                        intents[intent].append(snippet)
+                        seen[intent].add(key)
+            return intents
+
+        def _plan_result_mismatch(self, plan_blocks: list[str] | None, response: str,
+                                  tool_results: list[str], progress_eval: dict[str, Any],
+                                  finalize_meta: dict[str, Any]) -> dict[str, Any]:
+            intents = self._plan_intent_map(plan_blocks)
+            payloads = self._response_tool_payloads(response)
+            payload_texts = [payload.lower() for _, payload in payloads]
+            payload_tools = [tool_name for tool_name, _ in payloads]
+            result_payloads = [self._parse_tool_result_payload(result) or {} for result in tool_results]
+
+            def _payload_has_any(tokens: tuple[str, ...]) -> bool:
+                return any(any(token in payload for token in tokens) for payload in payload_texts)
+
+            changed_files = list(progress_eval.get("changed_files", []) or [])
+            inspection_only = bool(finalize_meta.get("inspection_only"))
+            blocked = bool(finalize_meta.get("blocked"))
+
+            install_result_indices = [
+                index for index, payload in enumerate(result_payloads)
+                if str(payload.get("tool", "") or "").strip() == "install_python_package"
+            ]
+            install_attempted = bool(install_result_indices) or _payload_has_any(("pip install", "poetry add", "conda install", "npm install", "install_python_package("))
+            install_succeeded = any(bool(result_payloads[index].get("ok", False)) for index in install_result_indices)
+            if not install_succeeded and install_attempted and not install_result_indices:
+                install_succeeded = not any(self._tool_result_failed(result) for result in tool_results if "install" in self._tool_result_text(result).lower())
+
+            test_tools = {"run_tests", "run_verification", "validate_python", "verify_work"}
+            test_result_indices = [
+                index for index, payload in enumerate(result_payloads)
+                if str(payload.get("tool", "") or "").strip() in test_tools
+            ]
+            tests_attempted = bool(test_result_indices) or _payload_has_any(("pytest", "unittest", "run_tests(", "run_verification(", "validate_python(", "py_compile", "import check"))
+            tests_succeeded = any(bool(result_payloads[index].get("ok", False)) for index in test_result_indices)
+
+            inspection_attempted = inspection_only
+            if not inspection_attempted and payloads and len(payloads) == len(tool_results):
+                inspection_attempted = True
+                for index, (tool_name, raw_payload) in enumerate(payloads):
+                    payload_tool = str(result_payloads[index].get("tool", tool_name) or tool_name).strip() or tool_name
+                    effective_tool = tool_name if payload_tool in {"bash", "python"} else payload_tool
+                    if effective_tool in {"bash", "python"}:
+                        if self.execution_policy._mutating_payload(effective_tool, raw_payload):
+                            inspection_attempted = False
+                            break
+                        if not self.execution_policy._inspection_like_payload(effective_tool, raw_payload):
+                            inspection_attempted = False
+                            break
+                    elif effective_tool not in {
+                        "inspect_python_environment",
+                        "list_python_packages",
+                        "python_symbol_doc",
+                        "python_import_graph",
+                        "list_windows",
+                        "list_windows_advanced",
+                        "get_active_terminal",
+                        "list_processes",
+                        "get_software_versions",
+                        "project_memory",
+                        "task_memory",
+                        "failure_memory",
+                        "recall",
+                        "search_memory",
+                        "read_bg_task_log",
+                        "get_bg_task_details",
+                        "check_bg_tasks",
+                    }:
+                        inspection_attempted = False
+                        break
+
+            reasons: list[str] = []
+            next_steps: list[str] = []
+            categories: list[str] = []
+
+            mutation_intended = bool(intents["create"] or intents["edit"])
+            if mutation_intended and not changed_files:
+                if inspection_only or inspection_attempted:
+                    reasons.append("the plan promised code changes, but the turn only produced inspection output")
+                elif blocked:
+                    reasons.append("the plan promised code changes, but the turn blocked before any file changed")
+                else:
+                    reasons.append("the plan promised code changes, but no workspace files changed")
+                next_steps.append("make the intended file edit explicitly or rewrite the plan as inspection-only")
+                categories.append("mutation_missing")
+
+            if intents["install"]:
+                if not install_attempted:
+                    reasons.append("the plan promised a dependency install, but no install command ran")
+                    next_steps.append("run the dependency install explicitly or report the missing prerequisite")
+                    categories.append("install_missing")
+                elif not install_succeeded and blocked:
+                    # Installation was attempted but failed; that is execution failure, not a plan/result mismatch.
+                    pass
+
+            if intents["run_tests"] and not tests_attempted:
+                reasons.append("the plan promised verification, but no test or verification command ran")
+                next_steps.append("run the promised scoped verification after the next concrete change")
+                categories.append("verification_missing")
+
+            if intents["inspect"] and not (inspection_attempted or inspection_only) and not payload_tools:
+                reasons.append("the plan promised inspection, but no inspection step actually ran")
+                next_steps.append("run the missing inspection step or drop it from the next plan")
+                categories.append("inspection_missing")
+
+            if not reasons:
+                return {
+                    "mismatch": False,
+                    "intents": intents,
+                    "categories": [],
+                    "reasons": [],
+                    "reason": "",
+                    "summary": "",
+                    "next_step": "",
+                }
+
+            deduped_steps: list[str] = []
+            seen_steps: set[str] = set()
+            for step in next_steps:
+                key = step.strip().lower()
+                if not key or key in seen_steps:
+                    continue
+                deduped_steps.append(step.strip())
+                seen_steps.add(key)
+            primary_reason = reasons[0].strip()
+            summary = "Blocked: Plan/result mismatch. " + "; ".join(reason.rstrip(".") for reason in reasons[:2]) + "."
+            next_step = deduped_steps[0] if deduped_steps else "choose the next action so it fulfills the stated plan before claiming progress"
+            summary += f" Next step: {next_step}."
+            return {
+                "mismatch": True,
+                "intents": intents,
+                "categories": categories,
+                "reasons": reasons,
+                "reason": primary_reason,
+                "summary": summary,
+                "next_step": next_step,
+                "changed_files": changed_files[:20],
+                "inspection_only": inspection_only,
+                "blocked": blocked,
+                "install_attempted": install_attempted,
+                "tests_attempted": tests_attempted,
+                "tests_succeeded": tests_succeeded,
+            }
+
+        consecutive = 0
+        blocked_recent = False
+        for attempt in reversed(attempts):
+            if str(attempt.get("primary_family", "")) != primary_family:
+                break
+            if attempt.get("changed_files") or attempt.get("changed_state") or attempt.get("goal_advances"):
+                break
+            if not bool(attempt.get("low_progress")) and not bool(attempt.get("blocked")):
+                break
+            consecutive += 1
+            blocked_recent = blocked_recent or bool(attempt.get("blocked"))
+
+        threshold = self._strategy_family_threshold(primary_family)
+        if consecutive < threshold:
+            return ""
+
+        suggestions = {
+            "inspect": "make a targeted edit, run a narrower verification, or summarize the blocker instead of inspecting again",
+            "shim": "switch to scoped verification, install the real dependency, edit imports directly, or return a concise blocker summary",
+            "install_dependency": "inspect the real dependency boundary, use a scoped verification, or explain the missing prerequisite clearly",
+            "edit_imports": "verify the expected API, scope the tests, or install the dependency instead of rewriting imports again",
+            "scope_tests": "make the missing code change, inspect the blocker more precisely, or report the blocker directly",
+            "ask_user": "return one concise blocker summary instead of asking again unless a real decision is required",
+        }
+        lead = "Blocked" if blocked_recent else "System Warning"
+        return (
+            f"{lead}: Strategy family '{primary_family}' is overused. The last {consecutive} {primary_family} attempts made no measurable progress. "
+            f"Switch strategy now: {suggestions.get(primary_family, 'choose a materially different recovery path before acting again')}."
+        )
+
+    def _normalize_blocker_signature_text(self, text: str) -> str:
+        normalized = str(text or "").replace("\r\n", "\n").strip().lower()
+        if not normalized:
+            return ""
+        normalized = re.sub(r"^(blocked|completed)\s*:\s*", "", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized[:240]
+
+    def _blocked_finalization_signature(self, finalized: str, tool_results: list[str],
+                                        verification: dict[str, Any], reviewer_review: str,
+                                        reviewer_guidance: dict[str, Any] | None = None,
+                                        stronger_verification: dict[str, Any] | None = None) -> dict[str, Any]:
+        guidance = reviewer_guidance if isinstance(reviewer_guidance, dict) else {}
+        stronger = stronger_verification if isinstance(stronger_verification, dict) else {}
+        reviewer_reason = str(guidance.get("blocked_reason") or stronger.get("reason") or "").strip()
+        if not reviewer_reason:
+            reviewer_reason = str(reviewer_review or "").strip().splitlines()[0] if str(reviewer_review or "").strip() else ""
+
+        semantic_parts: list[str] = []
+        semantic_seen: set[str] = set()
+        for result in tool_results:
+            detail = str(self._tool_result_semantic_blocker(result) or "").strip()
+            if not detail or detail in semantic_seen:
+                continue
+            semantic_parts.append(detail)
+            semantic_seen.add(detail)
+            if len(semantic_parts) >= 2:
+                break
+        semantic_blocker = "; ".join(semantic_parts)
+        if not semantic_blocker:
+            semantic_blocker = "; ".join(str(item).strip() for item in verification.get("errors", []) if str(item).strip())[:320]
+        if not semantic_blocker:
+            failed_result = next((result for result in tool_results if self._tool_result_failed(result)), tool_results[-1] if tool_results else "")
+            semantic_blocker = str(self._tool_result_highlight(failed_result, prefer_error=True) or "").strip()
+
+        classification = verification.get("failure_classification", {}) if isinstance(verification, dict) else {}
+        verification_category = str(classification.get("category", "") or "").strip()
+        verification_reason = str(classification.get("reason", "") or "").strip()
+        next_step = str(guidance.get("next_step") or stronger.get("next_step") or "").strip()
+        finalized_detail = re.sub(r"^(Blocked|Completed):\s*", "", str(finalized or "").strip())
+        primary_detail = semantic_blocker or reviewer_reason or verification_reason or finalized_detail or "Blocked action turn."
+        classifier_fragment = ": ".join(part for part in (verification_category, verification_reason or primary_detail) if part)
+        signature = " || ".join([
+            self._normalize_blocker_signature_text(reviewer_reason) or "__none__",
+            self._normalize_blocker_signature_text(semantic_blocker) or "__none__",
+            self._normalize_blocker_signature_text(classifier_fragment) or "__none__",
+        ])
+        return {
+            "signature": signature,
+            "reviewer_reason": reviewer_reason[:320],
+            "semantic_blocker": semantic_blocker[:320],
+            "verification_category": verification_category,
+            "verification_reason": verification_reason[:320],
+            "next_step": next_step[:320],
+            "primary_detail": primary_detail[:320],
+        }
+
+    def _blocker_repeat_summary(self, blocker_info: dict[str, Any], repeat_count: int) -> str:
+        detail = str(blocker_info.get("primary_detail", "") or "").strip()[:220].rstrip(" .")
+        category = str(blocker_info.get("verification_category", "") or "").strip()
+        next_step = str(blocker_info.get("next_step", "") or "").strip()[:220].rstrip(" .")
+        message = f"Blocked: The same blocker has repeated {max(1, int(repeat_count or 0))} times in this request"
+        if detail:
+            message += f": {detail}"
+        if category and category != "healthy":
+            message += f" [{category}]"
+        message = message.rstrip(".") + "."
+        if next_step:
+            message += f" Next step: {next_step}."
+        return message
+
+    def _remember_blocker_attempt(self, request_signature: str, blocker_info: dict[str, Any]) -> dict[str, Any]:
+        effective_signature = self._effective_request_signature(request_signature)
+        signature = str(blocker_info.get("signature", "") or "").strip()
+        if not signature:
+            return {
+                "request_signature": effective_signature,
+                "repeat_count": 0,
+                "summary": "",
+            }
+        attempts = list(self._blocker_signature_history.get(effective_signature, []))
+        attempts.append({
+            "timestamp": time.time(),
+            "signature": signature,
+            "reviewer_reason": str(blocker_info.get("reviewer_reason", "") or "").strip(),
+            "semantic_blocker": str(blocker_info.get("semantic_blocker", "") or "").strip(),
+            "verification_category": str(blocker_info.get("verification_category", "") or "").strip(),
+            "verification_reason": str(blocker_info.get("verification_reason", "") or "").strip(),
+            "next_step": str(blocker_info.get("next_step", "") or "").strip(),
+            "primary_detail": str(blocker_info.get("primary_detail", "") or "").strip(),
+        })
+        attempts = attempts[-MAX_BLOCKER_ATTEMPTS_PER_REQUEST:]
+        self._blocker_signature_history[effective_signature] = attempts
+
+        repeat_count = 0
+        for attempt in reversed(attempts):
+            if str(attempt.get("signature", "") or "").strip() != signature:
+                break
+            repeat_count += 1
+
+        summary = ""
+        if repeat_count >= BLOCKER_REPEAT_SUMMARIES_THRESHOLD:
+            summary = self._blocker_repeat_summary(blocker_info, repeat_count)
+        return {
+            "request_signature": effective_signature,
+            "repeat_count": repeat_count,
+            "summary": summary,
+        }
+
     def _snapshot_workspace_progress(self) -> dict[str, dict[str, int]]:
         root = Path.cwd()
         snapshot: dict[str, dict[str, int]] = {}
@@ -6590,6 +7461,145 @@ class FlexiBot:
             if str(after_goal.get("completed_at", "")).strip() and after_goal.get("completed_at") != before_goal.get("completed_at"):
                 details.append(f"goal_completed:{goal_id}")
         return details
+
+    def _extract_path_candidates(self, text: str) -> list[str]:
+        raw = str(text or "")
+        if not raw:
+            return []
+        patterns = [
+            r'[A-Za-z]:\\[^\s:\"\']+',
+            r'[A-Za-z]:/[^\s:\"\']+',
+            r'(?:(?:projects|tests|scripts|proposals|development_files|scanner|aiohttp)[/\\][^\s:\"\']+)',
+            r'(?:(?:\./|\.\\)[^\s:\"\']+)',
+            r'(?:[^\s:\"\']+\.(?:py|json|md|txt|yaml|yml|toml|ini))',
+        ]
+        matches: list[str] = []
+        seen: set[str] = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, raw):
+                candidate = str(match).strip().strip('"\'.,;()[]{}')
+                key = self._normalize_compare_path(candidate)
+                if not key or key in seen:
+                    continue
+                matches.append(candidate)
+                seen.add(key)
+        return matches
+
+    def _normalize_compare_path(self, value: str) -> str:
+        text = str(value or "").strip().strip('"\'')
+        if not text:
+            return ""
+        if any(token in text for token in ("\n", "\r", "\t")):
+            return ""
+        candidate = text.replace("\\", "/")
+        try:
+            path = Path(candidate)
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            else:
+                path = path.resolve()
+            candidate = path.as_posix()
+        except Exception:
+            candidate = candidate.lstrip("./")
+        return candidate.lower().rstrip("/")
+
+    def _paths_overlap_for_verification(self, left: str, right: str) -> bool:
+        left_key = self._normalize_compare_path(left)
+        right_key = self._normalize_compare_path(right)
+        if not left_key or not right_key:
+            return False
+        return (
+            left_key == right_key
+            or left_key.startswith(right_key + "/")
+            or right_key.startswith(left_key + "/")
+        )
+
+    def _request_mentions_failure(self, failure_text: str) -> bool:
+        request_context = getattr(self, "current_request_context", {}) or {}
+        haystack = " ".join(
+            str(value or "")
+            for value in (
+                request_context.get("user_input"),
+                request_context.get("request_signature"),
+            )
+        ).lower()
+        if not haystack:
+            return False
+        dependency = self._extract_missing_dependency(failure_text)
+        if dependency and dependency.lower() in haystack:
+            return True
+        for candidate in self._extract_path_candidates(failure_text):
+            stem = Path(str(candidate)).stem.lower().replace("_", " ")
+            if stem and stem in haystack:
+                return True
+        return False
+
+    def _classify_verification_failure(self, output_text: str, errors: list[str], context: str = "") -> dict[str, Any]:
+        combined = "\n".join([str(output_text or "").strip(), *[str(item).strip() for item in (errors or []) if str(item).strip()]]).strip()
+        if not combined:
+            return {
+                "category": "task_blocker",
+                "should_block": True,
+                "reason": "No verification output was produced.",
+                "scope_paths": self._verification_scope_paths(context),
+                "failure_paths": [],
+                "matching_paths": [],
+            }
+
+        scope_paths = self._verification_scope_paths(context)
+        failure_paths = self._extract_path_candidates(combined)
+        matching_paths = [
+            candidate for candidate in failure_paths
+            if any(self._paths_overlap_for_verification(candidate, scope) for scope in scope_paths)
+        ]
+        lowered = combined.lower()
+        environment_markers = (
+            "module not found",
+            "no module named",
+            "import file mismatch",
+            "command not found",
+            "not installed",
+            "missing dependency",
+            "cannot import name",
+        )
+        environment_like = any(marker in lowered for marker in environment_markers)
+        request_mentions_failure = self._request_mentions_failure(combined)
+
+        if matching_paths:
+            category = "task_blocker"
+            should_block = True
+        elif environment_like and scope_paths:
+            if request_mentions_failure:
+                category = "environment_blocker"
+                should_block = True
+            else:
+                category = "ambient_failure"
+                should_block = False
+        elif failure_paths and scope_paths:
+            category = "ambient_failure"
+            should_block = False
+        elif environment_like:
+            category = "environment_blocker"
+            should_block = True
+        else:
+            category = "task_blocker"
+            should_block = True
+
+        reason = next((str(item).strip() for item in errors if str(item).strip()), "")
+        if not reason:
+            reason = next((line.strip() for line in combined.splitlines() if line.strip()), "Verification failed.")
+        if category == "ambient_failure" and matching_paths:
+            category = "task_blocker"
+            should_block = True
+        return {
+            "category": category,
+            "should_block": should_block,
+            "reason": reason,
+            "scope_paths": scope_paths[:12],
+            "failure_paths": failure_paths[:20],
+            "matching_paths": matching_paths[:12],
+            "request_mentions_failure": request_mentions_failure,
+        }
 
     def _evaluate_turn_progress(self, baseline: dict[str, Any], finalize_meta: dict[str, Any], tool_results: list[str]) -> dict[str, Any]:
         after_workspace = self._snapshot_workspace_progress()
@@ -6712,6 +7722,83 @@ class FlexiBot:
         match = re.search(r"<consensus>(.*?)</consensus>", response, re.S)
         return match.group(1).strip() if match else ""
 
+    def _collapse_cli_block(self, text: str) -> str:
+        normalized = str(text or "").replace("\r\n", "\n")
+        lines: list[str] = []
+        last_blank = False
+        for raw_line in normalized.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                if lines and not last_blank:
+                    lines.append("")
+                last_blank = True
+                continue
+            lines.append(line.strip())
+            last_blank = False
+        return "\n".join(lines).strip()
+
+    def _extract_display_thought(self, response: str) -> str:
+        text = str(response or "")
+        text = re.sub(r"<(plan|bash|python|consensus)>.*?</\1>", "", text, flags=re.S)
+        text = text.replace("<ack_observation>", "")
+        return self._collapse_cli_block(text)
+
+    def _render_cli_response_sections(self, response: str, *, plan_blocks: list[str] | None = None,
+                                      bash_payloads: list[str] | None = None,
+                                      python_payloads: list[str] | None = None,
+                                      consensus_text: str = ""):
+        def _format_items(items: list[str]) -> str:
+            if not items:
+                return ""
+            if len(items) == 1:
+                return items[0]
+            blocks: list[str] = []
+            for index, item in enumerate(items, start=1):
+                lines = item.splitlines() or [item]
+                blocks.append("\n".join([
+                    f"{index}. {lines[0]}",
+                    *[f"   {line}" for line in lines[1:]],
+                ]))
+            return "\n\n".join(blocks)
+
+        thought_text = self._extract_display_thought(response)
+        plan_items = [
+            collapsed for collapsed in
+            (self._collapse_cli_block(block) for block in (plan_blocks or []))
+            if collapsed
+        ]
+        tool_items: list[str] = []
+        for tool_name, payloads in (("bash", bash_payloads or []), ("python", python_payloads or [])):
+            for payload in payloads:
+                collapsed = self._collapse_cli_block(self._normalize_tool_payload(payload))
+                if collapsed:
+                    tool_items.append(f"{tool_name}: {collapsed}")
+        consensus_block = self._collapse_cli_block(consensus_text)
+
+        sep_line = f"{Colors.DIM}{'-'*60}{Colors.ENDC}"
+        print(f"\n{sep_line}")
+
+        rendered_any = False
+
+        def _emit_section(title: str, color: str, body: str):
+            nonlocal rendered_any
+            if not body:
+                return
+            if rendered_any:
+                print()
+            formatted = body.replace("\n", f"\n{Colors.DIM}| {Colors.ENDC}")
+            print(f"{color}{Colors.BOLD}{title}:{Colors.ENDC}\n{Colors.DIM}| {Colors.ENDC}{formatted}")
+            rendered_any = True
+
+        _emit_section("Thought", Colors.YELLOW, thought_text)
+        _emit_section("Plan", Colors.BLUE, _format_items(plan_items))
+        _emit_section("Consensus", Colors.GREEN, consensus_block)
+        _emit_section("Tool", Colors.CYAN, _format_items(tool_items))
+
+        if not rendered_any:
+            print(f"{Colors.DIM}| {Colors.ENDC}(no displayable response sections)")
+        print(f"{sep_line}")
+
     def _trim_finalize_followup(self, draft: str) -> tuple[str, bool]:
         if not draft:
             return "", False
@@ -6723,6 +7810,14 @@ class FlexiBot:
         if not trimmed:
             return draft.strip(), False
         return trimmed.strip(), trimmed.strip() != draft.strip()
+
+    def _finalizer_has_interactive_followup(self, text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.strip().lower()
+        if lowered.startswith(("would you like", "how would you like", "reply with", "please choose", "choose one", "pick one")):
+            return True
+        return self._find_followup_cutoff(text) is not None
 
     def _summarize_tool_results(self, tool_results: list[str], *, max_chars: int = 4000) -> str:
         sections: list[str] = []
@@ -6785,6 +7880,66 @@ class FlexiBot:
         condensed = "\n".join(lines[:6]).strip()
         return condensed[:max_chars]
 
+    def _tool_result_semantic_blocker(self, result: str) -> str:
+        payload = self._parse_tool_result_payload(result)
+        if not payload:
+            return ""
+        data = payload.get("data") or {}
+        candidate_fields = [
+            data.get("stdout"),
+            data.get("output"),
+            data.get("analysis"),
+            payload.get("summary"),
+        ]
+        for candidate in candidate_fields:
+            if not isinstance(candidate, str):
+                continue
+            text = candidate.strip()
+            if not text:
+                continue
+            parsed = None
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                for key in ("error", "errors", "exception", "failure", "failed"):
+                    value = parsed.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                    if isinstance(value, list):
+                        joined = "; ".join(str(item).strip() for item in value if str(item).strip())
+                        if joined:
+                            return joined
+                if parsed.get("blocked") is True:
+                    return text[:240]
+            lowered = text.lower()
+            if any(marker in lowered for marker in ("traceback", "exception", "error:", "returned none", "not initialized", "login required", "blocked:")):
+                return text[:240]
+        return ""
+
+    def _idle_workflow_block_reason(self) -> str:
+        if getattr(self, "_turn_active", False):
+            return "an interactive turn is still active"
+        try:
+            heartbeat = self.runtime_heartbeat()
+        except Exception:
+            heartbeat = {}
+        phase = str(heartbeat.get("current_phase", "") or "").strip().lower()
+        if phase and phase not in {"awaiting_input", "idle", "completed", "startup", "blocked"}:
+            return f"runtime phase is {phase}"
+        try:
+            if self.state.query_history(tag="plan", limit=5):
+                return "there are pending plans"
+        except Exception:
+            pass
+        try:
+            if self.active_goals():
+                return "there are active goals"
+        except Exception:
+            pass
+        return ""
+
     def _build_action_turn_result(self, tool_results: list[str]) -> str:
         failed = False
         summaries: list[str] = []
@@ -6796,7 +7951,11 @@ class FlexiBot:
                 summary = str(payload.get("summary", "")).strip()
                 if summary:
                     summaries.append(f"{tool_name}: {summary}")
-                if not bool(payload.get("ok", False)):
+                semantic_blocker = self._tool_result_semantic_blocker(result)
+                if semantic_blocker:
+                    failed = True
+                    errors.append(f"{tool_name}: {semantic_blocker}")
+                elif not bool(payload.get("ok", False)):
                     failed = True
                     payload_errors = [str(item).strip() for item in payload.get("errors", []) if str(item).strip()]
                     if payload_errors:
@@ -6889,6 +8048,159 @@ class FlexiBot:
         guidance["blocked_reason"] = ""
         return guidance
 
+    def _normalize_verification_guidance(self, reviewer_guidance: dict[str, Any] | None,
+                                         verification: dict[str, Any], tool_results: list[str]) -> dict[str, Any]:
+        guidance = copy.deepcopy(reviewer_guidance or {})
+        if any(self._tool_result_failed(result) for result in tool_results):
+            return guidance
+        if any(self._tool_result_semantic_blocker(result) for result in tool_results):
+            return guidance
+        classification = verification.get("failure_classification", {}) if isinstance(verification, dict) else {}
+        if str(classification.get("category", "")) != "ambient_failure":
+            return guidance
+        guidance["severity"] = "healthy"
+        guidance["confidence"] = "high"
+        guidance["verification_level"] = "light"
+        guidance["require_stronger_verification"] = False
+        guidance["redirect_to_inspection"] = False
+        guidance["mark_goal_blocked"] = False
+        guidance["blocked_reason"] = ""
+        if not guidance.get("next_step"):
+            guidance["next_step"] = "Ignore unrelated repo failures outside the active scope and continue with scoped verification."
+        return guidance
+
+    def _normalize_inspection_ledger_entry(self, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        timestamp = float(value.get("timestamp", 0) or 0)
+        request_signature = str(value.get("request_signature", "") or "").strip()
+        goal_id = str(value.get("goal_id", "") or "").strip()
+        summary = str(value.get("summary", "") or "").strip()
+        payloads = [str(item).strip() for item in value.get("payloads", []) if str(item).strip()][:8]
+        scope_paths: list[str] = []
+        scope_seen: set[str] = set()
+        for item in value.get("scope_paths", []) or []:
+            key = self._normalize_compare_path(str(item))
+            if not key or key in scope_seen:
+                continue
+            scope_paths.append(str(item).strip())
+            scope_seen.add(key)
+        paths: list[str] = []
+        seen: set[str] = set(scope_seen)
+        for item in value.get("paths", []) or []:
+            key = self._normalize_compare_path(str(item))
+            if not key or key in seen:
+                continue
+            paths.append(str(item).strip())
+            seen.add(key)
+        allowance_key = str(value.get("allowance_key", "") or "").strip()
+        if not allowance_key:
+            seed = self._normalize_compare_path(paths[0] if paths else (scope_paths[0] if scope_paths else request_signature))
+            allowance_key = f"{request_signature or '__session__'}:{int(timestamp * 1000)}:{seed[:80]}"
+        return {
+            "timestamp": timestamp,
+            "request_signature": request_signature,
+            "goal_id": goal_id,
+            "summary": summary,
+            "payloads": payloads,
+            "scope_paths": scope_paths[:12],
+            "paths": paths[:20],
+            "allowance_key": allowance_key,
+        }
+
+    def _inspection_ledger(self) -> list[dict[str, Any]]:
+        raw = self.state.recall(INSPECTION_LEDGER_KEY)
+        entries: list[dict[str, Any]] = []
+        for item in raw if isinstance(raw, list) else []:
+            normalized = self._normalize_inspection_ledger_entry(item)
+            if normalized is not None:
+                entries.append(normalized)
+        return entries[-INSPECTION_LEDGER_KEEP:]
+
+    def _remember_inspection_turn(self, response: str, tool_results: list[str], verification: dict[str, Any]) -> dict[str, Any] | None:
+        payloads = self._response_tool_payloads(response)
+        if not payloads:
+            return None
+        if any(self._tool_result_failed(result) for result in tool_results):
+            return None
+        if any(self._tool_result_semantic_blocker(result) for result in tool_results):
+            return None
+        if bool(verification.get("should_block", False)):
+            return None
+
+        request_signature = self._effective_request_signature((self.current_request_context or {}).get("request_signature", ""))
+        goal = self.current_goal() or {}
+        scope_paths = self._verification_scope_paths("inspection")
+        path_candidates: list[str] = []
+        payload_summaries: list[str] = []
+
+        for tool_name, raw_payload in payloads:
+            normalized_payload = self._normalize_tool_payload(raw_payload)
+            payload_summaries.append(f"{tool_name}: {normalized_payload[:240]}")
+            path_candidates.extend(self._extract_path_candidates(normalized_payload))
+        for result in tool_results:
+            path_candidates.extend(self._extract_path_candidates(self._tool_result_text(result)))
+
+        merged_paths: list[str] = []
+        seen: set[str] = set()
+        for item in [*path_candidates, *scope_paths]:
+            key = self._normalize_compare_path(str(item))
+            if not key or key in seen:
+                continue
+            merged_paths.append(str(item).strip())
+            seen.add(key)
+
+        entry = self._normalize_inspection_ledger_entry({
+            "timestamp": time.time(),
+            "request_signature": request_signature,
+            "goal_id": str(goal.get("id", "") or "").strip(),
+            "summary": str(verification.get("summary", "") or "Inspection recorded.").strip(),
+            "payloads": payload_summaries,
+            "scope_paths": scope_paths,
+            "paths": merged_paths,
+        })
+        if entry is None:
+            return None
+        ledger = self._inspection_ledger()
+        ledger.append(entry)
+        self.state.remember(INSPECTION_LEDGER_KEY, ledger[-INSPECTION_LEDGER_KEEP:])
+        return entry
+
+    def _inspection_allowances_for_feedback(self, consumed_keys: list[str] | None = None) -> list[dict[str, Any]]:
+        now = time.time()
+        consumed = {str(item).strip() for item in (consumed_keys or []) if str(item).strip()}
+        active_request = self._effective_request_signature((self.current_request_context or {}).get("request_signature", ""))
+        current_scope = self._verification_scope_paths("")
+        allowances: list[dict[str, Any]] = []
+        for entry in reversed(self._inspection_ledger()):
+            timestamp = float(entry.get("timestamp", 0) or 0)
+            if timestamp <= 0 or (now - timestamp) > INSPECTION_ALLOWANCE_WINDOW_SECONDS:
+                continue
+            allowance_key = str(entry.get("allowance_key", "") or "").strip()
+            if allowance_key and allowance_key in consumed:
+                continue
+            entry_paths = list(entry.get("paths", []) or []) + list(entry.get("scope_paths", []) or [])
+            if not entry_paths:
+                continue
+            same_request = bool(active_request and str(entry.get("request_signature", "") or "") == active_request)
+            scope_overlap = any(
+                self._paths_overlap_for_verification(left, right)
+                for left in entry_paths
+                for right in current_scope
+            ) if current_scope else False
+            if not same_request and not scope_overlap:
+                continue
+            allowances.append({
+                "allowance_key": allowance_key,
+                "paths": list(entry.get("paths", []) or [])[:20],
+                "scope_paths": list(entry.get("scope_paths", []) or [])[:12],
+                "expires_at": timestamp + INSPECTION_ALLOWANCE_WINDOW_SECONDS,
+                "remaining_mutations": 1,
+                "request_signature": str(entry.get("request_signature", "") or "").strip(),
+                "summary": str(entry.get("summary", "") or "").strip(),
+            })
+        return allowances[:8]
+
     def _action_turn_fallback(self, response: str, tool_results: list[str],
                               verification: dict[str, Any], reviewer_review: str,
                               reviewer_guidance: dict[str, Any] | None = None,
@@ -6897,12 +8209,15 @@ class FlexiBot:
         stronger = stronger_verification or {}
         blocked = (
             any(self._tool_result_failed(result) for result in tool_results)
-            or not verification.get("success", False)
+            or any(self._tool_result_semantic_blocker(result) for result in tool_results)
+            or bool(verification.get("should_block", not verification.get("success", False)))
             or bool(stronger.get("required") and not stronger.get("verified", False))
             or guidance.get("severity") == "blocked"
         )
         if blocked:
             detail = str(stronger.get("reason") or "").strip()
+            if not detail:
+                detail = next((self._tool_result_semantic_blocker(result) for result in tool_results if self._tool_result_semantic_blocker(result)), "")
             if not detail:
                 failed_result = next((result for result in tool_results if self._tool_result_failed(result)), tool_results[-1] if tool_results else "")
                 detail = self._tool_result_highlight(failed_result, prefer_error=True)
@@ -6932,12 +8247,13 @@ class FlexiBot:
         verification = self.verify_and_report(aggregated_result, context="action_turn")
         reviewer_review = self._run_reviewer_pass("tools", user_input, aggregated_result, verification=verification)
         reviewer_guidance = self._reviewer_guidance_from_text(reviewer_review)
+        reviewer_guidance = self._normalize_verification_guidance(reviewer_guidance, verification, tool_results)
         inspection_only = self._inspection_only_turn(response, tool_results)
         if inspection_only:
             reviewer_guidance = self._normalize_inspection_guidance(reviewer_guidance, verification, tool_results)
         stronger_verification = {
             "required": False,
-            "verified": bool(verification.get("success", False)),
+            "verified": bool(verification.get("success", False)) and not bool(verification.get("should_block", False)),
             "confidence": reviewer_guidance.get("confidence", "medium"),
             "reason": "",
             "evidence": [],
@@ -6958,7 +8274,8 @@ class FlexiBot:
 
         blocked = (
             any(self._tool_result_failed(result) for result in tool_results)
-            or not verification.get("success", False)
+            or any(self._tool_result_semantic_blocker(result) for result in tool_results)
+            or bool(verification.get("should_block", not verification.get("success", False)))
             or bool(stronger_verification.get("required") and not stronger_verification.get("verified", False))
             or reviewer_guidance.get("severity") == "blocked"
         )
@@ -6970,6 +8287,9 @@ class FlexiBot:
             if stronger_verification.get("reason"):
                 merged_guidance["blocked_reason"] = str(stronger_verification.get("reason"))
         goal_update = self._apply_reviewer_goal_guidance(merged_guidance, stronger_verification)
+        inspection_record = None
+        if inspection_only:
+            inspection_record = self._remember_inspection_turn(response, tool_results, verification)
         policy_feedback = self._update_execution_policy_feedback(merged_guidance, stronger_verification)
 
         fallback = self._action_turn_fallback(
@@ -7028,11 +8348,43 @@ class FlexiBot:
                 )
 
         finalized, trimmed_menu = self._trim_finalize_followup(finalized)
+        if self._finalizer_has_interactive_followup(finalized) and not self._user_requested_options(user_input):
+            finalized = fallback
+            trimmed_menu = True
         if finalized and not re.match(r'^(Completed|Blocked):', finalized):
             cleaned = finalized.lstrip('-: ').strip()
             finalized = f"{target_prefix} {cleaned}".strip()
         if not finalized:
             finalized = fallback
+
+        blocker_info: dict[str, Any] = {}
+        blocker_repeat_count = 0
+        blocker_summary_escalated = False
+        if blocked:
+            blocker_info = self._blocked_finalization_signature(
+                finalized,
+                tool_results,
+                verification,
+                reviewer_review,
+                reviewer_guidance=merged_guidance,
+                stronger_verification=stronger_verification,
+            )
+            blocker_memory = self._remember_blocker_attempt(
+                (self.current_request_context or {}).get("request_signature", ""),
+                blocker_info,
+            )
+            blocker_repeat_count = int(blocker_memory.get("repeat_count", 0) or 0)
+            blocker_summary = str(blocker_memory.get("summary", "") or "").strip()
+            if blocker_summary:
+                finalized = blocker_summary
+                blocker_summary_escalated = True
+                self._append_response_trace(
+                    "blocker_summary_escalated",
+                    finalized=finalized,
+                    repeat_count=blocker_repeat_count,
+                    blocker_info=blocker_info,
+                    request_signature=blocker_memory.get("request_signature", ""),
+                )
 
         if blocked:
             self._note_runtime_error(finalized, current_phase="blocked", persist=True)
@@ -7052,6 +8404,10 @@ class FlexiBot:
             "redirect_to_inspection": bool(merged_guidance.get("redirect_to_inspection")),
             "goal_update": goal_update,
             "inspection_only": inspection_only,
+            "inspection_record": inspection_record,
+            "blocker_info": blocker_info,
+            "blocker_repeat_count": blocker_repeat_count,
+            "blocker_summary_escalated": blocker_summary_escalated,
         }
 
     def _mixed_consensus_fallback(self, response: str, tool_results: list[str]) -> str:
@@ -7095,9 +8451,15 @@ class FlexiBot:
             duration=dur,
             meta=meta,
         )
-        return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{draft}"
+        return self._format_final_answer_block(draft)
+
+    def _format_final_answer_block(self, message: str) -> str:
+        body = "" if message is None else str(message)
+        return f"\n{PROMPT_DIVIDER}\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{body}"
 
     def _should_return_after_action_turn(self, pending_consensus: str, finalize_meta: dict[str, Any]) -> bool:
+        if finalize_meta.get("blocker_summary_escalated"):
+            return True
         if str(pending_consensus or "").strip():
             return not bool(finalize_meta.get("blocked"))
         if finalize_meta.get("strategy_shift"):
@@ -7107,7 +8469,18 @@ class FlexiBot:
     def _build_internal_action_continuation(self, finalized: str, finalize_meta: dict[str, Any]) -> str:
         blocked = bool(finalize_meta.get("blocked"))
         guidance = finalize_meta.get("reviewer_guidance") if isinstance(finalize_meta.get("reviewer_guidance"), dict) else {}
+        mismatch = finalize_meta.get("plan_result_mismatch") if isinstance(finalize_meta.get("plan_result_mismatch"), dict) else {}
         next_step = str(guidance.get("next_step", "") or "").strip()
+        mismatch_summary = str(mismatch.get("summary", "") or "").strip()
+        mismatch_next_step = str(mismatch.get("next_step", "") or "").strip()
+        if mismatch.get("mismatch"):
+            detail = mismatch_summary or finalized.strip() or "Blocked action turn."
+            suffix = f" Next step hint: {mismatch_next_step or next_step}" if (mismatch_next_step or next_step) else ""
+            return (
+                f"Internal Continuation: {detail}{suffix} "
+                "Do not claim progress until the next action satisfies the promised plan intent or the plan is rewritten to match an inspection-only turn. "
+                "Use <consensus> only if you need user input or a decision."
+            ).strip()
         if blocked:
             detail = finalized.strip() or "Blocked action turn."
             suffix = f" Next step hint: {next_step}" if next_step else ""
@@ -7708,6 +9081,270 @@ class FlexiBot:
             f"reviewer_events={status.get('reviewer_event_count')}",
         ])
 
+    def _history_jsonl_records(self, path: Path, max_records: int = 800) -> list[dict[str, Any]]:
+        if not path.exists() or not path.is_file():
+            return []
+        try:
+            lines = _rlm_read_text(path).splitlines()
+        except Exception:
+            return []
+        if max_records > 0 and len(lines) > max_records:
+            lines = lines[-max_records:]
+        records: list[dict[str, Any]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                records.append(parsed)
+        return records
+
+    def _history_tail_text(self, path: Path, max_chars: int = 200000) -> str:
+        if not path.exists() or not path.is_file():
+            return ""
+        try:
+            text = _rlm_read_text(path)
+        except Exception:
+            return ""
+        if max_chars > 0 and len(text) > max_chars:
+            return text[-max_chars:]
+        return text
+
+    def _history_primary_sentence(self, text: str, max_chars: int = 220) -> str:
+        sample = str(text or "").strip()
+        if not sample:
+            return ""
+        sample = re.sub(r"\s+", " ", sample)
+        sample = re.sub(r"^assessment:\s*", "", sample, flags=re.I)
+        sample = re.sub(r"^blocked:\s*", "", sample, flags=re.I)
+        sample = re.split(r"(?<=[.!?])\s+|\n|;", sample, maxsplit=1)[0].strip()
+        return sample[:max_chars]
+
+    def _normalize_history_signature(self, text: str) -> str:
+        sample = str(text or "").strip().lower()
+        if not sample:
+            return ""
+        sample = re.sub(r"[a-z]:\\[^\s]+", " <path> ", sample)
+        sample = re.sub(r"/[A-Za-z0-9_.\-/]+", " <path> ", sample)
+        sample = re.sub(r"\b\d+\b", "#", sample)
+        sample = re.sub(r"[`'\"]", "", sample)
+        sample = re.sub(r"\s+", " ", sample)
+        return sample.strip()[:240]
+
+    def _abbreviate_history_signature(self, text: str, max_chars: int = 120) -> str:
+        sample = str(text or "").strip()
+        if len(sample) <= max_chars:
+            return sample
+        return sample[:max_chars - 3].rstrip() + "..."
+
+    def _history_matching_count(self, counter: Counter[str], keywords: tuple[str, ...]) -> tuple[int, str]:
+        total = 0
+        top_signature = ""
+        top_count = 0
+        for signature, count in counter.items():
+            if any(keyword in signature for keyword in keywords):
+                total += count
+                if count > top_count:
+                    top_signature = signature
+                    top_count = count
+        return total, top_signature
+
+    def _history_evolution_plan_signatures(self, text: str) -> Counter[str]:
+        counter: Counter[str] = Counter()
+        if not text:
+            return counter
+        matches = re.findall(
+            r"## Plan Event - .*?\n- \*\*Context:\*\* .*?\n- \*\*Plan:\*\*\n(.*?)\n---",
+            text,
+            flags=re.S,
+        )
+        for match in matches:
+            normalized = self._normalize_plan_signature(match)
+            if normalized:
+                counter[normalized] += 1
+        return counter
+
+    def _history_runtime_improvement_items(self, limit: int = 5) -> dict[str, Any]:
+        trace_records = self._history_jsonl_records(RESPONSE_TRACE_FILE, max_records=1200)
+        audit_path = getattr(self, "audit_log_path", STATE_DIR / "execution_audit.jsonl")
+        audit_records = self._history_jsonl_records(Path(audit_path), max_records=1200)
+        evolution_text = self._history_tail_text(EVOLUTION_LOG, max_chars=200000)
+
+        plan_counter: Counter[str] = Counter()
+        blocker_counter: Counter[str] = Counter()
+        reviewer_counter: Counter[str] = Counter()
+        execution_counter: Counter[str] = Counter()
+
+        for record in trace_records:
+            event_type = str(record.get("event", "") or "")
+            if event_type == "llm_response":
+                for block in record.get("plan_blocks", []) or []:
+                    normalized = self._normalize_plan_signature(block)
+                    if normalized:
+                        plan_counter[normalized] += 1
+                continue
+
+            if event_type == "reviewer_pass":
+                guidance = record.get("guidance") if isinstance(record.get("guidance"), dict) else {}
+                severity = str(guidance.get("severity", "") or "").lower()
+                reviewer_text = guidance.get("blocked_reason") or record.get("review") or guidance.get("next_step")
+                reviewer_signature = self._normalize_history_signature(self._history_primary_sentence(str(reviewer_text or "")))
+                if reviewer_signature:
+                    reviewer_counter[reviewer_signature] += 1
+                    if severity in {"blocked", "risky"}:
+                        blocker_counter[reviewer_signature] += 1
+                continue
+
+            if event_type == "action_turn_finalized":
+                guidance = record.get("reviewer_guidance") if isinstance(record.get("reviewer_guidance"), dict) else {}
+                blocked = bool(record.get("blocked")) or str(guidance.get("severity", "") or "").lower() in {"blocked", "risky"}
+                if blocked or record.get("redirect_to_inspection"):
+                    blocker_text = guidance.get("blocked_reason") or record.get("review") or record.get("finalized")
+                    blocker_signature = self._normalize_history_signature(self._history_primary_sentence(str(blocker_text or "")))
+                    if blocker_signature:
+                        blocker_counter[blocker_signature] += 1
+
+        plan_counter.update(self._history_evolution_plan_signatures(evolution_text))
+
+        for record in audit_records:
+            status = str(record.get("status", "") or "").lower()
+            action = str(record.get("action", "") or "").lower()
+            if status not in {"blocked", "failed"} and action != "deny":
+                continue
+            audit_text = record.get("reason") or record.get("result_preview") or record.get("payload_preview")
+            audit_signature = self._normalize_history_signature(self._history_primary_sentence(str(audit_text or "")))
+            if audit_signature:
+                execution_counter[audit_signature] += 1
+
+        items: list[dict[str, Any]] = []
+
+        inspection_keywords = ("inspection", "stronger verification", "evidence", "verify", "inspection before more changes")
+        inspection_count, inspection_signature = self._history_matching_count(blocker_counter, inspection_keywords)
+        inspection_exec_count, inspection_exec_signature = self._history_matching_count(execution_counter, inspection_keywords)
+        inspection_total = inspection_count + inspection_exec_count
+        if inspection_total:
+            exemplar = inspection_signature or inspection_exec_signature
+            items.append({
+                "priority_score": inspection_total * 3,
+                "symptom": f"Inspection-gated blocker loops recur across runtime history ({inspection_total} occurrences).",
+                "probable_cause": "Mutation plans are still being proposed before the bot has gathered enough file-level evidence to satisfy reviewer guidance.",
+                "recommended_code_change": "Make planners and idle self-improvement check recent inspection evidence first, and automatically pivot to inspection-only steps when reviewer guidance requires stronger verification.",
+                "success_metric": "Inspection-related blocked or denied actions drop by at least 80% over the next 50 action turns.",
+                "evidence": self._abbreviate_history_signature(exemplar),
+            })
+
+        repeated_plans = [(signature, count) for signature, count in plan_counter.most_common() if count >= 2]
+        if repeated_plans:
+            top_plan, top_plan_count = repeated_plans[0]
+            items.append({
+                "priority_score": top_plan_count * 4,
+                "symptom": f"Near-identical plans keep recurring without enough strategic change ({top_plan_count} repeats for the top signature).",
+                "probable_cause": "Planning still underweights recent normalized plan history and realized progress when choosing the next action sequence.",
+                "recommended_code_change": "Feed the last repeated plan signatures and progress deltas into planning, then force a rewritten plan or strategy-family escalation once a signature repeats twice without measurable progress.",
+                "success_metric": "No normalized plan signature repeats more than twice unless files changed, a new tool family was used, or a blocker summary was emitted.",
+                "evidence": self._abbreviate_history_signature(top_plan),
+            })
+
+        prerequisite_keywords = (
+            "module not found",
+            "modulenotfounderror",
+            "importerror",
+            "aiohttp",
+            "scanner",
+            "missing",
+            "not installed",
+            "initialization failed",
+            "dependency",
+        )
+        prerequisite_blockers, prerequisite_signature = self._history_matching_count(blocker_counter, prerequisite_keywords)
+        prerequisite_reviews, prerequisite_review_signature = self._history_matching_count(reviewer_counter, prerequisite_keywords)
+        prerequisite_execs, prerequisite_exec_signature = self._history_matching_count(execution_counter, prerequisite_keywords)
+        prerequisite_total = prerequisite_blockers + prerequisite_reviews + prerequisite_execs
+        if prerequisite_total:
+            exemplar = prerequisite_signature or prerequisite_review_signature or prerequisite_exec_signature
+            items.append({
+                "priority_score": prerequisite_total * 3,
+                "symptom": f"Dependency and import failures are recurring reviewer/blocker themes ({prerequisite_total} occurrences).",
+                "probable_cause": "Verification and execution still reach environments with unresolved prerequisites instead of classifying those failures early and steering toward prerequisite repair.",
+                "recommended_code_change": "Detect repeated missing-module and environment bootstrap failures from history, convert them into prerequisite gaps before rerunning tests, and keep verification scoped to touched targets until prerequisites are satisfied.",
+                "success_metric": "Repeated identical import or dependency failures drop by at least 70%, and prerequisite-classified failures are surfaced before broad test reruns.",
+                "evidence": self._abbreviate_history_signature(exemplar),
+            })
+
+        delivery_keywords = ("incomplete", "partial inspection", "not created", "did not create", "did not perform")
+        delivery_count, delivery_signature = self._history_matching_count(blocker_counter, delivery_keywords)
+        if delivery_count:
+            items.append({
+                "priority_score": delivery_count * 2,
+                "symptom": f"Reviewer feedback repeatedly reports partially completed action turns ({delivery_count} occurrences).",
+                "probable_cause": "Plans are promising more work than the executed tools complete in a single action turn, especially after early inspection steps.",
+                "recommended_code_change": "Tighten turn planning so each action turn commits to one verifiable delivery unit, then compare promised work against changed files and executed tool types before finalizing progress.",
+                "success_metric": "Partial-delivery reviewer findings fall below one per 20 action turns.",
+                "evidence": self._abbreviate_history_signature(delivery_signature),
+            })
+
+        if not items:
+            items.append({
+                "priority_score": 1,
+                "symptom": "No strong repeated blocker signature was found in recent runtime history.",
+                "probable_cause": "The recent trace window did not contain enough repeated failure patterns to justify a ranked backlog item.",
+                "recommended_code_change": "Keep logging structured reviewer guidance and plan signatures so future backlog generation has denser evidence.",
+                "success_metric": "Future history windows retain enough repeated signals to rank at least one evidence-backed backlog item.",
+                "evidence": "recent history window was sparse or diverse",
+            })
+
+        items.sort(key=lambda item: int(item.get("priority_score", 0)), reverse=True)
+        items = items[:max(1, int(limit))]
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "sources": {
+                "response_trace_records": len(trace_records),
+                "execution_audit_records": len(audit_records),
+                "evolution_plan_events": sum(plan_counter.values()),
+            },
+            "items": items,
+        }
+        try:
+            self.state.set_runtime_value(RUNTIME_IMPROVEMENT_BACKLOG_KEY, payload, persist=True)
+        except Exception:
+            pass
+        self._append_response_trace(
+            "history_improvement_backlog",
+            item_count=len(items),
+            top_symptom=items[0].get("symptom", "") if items else "",
+            sources=payload["sources"],
+        )
+        return payload
+
+    def render_runtime_improvement_backlog(self, limit: int = 5) -> str:
+        payload = self._history_runtime_improvement_items(limit=max(1, int(limit)))
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        sources = payload.get("sources", {}) if isinstance(payload, dict) else {}
+        lines = [
+            "History-Driven Runtime Improvement Backlog",
+            (
+                "Sources: "
+                f"response_trace={sources.get('response_trace_records', 0)}, "
+                f"execution_audit={sources.get('execution_audit_records', 0)}, "
+                f"plan_events={sources.get('evolution_plan_events', 0)}"
+            ),
+        ]
+        for index, item in enumerate(items, start=1):
+            lines.append("")
+            lines.append(f"{index}. Symptom: {item.get('symptom', '')}")
+            lines.append(f"   Probable cause: {item.get('probable_cause', '')}")
+            lines.append(f"   Recommended code change: {item.get('recommended_code_change', '')}")
+            lines.append(f"   Success metric: {item.get('success_metric', '')}")
+            evidence = str(item.get("evidence", "") or "").strip()
+            if evidence:
+                lines.append(f"   Evidence: {evidence}")
+            lines.append(f"   Priority score: {item.get('priority_score', 0)}")
+        return "\n".join(lines)
+
     def handle_operator_command(self, raw_command: str) -> str:
         command = (raw_command or "").strip()
         if not command:
@@ -7725,6 +9362,14 @@ class FlexiBot:
                 except ValueError:
                     return "Usage: /history [limit]"
             return self.render_history_summary(limit=limit)
+        if head == "/improvements":
+            limit = 5
+            if len(parts) > 1:
+                try:
+                    limit = max(1, min(20, int(parts[1])))
+                except ValueError:
+                    return "Usage: /improvements [limit]"
+            return self.render_runtime_improvement_backlog(limit=limit)
         if head == "/reviews":
             limit = 10
             if len(parts) > 1:
@@ -7764,6 +9409,7 @@ class FlexiBot:
             return "\n".join([
                 "/health",
                 "/history [limit]",
+                "/improvements [limit]",
                 "/reviews [limit]",
                 "/goals",
                 "/goal add <text>",
@@ -7784,35 +9430,59 @@ class FlexiBot:
                 context = str(goal.get("verification_target") or "").strip()
         try:
             payload = self._parse_tool_result_payload(result)
-            errors = []
-            success = True
+            errors: list[str] = []
+            warnings: list[str] = []
+            raw_success = True
             payload_errors = payload.get("errors", []) if payload else []
             r = self._tool_result_text(result).strip()
-            errors = []
 
             if payload and not payload.get("ok", True):
-                success = False
+                raw_success = False
                 errors.extend(str(item) for item in payload_errors if item)
 
             if not r:
-                success = False
+                raw_success = False
                 errors.append("No output returned from verification run.")
 
             if "Traceback" in r or "Traceback (most recent call last)" in r:
-                success = False
+                raw_success = False
                 errors.append("Traceback detected in output.")
 
             lowered = r.lower()
             if "error:" in lowered or "failed" in lowered or "✗" in r:
-                success = False
+                raw_success = False
                 # Capture a short context line
                 first_error_line = next((l for l in r.splitlines() if 'error' in l.lower() or 'fail' in l.lower() or 'traceback' in l.lower()), None)
                 if first_error_line:
                     errors.append(first_error_line.strip())
 
-            summary = None
+            failure_classification = {
+                "category": "healthy",
+                "should_block": False,
+                "reason": "",
+                "scope_paths": self._verification_scope_paths(context),
+                "failure_paths": [],
+                "matching_paths": [],
+                "request_mentions_failure": False,
+            }
+            success = raw_success
+            should_block = False
+
+            if not raw_success:
+                failure_classification = self._classify_verification_failure(r, errors, context=context)
+                should_block = bool(failure_classification.get("should_block", True))
+                success = not should_block
+
+            if errors and not should_block:
+                warnings = list(errors)
+                errors = []
+
             if errors:
-                summary = f"Verification FAILED: {'; '.join(errors)}"
+                category = str(failure_classification.get("category", "task_blocker") or "task_blocker")
+                summary = f"Verification FAILED ({category}): {'; '.join(errors)}"
+            elif warnings:
+                category = str(failure_classification.get("category", "ambient_failure") or "ambient_failure")
+                summary = f"Verification warning ({category}): {'; '.join(warnings)}"
             else:
                 summary = "Verification OK: No obvious errors detected."
 
@@ -7820,10 +9490,34 @@ class FlexiBot:
             self.state.log_event("system", f"Verification ({context}): {summary}")
             self.logger.log_turn(0, f"verify:{context}", summary, ["verify"])
 
-            return {"success": success, "summary": summary, "errors": errors}
+            return {
+                "success": success,
+                "raw_success": raw_success,
+                "should_block": should_block,
+                "summary": summary,
+                "errors": errors,
+                "warnings": warnings,
+                "failure_classification": failure_classification,
+            }
         except Exception as e:
             ErrorHandler.log(e, context="verify_and_report")
-            return {"success": False, "summary": f"Verification failed: {e}", "errors": [str(e)]}
+            return {
+                "success": False,
+                "raw_success": False,
+                "should_block": True,
+                "summary": f"Verification failed: {e}",
+                "errors": [str(e)],
+                "warnings": [],
+                "failure_classification": {
+                    "category": "task_blocker",
+                    "should_block": True,
+                    "reason": str(e),
+                    "scope_paths": self._verification_scope_paths(context),
+                    "failure_paths": [],
+                    "matching_paths": [],
+                    "request_mentions_failure": False,
+                },
+            }
 
     def _reviewer_pass_allowed(self, subject: str) -> bool:
         if not self.reviewer_pass_enabled:
@@ -7920,6 +9614,8 @@ class FlexiBot:
                                           stronger_verification: dict[str, Any] | None = None) -> dict[str, Any]:
         guidance = copy.deepcopy(reviewer_guidance or {})
         stronger = copy.deepcopy(stronger_verification or {})
+        existing_feedback = copy.deepcopy(getattr(self.execution_policy, "runtime_feedback", {}) or {})
+        consumed_keys = [str(item).strip() for item in existing_feedback.get("consumed_inspection_keys", []) if str(item).strip()]
         target = self._scoped_verification_target()
         feedback = {
             "severity": str(guidance.get("severity", "healthy") or "healthy"),
@@ -7929,6 +9625,8 @@ class FlexiBot:
             "blocked_reason": str(guidance.get("blocked_reason") or stronger.get("reason") or "").strip(),
             "next_step": str(guidance.get("next_step") or stronger.get("next_step") or "").strip(),
             "verification_target": target,
+            "inspection_allowances": self._inspection_allowances_for_feedback(consumed_keys=consumed_keys),
+            "consumed_inspection_keys": consumed_keys[-64:],
             "updated_at": datetime.now().isoformat(),
         }
         if (
@@ -8295,6 +9993,9 @@ class FlexiBot:
             return False
 
     def generate_improvement_plan(self) -> str:
+        backlog_text = self.render_runtime_improvement_backlog(limit=5)
+        if backlog_text.strip():
+            return backlog_text
         base = "Generate a concise plan for improving the current agent codebase without making unsafe changes."
         try:
             resp = self.client.chat([
@@ -9071,7 +10772,7 @@ class FlexiBot:
         # 3) Test run
         try:
             if Path("tests").is_dir():
-                test_out = self.tool_run_tests(f'"{sys.executable}" -m pytest -q')
+                test_out = self.tool_run_tests(str(proposal_path))
                 test_payload = self._parse_tool_result_payload(test_out) or {"raw": test_out}
                 test_ok = not self._tool_result_failed(test_out)
                 details["tests"] = {"ok": test_ok, "result": test_payload}
@@ -9942,14 +11643,61 @@ class FlexiBot:
     def tool_run_tests(self, command: str = ""):
         test_command = command.strip()
         if not test_command:
-            goal = self.current_goal()
-            if goal and goal.get("verification_target"):
-                test_command = str(goal.get("verification_target") or "").strip()
+            scope_spec = self._resolve_scoped_verification_spec(allow_full_fallback=True)
+            test_command = str(scope_spec.get("value", "") or "").strip()
         if not test_command:
             test_candidates = list(Path(".").glob("test_*.py")) + list(Path("tests").glob("**/test*.py")) if Path("tests").exists() else list(Path(".").glob("test_*.py"))
             if not test_candidates:
                 return self._structured_tool_result("run_tests", False, summary="No tests found.", errors=["No tests found and no command provided."])
             test_command = f'"{sys.executable}" -m unittest discover -v'
+        path_candidate: Path | None = None
+        try:
+            candidate_text = test_command.strip().strip('"\'')
+            if candidate_text and "pytest" not in test_command.lower() and "unittest" not in test_command.lower():
+                candidate_path = Path(candidate_text)
+                if not candidate_path.is_absolute():
+                    candidate_path = (Path.cwd() / candidate_path).resolve()
+                else:
+                    candidate_path = candidate_path.resolve()
+                if candidate_path.exists():
+                    path_candidate = candidate_path
+        except Exception:
+            path_candidate = None
+        if path_candidate and path_candidate.is_file() and path_candidate.suffix.lower() == ".py" and not self._path_has_tests(path_candidate):
+            delegated = self.tool_run_verification(target_script=str(path_candidate))
+            delegated_payload = self._parse_tool_result_payload(delegated) or {"raw": delegated}
+            delegated_ok = bool(delegated_payload.get("ok", False))
+            delegated_summary = str(delegated_payload.get("summary", "") or "").strip() or f"Verified {path_candidate.name}."
+            delegated_errors = [str(item).strip() for item in delegated_payload.get("errors", []) if str(item).strip()]
+            self.state.set_runtime_value(
+                LAST_TEST_RUN_KEY,
+                {
+                    "timestamp": time.time(),
+                    "command": "",
+                    "success": delegated_ok,
+                    "summary": delegated_summary,
+                    "errors": delegated_errors[:10],
+                    "goal": self._current_goal_reference(),
+                    "result": {
+                        "delegated_tool": "run_verification",
+                        "scoped_target": str(path_candidate),
+                        "result": copy.deepcopy(delegated_payload),
+                    },
+                },
+                persist=True,
+            )
+            return self._structured_tool_result(
+                "run_tests",
+                delegated_ok,
+                summary=delegated_summary,
+                errors=delegated_errors,
+                data={
+                    "command": "",
+                    "delegated_tool": "run_verification",
+                    "scoped_target": str(path_candidate),
+                    "result": delegated_payload,
+                },
+            )
         if "pytest" in test_command.lower():
             try:
                 import shlex
@@ -11365,6 +13113,7 @@ if __name__ == "__main__":
             return [e for e in self.state.query_history(tag="fact") if pattern in e["content"]]
 
         try:
+            self._turn_active = True
             # Periodic Summary Check
             if self.state.total_tokens > TOKEN_THRESHOLD:
                 self.compress_context()
@@ -11374,9 +13123,14 @@ if __name__ == "__main__":
             # also record the user prompt in the evolution log with metadata
             self.logger.log_user(user_input)
             request_signature = self._progress_request_signature(user_input)
+            if request_signature and request_signature != "__continue__":
+                self.active_request_signature = request_signature
+            elif not self.active_request_signature:
+                self.active_request_signature = "__session__"
+            effective_request_signature = self._effective_request_signature(request_signature)
             self.current_request_context = {
                 "user_input": user_input,
-                "request_signature": request_signature,
+                "request_signature": effective_request_signature,
                 "turn_counter": self.turn_counter,
             }
             if request_signature and request_signature != "__continue__" and request_signature != self.last_progress_request_signature:
@@ -11436,16 +13190,6 @@ if __name__ == "__main__":
                         ])
                         resp = resp_data["choices"][0]["message"]["content"]
 
-                    # Pretty print the thought process with clear sections
-                    sep_line = f"{Colors.DIM}{'-'*60}{Colors.ENDC}"
-                    print(f"\n{sep_line}")
-                    
-                    # Sanitise resp to prevent broken formatting
-                    formatted_thought = resp.replace('\n', f'\n{Colors.DIM}| {Colors.ENDC}')
-                    
-                    print(f"{Colors.YELLOW}{Colors.BOLD}⚡ Thought:{Colors.ENDC}\n{Colors.DIM}| {Colors.ENDC}{formatted_thought}")
-                    print(f"{sep_line}")
-
                     # 1. Extract Tools
                     bash = re.findall(r"<bash>(.*?)</bash>", resp, re.S)
                     py = re.findall(r"<python>(.*?)</python>", resp, re.S)
@@ -11454,6 +13198,14 @@ if __name__ == "__main__":
                     pending_consensus = self._extract_consensus_text(resp) if "<consensus>" in resp else ""
                     normalized_bash = [self._normalize_tool_payload(item) for item in bash]
                     normalized_py = [self._normalize_tool_payload(item) for item in py]
+                    strategy_families = self._infer_strategy_families(plan, bash, py, pending_consensus)
+                    self._render_cli_response_sections(
+                        resp,
+                        plan_blocks=plan,
+                        bash_payloads=bash,
+                        python_payloads=py,
+                        consensus_text=pending_consensus,
+                    )
                     self._append_response_trace(
                         "llm_response",
                         response=resp,
@@ -11479,7 +13231,7 @@ if __name__ == "__main__":
                             continue
 
                         if has_tools:
-                            print(f"{Colors.YELLOW}⚠️ Mixed Consensus and Action detected. Attempting to salvage final answer after tool execution.{Colors.ENDC}")
+                            ConsoleOutput.debug("Mixed consensus detected during tool execution; finalizer will produce the user-facing result.")
                             obs_prefix = "System Notice: You provided <consensus> with tools. The consensus will be accepted if the tool results succeed.\n"
                         else:
                             # Valid pure consensus
@@ -11501,7 +13253,7 @@ if __name__ == "__main__":
                             # no tools used for pure consensus
                             self.logger.log_turn(turn_num, resp, self.state.calculate_diff(turn_start_data, self.state.data), ["consensus"], duration=dur, meta=meta)
                             # Final response should not include the user label prefix
-                            return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{draft}"
+                            return self._format_final_answer_block(draft)
                     else:
                         obs_prefix = ""
 
@@ -11510,12 +13262,36 @@ if __name__ == "__main__":
                     # 4. Execute Tools
                     obs = ""
                     tool_results: list[str] = []
-                    for p in plan: 
-                        print(f"{Colors.BLUE}📋 Plan:{Colors.ENDC} {p}")
-                        obs += f"Plan: {p}\n" 
+                    for p in plan:
+                        obs += f"Plan: {p}\n"
+
+                    duplicate_plan_message = self._duplicate_plan_block_message(effective_request_signature, plan)
+                    if duplicate_plan_message:
+                        self.last_observation = duplicate_plan_message
+                        self.state.log_event("system", duplicate_plan_message)
+                        self._append_response_trace(
+                            "duplicate_plan_suppressed",
+                            response=resp,
+                            request_signature=effective_request_signature,
+                            plan_signatures=self._plan_signatures(plan),
+                            message=duplicate_plan_message,
+                        )
+                        continue
+
+                    strategy_family_message = self._strategy_family_escalation_message(effective_request_signature, strategy_families)
+                    if strategy_family_message:
+                        self.last_observation = strategy_family_message
+                        self.state.log_event("system", strategy_family_message)
+                        self._append_response_trace(
+                            "strategy_family_escalated",
+                            response=resp,
+                            request_signature=effective_request_signature,
+                            strategy_families=strategy_families,
+                            message=strategy_family_message,
+                        )
+                        continue
                     
-                    for b in bash: 
-                        print(f"{Colors.CYAN}💻 Bash:{Colors.ENDC} {b}")
+                    for b in bash:
                         res = self.run_bash(b)
                         tool_results.append(res)
                         bash_failed = self._report_tool_execution_status(res)
@@ -11528,7 +13304,6 @@ if __name__ == "__main__":
                             pass
                     
                     for p in py:
-                        print(f"{Colors.GREEN}🐍 Python:{Colors.ENDC} {p}")
                         out = self.run_python(p)
                         tool_results.append(out)
                         python_failed = self._report_tool_execution_status(out)
@@ -11591,16 +13366,47 @@ if __name__ == "__main__":
                     if bash or py:
                         finalized, finalize_meta = self._finalize_action_turn(resp, user_input, tool_results)
                         progress_eval = self._evaluate_turn_progress(progress_baseline or {}, finalize_meta, tool_results)
+                        plan_result_mismatch = self._plan_result_mismatch(plan, resp, tool_results, progress_eval, finalize_meta)
+                        if plan_result_mismatch.get("mismatch"):
+                            finalize_meta = dict(finalize_meta)
+                            finalize_meta["plan_result_mismatch"] = plan_result_mismatch
+                            reviewer_guidance = copy.deepcopy(finalize_meta.get("reviewer_guidance", {}) or {})
+                            reviewer_guidance["blocked_reason"] = str(plan_result_mismatch.get("reason", "") or reviewer_guidance.get("blocked_reason", "")).strip()
+                            reviewer_guidance["next_step"] = str(plan_result_mismatch.get("next_step", "") or reviewer_guidance.get("next_step", "")).strip()
+                            finalize_meta["reviewer_guidance"] = reviewer_guidance
+                            finalize_meta["blocked"] = True
+                            finalize_meta["confidence"] = "low"
+                            if not finalize_meta.get("blocker_summary_escalated"):
+                                finalized = str(plan_result_mismatch.get("summary", "") or finalized).strip() or finalized
+                            self.last_observation = str(plan_result_mismatch.get("summary", "") or finalized).strip() or self.last_observation
+                            self.state.log_event("system", self.last_observation)
+                            self._note_runtime_error(self.last_observation, current_phase="blocked", persist=True)
+                            self._append_response_trace(
+                                "plan_result_mismatch",
+                                original=resp,
+                                finalized=finalized,
+                                user_input=user_input,
+                                request_signature=effective_request_signature,
+                                mismatch=plan_result_mismatch,
+                                tool_count=len(tool_results),
+                                progress_score=int(progress_eval.get("score", 0) or 0),
+                            )
                         if progress_eval.get("low_progress"):
                             self.low_progress_turns += 1
                         else:
                             self.low_progress_turns = 0
                         progress_eval["consecutive_low_progress"] = self.low_progress_turns
                         self.last_progress_evaluation = progress_eval
+                        self._remember_plan_attempt(effective_request_signature, plan, progress_eval, finalize_meta)
+                        self._remember_strategy_family_attempt(effective_request_signature, strategy_families, progress_eval, finalize_meta)
 
                         finalize_meta = dict(finalize_meta)
                         finalize_meta["strategy_shift"] = False
-                        if progress_eval.get("low_progress") and self.low_progress_turns >= 2:
+                        if (
+                            progress_eval.get("low_progress")
+                            and self.low_progress_turns >= 2
+                            and not finalize_meta.get("blocker_summary_escalated")
+                        ):
                             finalized = self._low_progress_strategy_message(progress_eval)
                             finalize_meta["blocked"] = True
                             finalize_meta["strategy_shift"] = True
@@ -11628,6 +13434,7 @@ if __name__ == "__main__":
                             review=finalize_meta.get("review", ""),
                             reviewer_guidance=finalize_meta.get("reviewer_guidance", {}),
                             stronger_verification=finalize_meta.get("stronger_verification", {}),
+                            plan_result_mismatch=finalize_meta.get("plan_result_mismatch", {}),
                             goal_update=finalize_meta.get("goal_update", {}),
                             tool_count=len(tool_results),
                             progress_score=int(progress_eval.get("score", 0)),
@@ -11639,6 +13446,9 @@ if __name__ == "__main__":
                             goal_advances=progress_eval.get("goal_advances", []),
                             redirect_to_inspection=bool(finalize_meta.get("redirect_to_inspection")),
                             strategy_shift=bool(finalize_meta.get("strategy_shift")),
+                            blocker_info=finalize_meta.get("blocker_info", {}),
+                            blocker_repeat_count=int(finalize_meta.get("blocker_repeat_count", 0) or 0),
+                            blocker_summary_escalated=bool(finalize_meta.get("blocker_summary_escalated")),
                             returned_to_user=bool(return_to_user),
                             continuation_note=continuation_note,
                         )
@@ -11664,9 +13474,13 @@ if __name__ == "__main__":
                             meta.append(f"confidence:{finalize_meta.get('confidence')}")
                         if finalize_meta.get("redirect_to_inspection"):
                             meta.append("inspect_redirect")
+                        if finalize_meta.get("plan_result_mismatch"):
+                            meta.append("plan_result_mismatch")
                         stronger_verification = finalize_meta.get("stronger_verification", {})
                         if isinstance(stronger_verification, dict) and stronger_verification.get("required"):
                             meta.append("strong_verify")
+                        if finalize_meta.get("blocker_summary_escalated"):
+                            meta.append("blocker_escalated")
                         if finalize_meta.get("strategy_shift"):
                             meta.append("strategy_shift")
                         if return_to_user:
@@ -11686,7 +13500,7 @@ if __name__ == "__main__":
                         except Exception:
                             pass
                         if return_to_user:
-                            return f"\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{finalized}"
+                            return self._format_final_answer_block(finalized)
                         continue
 
                     # 6. Log and Continue
@@ -11729,6 +13543,8 @@ if __name__ == "__main__":
             return f"{stop_msg}\n\n{recovery}"
         except Exception as outer_e:
             return f"\n{Colors.RED}[CRITICAL HANDLER FAILURE]: {outer_e}{Colors.ENDC}\n{traceback.format_exc()}"
+        finally:
+            self._turn_active = False
 
 
 def clear_console():
@@ -11799,14 +13615,17 @@ def bootstrap_runtime(log_step):
     return bot
 
 
-def start_input_thread(input_queue: queue.Queue):
+def start_input_thread(input_queue: queue.Queue, input_ready: threading.Event):
     def input_worker():
         while True:
             try:
-                user_text = input()
+                input_ready.wait()
+                user_text = input(f"{Colors.GREEN}{Colors.BOLD}{ConsoleOutput.prompt_text()}{Colors.ENDC}")
+                input_ready.clear()
                 input_queue.put(user_text)
                 save_command_history()
             except EOFError:
+                input_ready.clear()
                 save_command_history()
                 input_queue.put(None)
                 break
@@ -11835,7 +13654,17 @@ def shutdown_runtime(bot: Optional[FlexiBot], reason: str = ""):
             pass
 
 
-def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle_timeout: int = 300):
+def _format_repl_output_block(message: Any) -> str:
+    text = "" if message is None else str(message)
+    normalized = text.replace("\r\n", "\n")
+    if not normalized.endswith("\n"):
+        normalized += "\n"
+    if not normalized.endswith("\n\n"):
+        normalized += "\n"
+    return normalized
+
+
+def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, input_ready: threading.Event, log_step, idle_timeout: int = 300):
     stdin_closed = False
     log_step("enter input loop")
     # Respect both an explicit bot attribute and a module-level environment-controlled toggle.
@@ -11843,8 +13672,8 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
     while True:
         log_step("loop iteration start")
         bot._update_runtime_heartbeat(current_mode="interactive", current_phase="awaiting_input", persist=True)
-        ConsoleOutput.user_output("", end="")
-        ConsoleOutput.prompt()
+        if not stdin_closed and not input_ready.is_set():
+            input_ready.set()
 
         last_activity = time.time()
         user_input = None
@@ -11856,13 +13685,16 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
                     break
                 except queue.Empty:
                     if time.time() - last_activity > effective_idle:
-                        bot._update_runtime_heartbeat(current_mode="idle", current_phase="idle", persist=True)
-                        ConsoleOutput.warning(f"User idle for {effective_idle}s. Resuming...")
                         last_activity = time.time()
+                        idle_block_reason = bot._idle_workflow_block_reason()
 
                         # trigger auto-proposal workflow and apply confirmed patch (guarded + lightweight safety)
                         # Run the workflow only when explicitly allowed; invoke in a background thread to avoid blocking the input loop.
-                        if (getattr(bot, "idle_proposal_enabled", False) or globals().get("AUTO_IDLE_PROPOSAL_ENABLED", False)) and getattr(bot, "idle_proposal_interval_seconds", 0) > 0:
+                        if idle_block_reason:
+                            ConsoleOutput.debug(f"Idle workflow skipped: {idle_block_reason}.")
+                        elif (getattr(bot, "idle_proposal_enabled", False) or globals().get("AUTO_IDLE_PROPOSAL_ENABLED", False)) and getattr(bot, "idle_proposal_interval_seconds", 0) > 0:
+                            bot._update_runtime_heartbeat(current_mode="idle", current_phase="idle", persist=True)
+                            ConsoleOutput.warning(f"User idle for {effective_idle}s. Resuming...")
                             import threading
 
                             def _run_idle_workflow_bg():
@@ -11893,8 +13725,8 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
                         else:
                             ConsoleOutput.system("Idle proposal workflow disabled or misconfigured; skipping automated run.")
 
-                        ConsoleOutput.user_output("", end="")
-                        ConsoleOutput.prompt()
+                        if not input_ready.is_set():
+                            input_ready.set()
         else:
             user_input = None
 
@@ -11911,14 +13743,14 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
         if user_input.strip() == "__STATUS__":
             bot._update_runtime_heartbeat(current_mode="interactive", current_phase="status_probe", persist=True)
             ConsoleOutput.system("STATUS PROBE")
-            ConsoleOutput.user_output(json.dumps(bot.get_runtime_status(), indent=2))
+            ConsoleOutput.user_output(_format_repl_output_block(json.dumps(bot.get_runtime_status(), indent=2)), end="")
             continue
 
         stripped_input = user_input.strip()
         if stripped_input.startswith(OPERATOR_COMMAND_PREFIX):
             try:
                 bot._update_runtime_heartbeat(current_mode="interactive", current_phase="operator_command", last_user_input_at=time.time(), persist=True)
-                ConsoleOutput.user_output(bot.handle_operator_command(stripped_input))
+                ConsoleOutput.user_output(_format_repl_output_block(bot.handle_operator_command(stripped_input)), end="")
                 bot._note_runtime_success(stripped_input, current_phase="awaiting_input", persist=True)
             except Exception as e:
                 bot._note_runtime_error(f"Operator command error: {e}", current_phase="blocked", persist=True)
@@ -11931,7 +13763,7 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, log_step, idle
 
         try:
             result = bot.handle_turn(user_input)
-            ConsoleOutput.user_output(result)
+            ConsoleOutput.user_output(_format_repl_output_block(result), end="")
         except Exception as e:
             bot._note_runtime_error(f"Fatal runtime error: {e}", current_phase="blocked", persist=True)
             ConsoleOutput.error(f"FATAL ERROR: {e}")
@@ -11961,8 +13793,9 @@ def main():
 
         bot = bootstrap_runtime(log_step)
         input_queue = queue.Queue()
-        start_input_thread(input_queue)
-        run_interactive_loop(bot, input_queue, log_step)
+        input_ready = threading.Event()
+        start_input_thread(input_queue, input_ready)
+        run_interactive_loop(bot, input_queue, input_ready, log_step)
 
     except KeyboardInterrupt:
         ConsoleOutput.warning("👋 Gracefully shutting down... (Ctrl+C detected)")
