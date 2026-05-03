@@ -37,6 +37,7 @@ import warnings
 import importlib.util
 import tokenize
 import html
+import inspect
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
@@ -261,7 +262,10 @@ def save_command_history() -> bool:
 
 def get_default_runtime_config() -> dict[str, Any]:
     return {
-        "idle_proposal_enabled": True,
+        "provider": "copilot",
+        "streaming_enabled": True,
+        "automated_proposal_enabled": False,
+        "idle_proposal_enabled": False,
         "idle_proposal_interval_seconds": 300,
         "idle_proposal_auto_confirm": True,
         "heartbeat_interval_seconds": DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -288,14 +292,38 @@ def _parse_runtime_config_value(raw_value: Any, default_value: Any) -> Any:
 
 def _apply_env_config_overrides(config: dict[str, Any]) -> dict[str, Any]:
     runtime_config = dict(config)
+    config_only_keys = {"automated_proposal_enabled", "idle_proposal_enabled"}
     for env_name, env_value in os.environ.items():
         for prefix in RUNTIME_CONFIG_PREFIXES:
             if env_name.startswith(prefix):
                 key = env_name[len(prefix) :].lower()
                 if not key:
                     continue
+                if key in config_only_keys:
+                    continue
                 runtime_config[key] = _parse_runtime_config_value(env_value, config.get(key))
                 break
+    return runtime_config
+
+
+def _normalize_runtime_config_aliases(config: dict[str, Any]) -> dict[str, Any]:
+    runtime_config = dict(config)
+    automated_key = "automated_proposal_enabled"
+    legacy_key = "idle_proposal_enabled"
+    automated_value = runtime_config.get(automated_key)
+    legacy_value = runtime_config.get(legacy_key)
+
+    if automated_value is None and legacy_value is not None:
+        automated_value = _parse_runtime_config_value(legacy_value, False)
+    elif automated_value is not None:
+        automated_value = _parse_runtime_config_value(automated_value, False)
+
+    if automated_value is None:
+        automated_value = False
+
+    runtime_config[automated_key] = bool(automated_value)
+    runtime_config[legacy_key] = runtime_config[automated_key]
+    runtime_config["provider"] = str(runtime_config.get("provider") or "copilot").strip().lower() or "copilot"
     return runtime_config
 
 
@@ -304,6 +332,7 @@ def validate_runtime_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]
         cfg = {}
     if not isinstance(cfg, dict):
         raise TypeError("Runtime config must be a dictionary.")
+    cfg = _normalize_runtime_config_aliases(cfg)
     defaults = get_default_runtime_config()
     validated: dict[str, Any] = {}
     for key, default_value in defaults.items():
@@ -311,7 +340,7 @@ def validate_runtime_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]
             validated[key] = _parse_runtime_config_value(cfg[key], default_value)
         else:
             validated[key] = default_value
-    return validated
+    return _normalize_runtime_config_aliases(validated)
 
 
 def load_runtime_config() -> dict[str, Any]:
@@ -334,7 +363,7 @@ def load_runtime_config() -> dict[str, Any]:
 
     config = validate_runtime_config(raw_config)
     config = _apply_env_config_overrides(config)
-    return config
+    return _normalize_runtime_config_aliases(config)
 
 
 def save_runtime_config(config: dict[str, Any]) -> bool:
@@ -5119,25 +5148,52 @@ class AgentState:
 
 # --- LLM PROVIDER & SUMMARIZER ---
 class OllamaProvider:
-    def __init__(self, model="lfm2.5-thinking", host="127.0.0.1", port="11434"):
+    def __init__(self, model="gemma4:e4b", host="127.0.0.1", port="11434"):
         self.model = model
+        self.host = str(host)
+        self.port = str(port)
+        self.base_url = f"http://{self.host}:{self.port}"
         self.url = f"http://{host}:{port}/api/chat"
 
+    def is_server_accessible(self, timeout: float = 2.0) -> bool:
+        try:
+            req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=max(0.5, float(timeout))) as res:
+                status = int(getattr(res, "status", 200) or 200)
+                return 200 <= status < 300
+        except Exception:
+            return False
+
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
-    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.1) -> Dict[str, Any]:
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.1, stream: bool = False, on_chunk=None) -> Dict[str, Any]:
         payload = {
             "model": self.model,
             "messages": messages,
-            "stream": False,
+            "stream": bool(stream),
             "options": {"temperature": float(temperature)}
         }
         headers = {"Content-Type": "application/json"}
         try:
             req = urllib.request.Request(self.url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
             with urllib.request.urlopen(req) as res:
-                data = json.loads(res.read().decode("utf-8"))
+                if stream:
+                    chunks: list[str] = []
+                    for raw_line in res:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        data = json.loads(line)
+                        piece = str(data.get("message", {}).get("content", "") or "")
+                        if piece:
+                            chunks.append(piece)
+                            if callable(on_chunk):
+                                on_chunk(piece)
+                    content = "".join(chunks)
+                else:
+                    data = json.loads(res.read().decode("utf-8"))
+                    content = str(data.get("message", {}).get("content", "") or "")
                 # Map Ollama response to match standard format
-                return {"choices": [{"message": {"content": data.get("message", {}).get("content", "")}}]}
+                return {"choices": [{"message": {"content": content}}]}
         except Exception as e:
             return {"choices": [{"message": {"content": f"Ollama Error: {e}"}}]}
 
@@ -5266,15 +5322,55 @@ class CopilotClient:
             return result
 
     @retry_with_backoff(retries=3, backoff_in_seconds=1)
-    def chat(self, messages: List[Dict[str, str]], temperature: float | None = None, **kwargs) -> Dict[str, Any]:
+    def _stream_chunk_text(self, payload: dict[str, Any]) -> str:
+        pieces: list[str] = []
+        for choice in payload.get("choices", []) or []:
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str):
+                pieces.append(content)
+                continue
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        pieces.append(str(item.get("text", "") or ""))
+                continue
+            message = choice.get("message") or {}
+            if isinstance(message.get("content"), str):
+                pieces.append(message["content"])
+        return "".join(piece for piece in pieces if piece)
+
+    def chat(self, messages: List[Dict[str, str]], temperature: float | None = None, stream: bool = False, on_chunk=None, **kwargs) -> Dict[str, Any]:
         try:
             self._ensure_session() # Auto-refresh if expired
             
             url = f"{self.token_data['base_url']}/chat/completions"
             headers = {**COMMON_HEADERS, "Authorization": f"Bearer {self.token_data['token']}", "Content-Type": "application/json"}
             payload = {"model": "gpt-5-mini", "messages": messages}
+            if stream:
+                payload["stream"] = True
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req) as res: return json.loads(res.read().decode("utf-8"))
+            with urllib.request.urlopen(req) as res:
+                if not stream:
+                    return json.loads(res.read().decode("utf-8"))
+
+                chunks: list[str] = []
+                for raw_line in res:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload_text = line[5:].strip()
+                    if not payload_text:
+                        continue
+                    if payload_text == "[DONE]":
+                        break
+                    event = json.loads(payload_text)
+                    piece = self._stream_chunk_text(event)
+                    if piece:
+                        chunks.append(piece)
+                        if callable(on_chunk):
+                            on_chunk(piece)
+                return {"choices": [{"message": {"content": "".join(chunks)}}]}
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 # Session token (JWT) is invalid or expired. Force a refresh and let retry decorator handle the rest.
@@ -5790,9 +5886,13 @@ class FlexiBot:
         _log("execution policy created")
 
         # Idle proposal config controls
-        self.idle_proposal_enabled = bool(self.config.get("idle_proposal_enabled", True))
+        self.automated_proposal_enabled = bool(
+            self.config.get("automated_proposal_enabled", self.config.get("idle_proposal_enabled", True))
+        )
+        self.idle_proposal_enabled = self.automated_proposal_enabled
         self.idle_proposal_interval_seconds = int(self.config.get("idle_proposal_interval_seconds", 300))
         self.idle_proposal_auto_confirm = bool(self.config.get("idle_proposal_auto_confirm", True))
+        self.streaming_enabled = bool(self.config.get("streaming_enabled", True))
         self.heartbeat_interval_seconds = max(1, int(self.config.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS) or DEFAULT_HEARTBEAT_INTERVAL_SECONDS))
         self.reviewer_pass_enabled = bool(self.config.get("reviewer_pass_enabled", True))
         self.reviewer_pass_after_tools = bool(self.config.get("reviewer_pass_after_tools", True))
@@ -6263,15 +6363,15 @@ class FlexiBot:
 
     def _goal_target_files(self, goal: dict[str, Any], task_memory: TaskMemory | None = None) -> list[str]:
         files: list[str] = []
-        workspace_path = str(goal.get("workspace_path", "") or "").strip()
-        if workspace_path:
-            files.append(workspace_path)
         verification_target = str(goal.get("verification_target", "") or "").strip()
         if verification_target and ("/" in verification_target or "\\" in verification_target or verification_target.endswith(".py")):
             files.append(verification_target)
         goal_id = str(goal.get("id", "") or "").strip()
         if task_memory is not None and goal_id and task_memory.active_goal_id == goal_id:
             files.extend(task_memory.touched_files)
+        workspace_path = str(goal.get("workspace_path", "") or "").strip()
+        if workspace_path:
+            files.append(workspace_path)
         return self._merge_memory_items([], files, limit=12, max_chars=220)
 
     def _user_requested_full_validation(self, user_input: str = "") -> bool:
@@ -6522,6 +6622,84 @@ class FlexiBot:
             return None
 
         memory = state.task_memory()
+        request_context = getattr(self, "current_request_context", {}) or {}
+        resolved_user_input = str(user_input or request_context.get("user_input") or "").strip()
+        request_signature = str(request_context.get("request_signature", "") or "").strip()
+        if not request_signature and resolved_user_input:
+            request_signature = self._progress_request_signature(resolved_user_input)
+        if request_signature:
+            memory.request_signature = request_signature
+
+        if resolved_user_input:
+            memory.current_operation = self._memory_summary_text(resolved_user_input, max_chars=280)
+
+        goal = self.current_goal()
+        if goal:
+            goal_id = str(goal.get("id", "") or "").strip()
+            if goal_id:
+                memory.active_goal_id = goal_id
+            if not memory.current_operation:
+                goal_text = str(goal.get("next_action", "") or goal.get("text", "") or "").strip()
+                if goal_text:
+                    memory.current_operation = self._memory_summary_text(goal_text, max_chars=280)
+
+        resolved_expected_output = str(expected_output or memory.expected_output or "").strip()
+        if not resolved_expected_output:
+            resolved_expected_output = self._expected_output_for_request(resolved_user_input or memory.current_operation)
+        if resolved_expected_output:
+            memory.expected_output = self._memory_summary_text(resolved_expected_output, max_chars=280)
+
+        if current_phase:
+            memory.current_phase = str(current_phase).strip()
+
+        if touched_files:
+            memory.touched_files = self._merge_memory_items(memory.touched_files, list(touched_files), limit=20, max_chars=200)
+
+        if observation:
+            memory.last_observations = self._merge_memory_items(memory.last_observations, [observation], limit=8, max_chars=280)
+
+        return state.remember_task_memory(memory)
+
+
+    def _project_brief_payload(self, *, refresh: bool = True) -> dict[str, Any]:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "project_brief"):
+            return asdict(ProjectBrief())
+        brief = self._refresh_project_brief(persist=True) if refresh else state.project_brief()
+        return asdict(brief)
+
+    def _task_graph_payload(self, *, refresh: bool = True) -> dict[str, Any]:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "task_graph"):
+            return asdict(TaskGraph())
+        graph = self._refresh_task_graph(persist=True) if refresh else state.task_graph()
+        return asdict(graph)
+
+    def _workspace_locks_payload(self) -> dict[str, Any]:
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "workspace_locks"):
+            return {"locks": [], "count": 0}
+        locks = [asdict(lock) for lock in state.workspace_locks()]
+        return {"locks": locks, "count": len(locks)}
+
+    def _tool_text_list(self, value: Any, *, limit: int = 16, max_chars: int = 200) -> list[str]:
+        raw_items = value if isinstance(value, list) else re.split(r"[\n,]", str(value or ""))
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            text = re.sub(r"\s+", " ", str(item or "")).strip()
+            if not text:
+                continue
+            text = text[:max_chars]
+            key = text.lower()
+            if key in seen:
+                continue
+            cleaned.append(text)
+            seen.add(key)
+            if len(cleaned) >= limit:
+                break
+        return cleaned
+        memory = state.task_memory()
         request_context = copy.deepcopy(getattr(self, "current_request_context", {}) or {})
         request_signature = str(request_context.get("request_signature", "") or memory.request_signature).strip()
         if user_input is not None:
@@ -6532,7 +6710,8 @@ class FlexiBot:
                     memory.touched_files = []
                     memory.last_observations = []
                 memory.current_operation = self._memory_summary_text(user_input, max_chars=320)
-                memory.expected_output = self._memory_summary_text(expected_output or self._expected_output_for_request(user_input), max_chars=320)
+            "   - **State**: Variables persist; `remember(tag, txt)`, `recall(tag)`, `search_memory(query)`, `project_memory()`, `task_memory()`, `failure_memory()`.\n"
+            "   - **Planning**: `project_brief(refresh=True)`, `update_project_brief(...)`, `task_graph(refresh=True)`, `update_task_graph(nodes_json, replace=True)`, `workspace_locks()`, `acquire_workspace_lock(area, holder='operator', ...)`, `release_workspace_lock(lock_id)`, `clear_workspace_locks()`.\n"
 
         if request_signature and request_signature != "__continue__":
             memory.request_signature = request_signature
@@ -6784,6 +6963,55 @@ class FlexiBot:
         if not isinstance(payload, str):
             payload = str(payload)
         return re.sub(r"\s+", " ", payload).strip()
+
+    def _repair_python_tool_payload(self, payload: str) -> tuple[str, list[str]]:
+        repaired = str(payload or "")
+        notes: list[str] = []
+
+        def _apply(pattern: str, repl: str | Callable[[re.Match[str]], str], note: str):
+            nonlocal repaired
+            updated, count = re.subn(pattern, repl, repaired, flags=re.I | re.M)
+            if count:
+                repaired = updated
+                notes.append(note)
+
+        _apply(
+            r"\bfind_files\s*\(\s*glob\s*=",
+            "find_files(pattern=",
+            "normalized find_files(glob=...) to find_files(pattern=...)",
+        )
+        _apply(
+            r"\bfind_files\s*\(\s*\)",
+            "find_files(pattern='*')",
+            "added default pattern to empty find_files() call",
+        )
+        _apply(
+            r"\bfind_files\s*\(\s*root\s*=",
+            "find_files(pattern='*', root=",
+            "added missing pattern argument to find_files(root=...)",
+        )
+        _apply(
+            r"\bread_file\s*\(\s*file_path\s*=",
+            "read_file(filepath=",
+            "normalized read_file(file_path=...) to read_file(filepath=...)",
+        )
+        _apply(
+            r"\bread_range\s*\(\s*file_path\s*=",
+            "read_range(filepath=",
+            "normalized read_range(file_path=...) to read_range(filepath=...)",
+        )
+        _apply(
+            r"\bpeek\s*\(\s*file_path\s*=",
+            "peek(filepath=",
+            "normalized peek(file_path=...) to peek(filepath=...)",
+        )
+        return repaired, notes
+
+    def _normalize_and_repair_tool_payload(self, tool_name: str, payload: str) -> tuple[str, list[str]]:
+        raw_payload = "" if payload is None else str(payload)
+        if tool_name == "python":
+            return self._repair_python_tool_payload(raw_payload)
+        return raw_payload.strip(), []
 
     def _tool_result_failed(self, result: str) -> bool:
         payload = self._parse_tool_result_payload(result)
@@ -7050,178 +7278,6 @@ class FlexiBot:
         if not primary_family:
             return ""
 
-        def _plan_intent_map(self, plan_blocks: list[str] | None) -> dict[str, list[str]]:
-            intents: dict[str, list[str]] = {
-                "create": [],
-                "edit": [],
-                "install": [],
-                "run_tests": [],
-                "inspect": [],
-            }
-            markers = {
-                "create": ("create", "add ", "new file", "scaffold", "write ", "generate "),
-                "edit": ("edit", "modify", "change", "update", "patch", "refactor", "rename", "fix "),
-                "install": ("install", "dependency", "package", "pip ", "poetry add", "conda install", "npm install"),
-                "run_tests": ("run tests", "test ", "pytest", "unittest", "verify", "verification", "validate", "py_compile", "compile check", "import check"),
-                "inspect": ("inspect", "read ", "search", "grep", "find ", "review", "map ", "list ", "peek", "tree"),
-            }
-            seen: dict[str, set[str]] = {key: set() for key in intents}
-            for block in plan_blocks or []:
-                text = self._normalize_tool_payload(block)
-                lowered = text.lower()
-                if not lowered:
-                    continue
-                snippet = text[:160]
-                for intent, tokens in markers.items():
-                    if any(token in lowered for token in tokens):
-                        key = lowered[:200]
-                        if key in seen[intent]:
-                            continue
-                        intents[intent].append(snippet)
-                        seen[intent].add(key)
-            return intents
-
-        def _plan_result_mismatch(self, plan_blocks: list[str] | None, response: str,
-                                  tool_results: list[str], progress_eval: dict[str, Any],
-                                  finalize_meta: dict[str, Any]) -> dict[str, Any]:
-            intents = self._plan_intent_map(plan_blocks)
-            payloads = self._response_tool_payloads(response)
-            payload_texts = [payload.lower() for _, payload in payloads]
-            payload_tools = [tool_name for tool_name, _ in payloads]
-            result_payloads = [self._parse_tool_result_payload(result) or {} for result in tool_results]
-
-            def _payload_has_any(tokens: tuple[str, ...]) -> bool:
-                return any(any(token in payload for token in tokens) for payload in payload_texts)
-
-            changed_files = list(progress_eval.get("changed_files", []) or [])
-            inspection_only = bool(finalize_meta.get("inspection_only"))
-            blocked = bool(finalize_meta.get("blocked"))
-
-            install_result_indices = [
-                index for index, payload in enumerate(result_payloads)
-                if str(payload.get("tool", "") or "").strip() == "install_python_package"
-            ]
-            install_attempted = bool(install_result_indices) or _payload_has_any(("pip install", "poetry add", "conda install", "npm install", "install_python_package("))
-            install_succeeded = any(bool(result_payloads[index].get("ok", False)) for index in install_result_indices)
-            if not install_succeeded and install_attempted and not install_result_indices:
-                install_succeeded = not any(self._tool_result_failed(result) for result in tool_results if "install" in self._tool_result_text(result).lower())
-
-            test_tools = {"run_tests", "run_verification", "validate_python", "verify_work"}
-            test_result_indices = [
-                index for index, payload in enumerate(result_payloads)
-                if str(payload.get("tool", "") or "").strip() in test_tools
-            ]
-            tests_attempted = bool(test_result_indices) or _payload_has_any(("pytest", "unittest", "run_tests(", "run_verification(", "validate_python(", "py_compile", "import check"))
-            tests_succeeded = any(bool(result_payloads[index].get("ok", False)) for index in test_result_indices)
-
-            inspection_attempted = inspection_only
-            if not inspection_attempted and payloads and len(payloads) == len(tool_results):
-                inspection_attempted = True
-                for index, (tool_name, raw_payload) in enumerate(payloads):
-                    payload_tool = str(result_payloads[index].get("tool", tool_name) or tool_name).strip() or tool_name
-                    effective_tool = tool_name if payload_tool in {"bash", "python"} else payload_tool
-                    if effective_tool in {"bash", "python"}:
-                        if self.execution_policy._mutating_payload(effective_tool, raw_payload):
-                            inspection_attempted = False
-                            break
-                        if not self.execution_policy._inspection_like_payload(effective_tool, raw_payload):
-                            inspection_attempted = False
-                            break
-                    elif effective_tool not in {
-                        "inspect_python_environment",
-                        "list_python_packages",
-                        "python_symbol_doc",
-                        "python_import_graph",
-                        "list_windows",
-                        "list_windows_advanced",
-                        "get_active_terminal",
-                        "list_processes",
-                        "get_software_versions",
-                        "project_memory",
-                        "task_memory",
-                        "failure_memory",
-                        "recall",
-                        "search_memory",
-                        "read_bg_task_log",
-                        "get_bg_task_details",
-                        "check_bg_tasks",
-                    }:
-                        inspection_attempted = False
-                        break
-
-            reasons: list[str] = []
-            next_steps: list[str] = []
-            categories: list[str] = []
-
-            mutation_intended = bool(intents["create"] or intents["edit"])
-            if mutation_intended and not changed_files:
-                if inspection_only or inspection_attempted:
-                    reasons.append("the plan promised code changes, but the turn only produced inspection output")
-                elif blocked:
-                    reasons.append("the plan promised code changes, but the turn blocked before any file changed")
-                else:
-                    reasons.append("the plan promised code changes, but no workspace files changed")
-                next_steps.append("make the intended file edit explicitly or rewrite the plan as inspection-only")
-                categories.append("mutation_missing")
-
-            if intents["install"]:
-                if not install_attempted:
-                    reasons.append("the plan promised a dependency install, but no install command ran")
-                    next_steps.append("run the dependency install explicitly or report the missing prerequisite")
-                    categories.append("install_missing")
-                elif not install_succeeded and blocked:
-                    # Installation was attempted but failed; that is execution failure, not a plan/result mismatch.
-                    pass
-
-            if intents["run_tests"] and not tests_attempted:
-                reasons.append("the plan promised verification, but no test or verification command ran")
-                next_steps.append("run the promised scoped verification after the next concrete change")
-                categories.append("verification_missing")
-
-            if intents["inspect"] and not (inspection_attempted or inspection_only) and not payload_tools:
-                reasons.append("the plan promised inspection, but no inspection step actually ran")
-                next_steps.append("run the missing inspection step or drop it from the next plan")
-                categories.append("inspection_missing")
-
-            if not reasons:
-                return {
-                    "mismatch": False,
-                    "intents": intents,
-                    "categories": [],
-                    "reasons": [],
-                    "reason": "",
-                    "summary": "",
-                    "next_step": "",
-                }
-
-            deduped_steps: list[str] = []
-            seen_steps: set[str] = set()
-            for step in next_steps:
-                key = step.strip().lower()
-                if not key or key in seen_steps:
-                    continue
-                deduped_steps.append(step.strip())
-                seen_steps.add(key)
-            primary_reason = reasons[0].strip()
-            summary = "Blocked: Plan/result mismatch. " + "; ".join(reason.rstrip(".") for reason in reasons[:2]) + "."
-            next_step = deduped_steps[0] if deduped_steps else "choose the next action so it fulfills the stated plan before claiming progress"
-            summary += f" Next step: {next_step}."
-            return {
-                "mismatch": True,
-                "intents": intents,
-                "categories": categories,
-                "reasons": reasons,
-                "reason": primary_reason,
-                "summary": summary,
-                "next_step": next_step,
-                "changed_files": changed_files[:20],
-                "inspection_only": inspection_only,
-                "blocked": blocked,
-                "install_attempted": install_attempted,
-                "tests_attempted": tests_attempted,
-                "tests_succeeded": tests_succeeded,
-            }
-
         consecutive = 0
         blocked_recent = False
         for attempt in reversed(attempts):
@@ -7251,6 +7307,177 @@ class FlexiBot:
             f"{lead}: Strategy family '{primary_family}' is overused. The last {consecutive} {primary_family} attempts made no measurable progress. "
             f"Switch strategy now: {suggestions.get(primary_family, 'choose a materially different recovery path before acting again')}."
         )
+
+    def _plan_intent_map(self, plan_blocks: list[str] | None) -> dict[str, list[str]]:
+        intents: dict[str, list[str]] = {
+            "create": [],
+            "edit": [],
+            "install": [],
+            "run_tests": [],
+            "inspect": [],
+        }
+        markers = {
+            "create": ("create", "add ", "new file", "scaffold", "write ", "generate "),
+            "edit": ("edit", "modify", "change", "update", "patch", "refactor", "rename", "fix "),
+            "install": ("install", "dependency", "package", "pip ", "poetry add", "conda install", "npm install"),
+            "run_tests": ("run tests", "test ", "pytest", "unittest", "verify", "verification", "validate", "py_compile", "compile check", "import check"),
+            "inspect": ("inspect", "read ", "search", "grep", "find ", "review", "map ", "list ", "peek", "tree"),
+        }
+        seen: dict[str, set[str]] = {key: set() for key in intents}
+        for block in plan_blocks or []:
+            text = self._normalize_tool_payload(block)
+            lowered = text.lower()
+            if not lowered:
+                continue
+            snippet = text[:160]
+            for intent, tokens in markers.items():
+                if any(token in lowered for token in tokens):
+                    key = lowered[:200]
+                    if key in seen[intent]:
+                        continue
+                    intents[intent].append(snippet)
+                    seen[intent].add(key)
+        return intents
+
+    def _plan_result_mismatch(self, plan_blocks: list[str] | None, response: str,
+                              tool_results: list[str], progress_eval: dict[str, Any],
+                              finalize_meta: dict[str, Any]) -> dict[str, Any]:
+        intents = self._plan_intent_map(plan_blocks)
+        payloads = self._response_tool_payloads(response)
+        payload_texts = [payload.lower() for _, payload in payloads]
+        payload_tools = [tool_name for tool_name, _ in payloads]
+        result_payloads = [self._parse_tool_result_payload(result) or {} for result in tool_results]
+
+        def _payload_has_any(tokens: tuple[str, ...]) -> bool:
+            return any(any(token in payload for token in tokens) for payload in payload_texts)
+
+        changed_files = list(progress_eval.get("changed_files", []) or [])
+        inspection_only = bool(finalize_meta.get("inspection_only"))
+        blocked = bool(finalize_meta.get("blocked"))
+
+        install_result_indices = [
+            index for index, payload in enumerate(result_payloads)
+            if str(payload.get("tool", "") or "").strip() == "install_python_package"
+        ]
+        install_attempted = bool(install_result_indices) or _payload_has_any(("pip install", "poetry add", "conda install", "npm install", "install_python_package("))
+        install_succeeded = any(bool(result_payloads[index].get("ok", False)) for index in install_result_indices)
+        if not install_succeeded and install_attempted and not install_result_indices:
+            install_succeeded = not any(self._tool_result_failed(result) for result in tool_results if "install" in self._tool_result_text(result).lower())
+
+        test_tools = {"run_tests", "run_verification", "validate_python", "verify_work"}
+        test_result_indices = [
+            index for index, payload in enumerate(result_payloads)
+            if str(payload.get("tool", "") or "").strip() in test_tools
+        ]
+        tests_attempted = bool(test_result_indices) or _payload_has_any(("pytest", "unittest", "run_tests(", "run_verification(", "validate_python(", "py_compile", "import check"))
+        tests_succeeded = any(bool(result_payloads[index].get("ok", False)) for index in test_result_indices)
+
+        inspection_attempted = inspection_only
+        if not inspection_attempted and payloads and len(payloads) == len(tool_results):
+            inspection_attempted = True
+            for index, (tool_name, raw_payload) in enumerate(payloads):
+                payload_tool = str(result_payloads[index].get("tool", tool_name) or tool_name).strip() or tool_name
+                effective_tool = tool_name if payload_tool in {"bash", "python"} else payload_tool
+                if effective_tool in {"bash", "python"}:
+                    if self.execution_policy._mutating_payload(effective_tool, raw_payload):
+                        inspection_attempted = False
+                        break
+                    if not self.execution_policy._inspection_like_payload(effective_tool, raw_payload):
+                        inspection_attempted = False
+                        break
+                elif effective_tool not in {
+                    "inspect_python_environment",
+                    "list_python_packages",
+                    "python_symbol_doc",
+                    "python_import_graph",
+                    "list_windows",
+                    "list_windows_advanced",
+                    "get_active_terminal",
+                    "list_processes",
+                    "get_software_versions",
+                    "project_memory",
+                    "task_memory",
+                    "failure_memory",
+                    "recall",
+                    "search_memory",
+                    "read_bg_task_log",
+                    "get_bg_task_details",
+                    "check_bg_tasks",
+                }:
+                    inspection_attempted = False
+                    break
+
+        reasons: list[str] = []
+        next_steps: list[str] = []
+        categories: list[str] = []
+
+        mutation_intended = bool(intents["create"] or intents["edit"])
+        if mutation_intended and not changed_files:
+            if inspection_only or inspection_attempted:
+                reasons.append("the plan promised code changes, but the turn only produced inspection output")
+            elif blocked:
+                reasons.append("the plan promised code changes, but the turn blocked before any file changed")
+            else:
+                reasons.append("the plan promised code changes, but no workspace files changed")
+            next_steps.append("make the intended file edit explicitly or rewrite the plan as inspection-only")
+            categories.append("mutation_missing")
+
+        if intents["install"]:
+            if not install_attempted:
+                reasons.append("the plan promised a dependency install, but no install command ran")
+                next_steps.append("run the dependency install explicitly or report the missing prerequisite")
+                categories.append("install_missing")
+            elif not install_succeeded and blocked:
+                pass
+
+        if intents["run_tests"] and not tests_attempted:
+            reasons.append("the plan promised verification, but no test or verification command ran")
+            next_steps.append("run the promised scoped verification after the next concrete change")
+            categories.append("verification_missing")
+
+        if intents["inspect"] and not (inspection_attempted or inspection_only) and not payload_tools:
+            reasons.append("the plan promised inspection, but no inspection step actually ran")
+            next_steps.append("run the missing inspection step or drop it from the next plan")
+            categories.append("inspection_missing")
+
+        if not reasons:
+            return {
+                "mismatch": False,
+                "intents": intents,
+                "categories": [],
+                "reasons": [],
+                "reason": "",
+                "summary": "",
+                "next_step": "",
+            }
+
+        deduped_steps: list[str] = []
+        seen_steps: set[str] = set()
+        for step in next_steps:
+            key = step.strip().lower()
+            if not key or key in seen_steps:
+                continue
+            deduped_steps.append(step.strip())
+            seen_steps.add(key)
+        primary_reason = reasons[0].strip()
+        summary = "Blocked: Plan/result mismatch. " + "; ".join(reason.rstrip(".") for reason in reasons[:2]) + "."
+        next_step = deduped_steps[0] if deduped_steps else "choose the next action so it fulfills the stated plan before claiming progress"
+        summary += f" Next step: {next_step}."
+        return {
+            "mismatch": True,
+            "intents": intents,
+            "categories": categories,
+            "reasons": reasons,
+            "reason": primary_reason,
+            "summary": summary,
+            "next_step": next_step,
+            "changed_files": changed_files[:20],
+            "inspection_only": inspection_only,
+            "blocked": blocked,
+            "install_attempted": install_attempted,
+            "tests_attempted": tests_attempted,
+            "tests_succeeded": tests_succeeded,
+        }
 
     def _normalize_blocker_signature_text(self, text: str) -> str:
         normalized = str(text or "").replace("\r\n", "\n").strip().lower()
@@ -7332,7 +7559,11 @@ class FlexiBot:
                 "repeat_count": 0,
                 "summary": "",
             }
-        attempts = list(self._blocker_signature_history.get(effective_signature, []))
+        history_store = getattr(self, "_blocker_signature_history", None)
+        if not isinstance(history_store, dict):
+            history_store = {}
+            self._blocker_signature_history = history_store
+        attempts = list(history_store.get(effective_signature, []))
         attempts.append({
             "timestamp": time.time(),
             "signature": signature,
@@ -7344,7 +7575,7 @@ class FlexiBot:
             "primary_detail": str(blocker_info.get("primary_detail", "") or "").strip(),
         })
         attempts = attempts[-MAX_BLOCKER_ATTEMPTS_PER_REQUEST:]
-        self._blocker_signature_history[effective_signature] = attempts
+        history_store[effective_signature] = attempts
 
         repeat_count = 0
         for attempt in reversed(attempts):
@@ -7722,6 +7953,57 @@ class FlexiBot:
         match = re.search(r"<consensus>(.*?)</consensus>", response, re.S)
         return match.group(1).strip() if match else ""
 
+    def _hidden_cli_response_tags(self) -> set[str]:
+        return {
+            "plan",
+            "bash",
+            "python",
+            "consensus",
+            "execute",
+            "execute_bash",
+            "execute_python",
+            "execute_tool",
+            "execute_output",
+            "executeoutput",
+            "tool_output",
+            "tooloutput",
+        }
+
+    def _forbidden_cli_response_tags(self) -> set[str]:
+        return {
+            "execute",
+            "execute_bash",
+            "execute_python",
+            "execute_tool",
+            "execute_output",
+            "executeoutput",
+            "tool_output",
+            "tooloutput",
+        }
+
+    def _strip_hidden_cli_markup(self, text: str) -> str:
+        cleaned = str(text or "")
+        for tag in sorted(self._hidden_cli_response_tags(), key=len, reverse=True):
+            escaped = re.escape(tag)
+            cleaned = re.sub(rf"<\s*{escaped}\s*>.*?<\s*/\s*{escaped}\s*>", "", cleaned, flags=re.S | re.I)
+            cleaned = re.sub(rf"<\s*/?\s*{escaped}\s*>", "", cleaned, flags=re.I)
+        cleaned = cleaned.replace("<ack_observation>", "")
+        return cleaned
+
+    def _forbidden_cli_response_markers(self, response: str) -> list[str]:
+        text = str(response or "")
+        markers: list[str] = []
+        for tag in sorted(self._forbidden_cli_response_tags()):
+            if re.search(rf"<\s*/?\s*{re.escape(tag)}\s*>", text, flags=re.I):
+                markers.append(tag)
+        return markers
+
+    def _sanitize_user_facing_text(self, text: str) -> str:
+        return self._collapse_cli_block(self._strip_hidden_cli_markup(text))
+
+    def _canonicalize_user_facing_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", self._sanitize_user_facing_text(text)).strip()
+
     def _collapse_cli_block(self, text: str) -> str:
         normalized = str(text or "").replace("\r\n", "\n")
         lines: list[str] = []
@@ -7738,15 +8020,132 @@ class FlexiBot:
         return "\n".join(lines).strip()
 
     def _extract_display_thought(self, response: str) -> str:
-        text = str(response or "")
-        text = re.sub(r"<(plan|bash|python|consensus)>.*?</\1>", "", text, flags=re.S)
-        text = text.replace("<ack_observation>", "")
-        return self._collapse_cli_block(text)
+        return self._sanitize_user_facing_text(response)
+
+    def _streaming_enabled_for_turn(self) -> bool:
+        if hasattr(self, "streaming_enabled"):
+            return bool(self.streaming_enabled)
+        config = getattr(self, "config", {}) or {}
+        return bool(config.get("streaming_enabled", True))
+
+    def _client_supports_streaming(self) -> bool:
+        chat_method = getattr(getattr(self, "client", None), "chat", None)
+        if not callable(chat_method):
+            return False
+        try:
+            signature = inspect.signature(chat_method)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters.values()
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+            return True
+        names = {param.name for param in signature.parameters.values()}
+        return "stream" in names and "on_chunk" in names
+
+    def _begin_streamed_response(self):
+        self._stream_response_tag = None
+        self._stream_response_tag_buffer = ""
+        self._stream_response_started = False
+        self._stream_response_visible_parts = []
+
+    def _emit_stream_visible_text(self, text: str):
+        if not text:
+            return
+        if not getattr(self, "_stream_response_started", False):
+            builtins.print(f"{Colors.YELLOW}[Assistant] {Colors.ENDC}", end="", flush=True)
+            self._stream_response_started = True
+        visible_parts = getattr(self, "_stream_response_visible_parts", None)
+        if isinstance(visible_parts, list):
+            visible_parts.append(text)
+        builtins.print(f"{Colors.YELLOW}{text}{Colors.ENDC}", end="", flush=True)
+
+    def _consume_stream_tag_token(self, token: str):
+        normalized = token.strip().lower()
+        active_tag = getattr(self, "_stream_response_tag", None)
+        if active_tag:
+            if normalized == f"</{active_tag}>":
+                self._stream_response_tag = None
+            return
+
+        if normalized == "<ack_observation>":
+            return
+
+        hidden_tags = self._hidden_cli_response_tags()
+        open_match = re.fullmatch(r"<\s*([a-z_]+)\s*>", normalized)
+        if open_match and open_match.group(1) in hidden_tags:
+            self._stream_response_tag = open_match.group(1)
+            return
+
+        close_match = re.fullmatch(r"</\s*([a-z_]+)\s*>", normalized)
+        if close_match and close_match.group(1) in hidden_tags:
+            return
+
+        self._emit_stream_visible_text(token)
+
+    def _stream_visible_response_chunk(self, chunk: str):
+        text = str(chunk or "")
+        if not text:
+            return
+
+        visible_parts: list[str] = []
+        for char in text:
+            if getattr(self, "_stream_response_tag_buffer", ""):
+                self._stream_response_tag_buffer += char
+                if char == ">":
+                    self._consume_stream_tag_token(self._stream_response_tag_buffer)
+                    self._stream_response_tag_buffer = ""
+                continue
+            if char == "<":
+                self._stream_response_tag_buffer = "<"
+                continue
+            if not getattr(self, "_stream_response_tag", None):
+                visible_parts.append(char)
+
+        self._emit_stream_visible_text("".join(visible_parts))
+
+    def _finish_streamed_response(self) -> bool:
+        started = bool(getattr(self, "_stream_response_started", False))
+        residual_tag = str(getattr(self, "_stream_response_tag_buffer", "") or "")
+        if residual_tag and not getattr(self, "_stream_response_tag", None):
+            self._emit_stream_visible_text(residual_tag)
+            started = True
+        visible_parts = getattr(self, "_stream_response_visible_parts", [])
+        if isinstance(visible_parts, list):
+            self._last_streamed_visible_text = "".join(visible_parts)
+        else:
+            self._last_streamed_visible_text = ""
+        if started:
+            builtins.print(flush=True)
+        self._stream_response_tag = None
+        self._stream_response_tag_buffer = ""
+        self._stream_response_started = False
+        self._stream_response_visible_parts = []
+        return started
+
+    def _chat_with_optional_streaming(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        self._last_streamed_visible_output = False
+        self._last_streamed_visible_text = ""
+        if not self._streaming_enabled_for_turn() or not self._client_supports_streaming():
+            return self.client.chat(messages)
+        self._begin_streamed_response()
+        try:
+            return self.client.chat(messages, stream=True, on_chunk=self._stream_visible_response_chunk)
+        finally:
+            self._last_streamed_visible_output = self._finish_streamed_response()
+
+    def _should_suppress_repl_echo(self, message: str) -> bool:
+        if not bool(getattr(self, "_last_streamed_visible_output", False)):
+            return False
+        streamed = self._canonicalize_user_facing_text(getattr(self, "_last_streamed_visible_text", ""))
+        target = self._canonicalize_user_facing_text(message)
+        return bool(streamed and target and streamed == target)
 
     def _render_cli_response_sections(self, response: str, *, plan_blocks: list[str] | None = None,
                                       bash_payloads: list[str] | None = None,
                                       python_payloads: list[str] | None = None,
-                                      consensus_text: str = ""):
+                                      consensus_text: str = "",
+                                      skip_thought: bool = False,
+                                      skip_consensus: bool = False):
         def _format_items(items: list[str]) -> str:
             if not items:
                 return ""
@@ -7761,7 +8160,7 @@ class FlexiBot:
                 ]))
             return "\n\n".join(blocks)
 
-        thought_text = self._extract_display_thought(response)
+        thought_text = "" if skip_thought else self._extract_display_thought(response)
         plan_items = [
             collapsed for collapsed in
             (self._collapse_cli_block(block) for block in (plan_blocks or []))
@@ -7773,31 +8172,31 @@ class FlexiBot:
                 collapsed = self._collapse_cli_block(self._normalize_tool_payload(payload))
                 if collapsed:
                     tool_items.append(f"{tool_name}: {collapsed}")
-        consensus_block = self._collapse_cli_block(consensus_text)
+        consensus_block = "" if skip_consensus else self._collapse_cli_block(consensus_text)
+
+        sections: list[tuple[str, str, str]] = []
+        if thought_text:
+            sections.append(("Thought", Colors.YELLOW, thought_text))
+        if plan_items:
+            sections.append(("Plan", Colors.BLUE, _format_items(plan_items)))
+        if consensus_block:
+            sections.append(("Consensus", Colors.GREEN, consensus_block))
+        if tool_items:
+            sections.append(("Tool", Colors.CYAN, _format_items(tool_items)))
+
+        if not sections:
+            return False
 
         sep_line = f"{Colors.DIM}{'-'*60}{Colors.ENDC}"
         print(f"\n{sep_line}")
 
-        rendered_any = False
-
-        def _emit_section(title: str, color: str, body: str):
-            nonlocal rendered_any
-            if not body:
-                return
-            if rendered_any:
+        for index, (title, color, body) in enumerate(sections):
+            if index:
                 print()
             formatted = body.replace("\n", f"\n{Colors.DIM}| {Colors.ENDC}")
             print(f"{color}{Colors.BOLD}{title}:{Colors.ENDC}\n{Colors.DIM}| {Colors.ENDC}{formatted}")
-            rendered_any = True
-
-        _emit_section("Thought", Colors.YELLOW, thought_text)
-        _emit_section("Plan", Colors.BLUE, _format_items(plan_items))
-        _emit_section("Consensus", Colors.GREEN, consensus_block)
-        _emit_section("Tool", Colors.CYAN, _format_items(tool_items))
-
-        if not rendered_any:
-            print(f"{Colors.DIM}| {Colors.ENDC}(no displayable response sections)")
         print(f"{sep_line}")
+        return True
 
     def _trim_finalize_followup(self, draft: str) -> tuple[str, bool]:
         if not draft:
@@ -8109,7 +8508,10 @@ class FlexiBot:
         }
 
     def _inspection_ledger(self) -> list[dict[str, Any]]:
-        raw = self.state.recall(INSPECTION_LEDGER_KEY)
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "recall"):
+            return []
+        raw = state.recall(INSPECTION_LEDGER_KEY)
         entries: list[dict[str, Any]] = []
         for item in raw if isinstance(raw, list) else []:
             normalized = self._normalize_inspection_ledger_entry(item)
@@ -8169,7 +8571,8 @@ class FlexiBot:
     def _inspection_allowances_for_feedback(self, consumed_keys: list[str] | None = None) -> list[dict[str, Any]]:
         now = time.time()
         consumed = {str(item).strip() for item in (consumed_keys or []) if str(item).strip()}
-        active_request = self._effective_request_signature((self.current_request_context or {}).get("request_signature", ""))
+        request_context = getattr(self, "current_request_context", {}) or {}
+        active_request = self._effective_request_signature(request_context.get("request_signature", ""))
         current_scope = self._verification_scope_paths("")
         allowances: list[dict[str, Any]] = []
         for entry in reversed(self._inspection_ledger()):
@@ -8370,7 +8773,7 @@ class FlexiBot:
                 stronger_verification=stronger_verification,
             )
             blocker_memory = self._remember_blocker_attempt(
-                (self.current_request_context or {}).get("request_signature", ""),
+                (getattr(self, "current_request_context", {}) or {}).get("request_signature", ""),
                 blocker_info,
             )
             blocker_repeat_count = int(blocker_memory.get("repeat_count", 0) or 0)
@@ -8454,7 +8857,7 @@ class FlexiBot:
         return self._format_final_answer_block(draft)
 
     def _format_final_answer_block(self, message: str) -> str:
-        body = "" if message is None else str(message)
+        body = self._sanitize_user_facing_text(message)
         return f"\n{PROMPT_DIVIDER}\n{Colors.CYAN}{Colors.BOLD}💡 Answer:{Colors.ENDC}\n{body}"
 
     def _should_return_after_action_turn(self, pending_consensus: str, finalize_meta: dict[str, Any]) -> bool:
@@ -8538,24 +8941,13 @@ class FlexiBot:
         ]
 
     def _recover_from_turn_limit(self, reason: str) -> str:
-        fallback = (
-            "Current work summary\n"
-            f"- The agent paused because: {reason}.\n\n"
-            "Progress so far\n"
-            f"- Last observation: {self.last_observation[:1000] or 'No observation recorded.'}\n\n"
-            "Best next step\n"
-            "- Either continue from the last observation or redirect the task.\n\n"
-            "User choice\n"
-            "- Reply with 'continue' to keep going, or tell me what to do next."
+        last_observation = self._sanitize_user_facing_text(self.last_observation[:400] if self.last_observation else "")
+        detail = last_observation or "No concrete blocker was recorded."
+        recovery_text = (
+            "The agent stopped after repeated internal turns before reaching a final answer. "
+            f"Last real blocker: {detail} "
+            "Best next step: reply 'continue' to retry from that blocker, or restate the task with a narrower target such as a file, folder, or exact command."
         )
-        try:
-            recovery_messages = self._build_recovery_prompt(reason)
-            resp_data = self.client.chat(recovery_messages)
-            recovery_text = resp_data["choices"][0]["message"]["content"].strip()
-            if not recovery_text:
-                recovery_text = fallback
-        except Exception as e:
-            recovery_text = fallback + f"\n\n[Recovery note fallback: {e}]"
 
         self._append_response_trace(
             "recovery_response",
@@ -8576,25 +8968,38 @@ class FlexiBot:
     def facts_matching(self, pattern: str):
         return [e for e in self.state.query_history(tag="fact") if pattern in e["content"]]
 
+    def _ollama_client_from_config(self, config: dict[str, Any] | None = None) -> OllamaProvider:
+        cfg = dict(config or {})
+        return OllamaProvider(
+            model=str(cfg.get("model") or cfg.get("ollama_model") or "gemma4:e4b"),
+            host=str(cfg.get("ollama_host") or cfg.get("host") or "127.0.0.1"),
+            port=str(cfg.get("ollama_port") or cfg.get("port") or "11434"),
+        )
+
     def _setup_client(self):
-        config = {}
-        if CONFIG_FILE.exists():
-            try:
-                with open(CONFIG_FILE, "r") as f: config = json.load(f)
-            except: pass
-        
-        provider = config.get("provider", "copilot")
-        
+        config = load_runtime_config()
+        provider = str(config.get("provider", "copilot") or "copilot").strip().lower()
+        ollama_client = self._ollama_client_from_config(config)
+
         if provider == "ollama":
-            ConsoleOutput.system(f"Using Ollama Provider ({config.get('model', 'lfm2.5-thinking')})")
-            self.client = OllamaProvider(
-                model=config.get("model", "lfm2.5-thinking"),
-                host=config.get("host", "127.0.0.1"),
-                port=config.get("port", "11434")
+            if ollama_client.is_server_accessible():
+                ConsoleOutput.system(f"Using Ollama Provider ({ollama_client.model})")
+                self.client = ollama_client
+                return
+            ConsoleOutput.warning(
+                f"Ollama server at {ollama_client.base_url} is unavailable. Falling back to GitHub Copilot."
             )
-        else:
+
+        if provider in {"", "auto", "copilot"}:
             ConsoleOutput.system("Using GitHub Copilot Provider")
             self.client = CopilotClient()
+            return
+
+        if provider not in {"", "auto", "ollama", "copilot"}:
+            ConsoleOutput.warning(f"Unknown provider '{provider}'. Falling back to GitHub Copilot.")
+        else:
+            ConsoleOutput.system("Using GitHub Copilot Provider")
+        self.client = CopilotClient()
 
     def _build_skill_context(self, skill: BaseSkill) -> SkillLifecycleContext:
         metadata = skill.metadata()
@@ -9614,7 +10019,8 @@ class FlexiBot:
                                           stronger_verification: dict[str, Any] | None = None) -> dict[str, Any]:
         guidance = copy.deepcopy(reviewer_guidance or {})
         stronger = copy.deepcopy(stronger_verification or {})
-        existing_feedback = copy.deepcopy(getattr(self.execution_policy, "runtime_feedback", {}) or {})
+        execution_policy = getattr(self, "execution_policy", None)
+        existing_feedback = copy.deepcopy(getattr(execution_policy, "runtime_feedback", {}) or {})
         consumed_keys = [str(item).strip() for item in existing_feedback.get("consumed_inspection_keys", []) if str(item).strip()]
         target = self._scoped_verification_target()
         feedback = {
@@ -9635,9 +10041,11 @@ class FlexiBot:
             and not feedback["require_stronger_verification"]
             and not feedback["redirect_to_inspection"]
         ):
-            self.execution_policy.clear_runtime_feedback()
+            if execution_policy is not None:
+                execution_policy.clear_runtime_feedback()
             return {}
-        self.execution_policy.set_runtime_feedback(feedback)
+        if execution_policy is not None:
+            execution_policy.set_runtime_feedback(feedback)
         return feedback
 
     def _run_stronger_verification(self, user_input: str, tool_results: list[str], verification: dict[str, Any],
@@ -9770,16 +10178,25 @@ class FlexiBot:
                 )
 
     def _run_tool_with_wrapper(self, tool_name: str, payload: str, executor: Callable[[str], str]) -> str:
+        normalized_payload, repair_notes = self._normalize_and_repair_tool_payload(tool_name, payload)
+        if repair_notes:
+            self._append_response_trace(
+                "tool_payload_repaired",
+                tool=tool_name,
+                original=str(payload or "")[:1200],
+                repaired=normalized_payload[:1200],
+                notes=repair_notes,
+            )
         wrapper_entry = self.skill_tool_wrappers.get(tool_name)
         if not wrapper_entry:
-            return executor(payload)
+            return executor(normalized_payload)
         try:
-            return wrapper_entry["wrapper"](payload, executor)
+            return wrapper_entry["wrapper"](normalized_payload, executor)
         except Exception as e:
             ConsoleOutput.warning(
                 f"Skill wrapper failed for '{tool_name}' from '{wrapper_entry.get('skill', 'unknown')}': {e}"
             )
-            return executor(payload)
+            return executor(normalized_payload)
 
     def _render_skill_prompt_sections(self) -> str:
         sections: list[str] = []
@@ -11583,6 +12000,138 @@ class FlexiBot:
         payload = self._failure_memory_payload()
         return self._structured_tool_result("failure_memory", True, summary="Retrieved failure memory.", data=payload)
 
+    def tool_project_brief(self, refresh: bool = True):
+        payload = self._project_brief_payload(refresh=bool(refresh))
+        return self._structured_tool_result("project_brief", True, summary="Retrieved project brief.", data={"brief": payload})
+
+    def tool_update_project_brief(self, workspace_path: str = "", stack: str | list[str] = "",
+                                  entrypoints: str | list[str] = "", build_commands: str | list[str] = "",
+                                  test_commands: str | list[str] = "", deployment_shape: str = "",
+                                  current_milestone: str = ""):
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "remember_project_brief"):
+            return self._structured_tool_result("update_project_brief", False, summary="Project brief state is unavailable.", errors=["Project brief state is unavailable."])
+
+        brief = state.project_brief() if hasattr(state, "project_brief") else ProjectBrief()
+        if str(workspace_path or "").strip():
+            brief.workspace_path = str(workspace_path).strip()
+        if stack:
+            brief.stack = self._tool_text_list(stack, limit=16, max_chars=160)
+        if entrypoints:
+            brief.entrypoints = self._tool_text_list(entrypoints, limit=16, max_chars=200)
+        if build_commands:
+            brief.build_commands = self._tool_text_list(build_commands, limit=16, max_chars=200)
+        if test_commands:
+            brief.test_commands = self._tool_text_list(test_commands, limit=16, max_chars=200)
+        if str(deployment_shape or "").strip():
+            brief.deployment_shape = str(deployment_shape).strip()
+        if str(current_milestone or "").strip():
+            brief.current_milestone = str(current_milestone).strip()
+        stored = state.remember_project_brief(brief)
+        return self._structured_tool_result("update_project_brief", True, summary="Updated project brief.", data={"brief": asdict(stored)})
+
+    def tool_task_graph(self, refresh: bool = True):
+        payload = self._task_graph_payload(refresh=bool(refresh))
+        return self._structured_tool_result("task_graph", True, summary="Retrieved task graph.", data={"graph": payload})
+
+    def tool_update_task_graph(self, nodes_json: str, replace: bool = True):
+        raw_nodes_text = str(nodes_json or "").strip()
+        if not raw_nodes_text:
+            return self._structured_tool_result("update_task_graph", False, summary="Task graph update requires JSON nodes.", errors=["nodes_json is required."])
+        try:
+            parsed = json.loads(raw_nodes_text)
+        except Exception as e:
+            return self._structured_tool_result("update_task_graph", False, summary="Task graph JSON was invalid.", errors=[str(e)], data={"nodes_json": raw_nodes_text[:1000]})
+
+        if isinstance(parsed, dict):
+            raw_nodes = parsed.get("nodes", [])
+        elif isinstance(parsed, list):
+            raw_nodes = parsed
+        else:
+            raw_nodes = []
+        if not isinstance(raw_nodes, list):
+            return self._structured_tool_result("update_task_graph", False, summary="Task graph JSON must be a node list or an object containing nodes.", errors=["Invalid task graph JSON shape."])
+
+        state = getattr(self, "state", None)
+        if state is None or not hasattr(state, "remember_task_graph"):
+            return self._structured_tool_result("update_task_graph", False, summary="Task graph state is unavailable.", errors=["Task graph state is unavailable."])
+
+        existing_graph = state.task_graph() if hasattr(state, "task_graph") else TaskGraph()
+        merged_nodes = list(raw_nodes)
+        if not bool(replace):
+            by_id: dict[str, dict[str, Any]] = {}
+            ordered_ids: list[str] = []
+            for node in existing_graph.nodes:
+                payload = asdict(node)
+                node_id = str(payload.get("id", "") or "").strip()
+                if node_id and node_id not in by_id:
+                    by_id[node_id] = payload
+                    ordered_ids.append(node_id)
+            for item in raw_nodes:
+                if not isinstance(item, dict):
+                    continue
+                node_id = str(item.get("id", "") or "").strip()
+                if node_id:
+                    if node_id not in by_id:
+                        ordered_ids.append(node_id)
+                    by_id[node_id] = copy.deepcopy(item)
+                else:
+                    ordered_ids.append(f"__append__:{len(ordered_ids)}")
+                    by_id[ordered_ids[-1]] = copy.deepcopy(item)
+            merged_nodes = [by_id[node_id] for node_id in ordered_ids if node_id in by_id]
+
+        stored = state.remember_task_graph({"nodes": merged_nodes, "updated_at": existing_graph.updated_at})
+        return self._structured_tool_result("update_task_graph", True, summary="Updated task graph.", data={"graph": asdict(stored), "replaced": bool(replace)})
+
+    def tool_workspace_locks(self):
+        payload = self._workspace_locks_payload()
+        return self._structured_tool_result("workspace_locks", True, summary=f"Retrieved {payload.get('count', 0)} workspace lock(s).", data=payload)
+
+    def tool_acquire_workspace_lock(self, area: str, holder: str = "operator", goal_id: str = "",
+                                    reason: str = "", ttl_seconds: int = 900, metadata_json: str = ""):
+        if not str(area or "").strip():
+            return self._structured_tool_result("acquire_workspace_lock", False, summary="Workspace lock area is required.", errors=["area is required."])
+        metadata: dict[str, Any] = {}
+        raw_metadata = str(metadata_json or "").strip()
+        if raw_metadata:
+            try:
+                parsed_metadata = json.loads(raw_metadata)
+                if isinstance(parsed_metadata, dict):
+                    metadata = parsed_metadata
+                else:
+                    return self._structured_tool_result("acquire_workspace_lock", False, summary="Workspace lock metadata must be a JSON object.", errors=["metadata_json must decode to an object."])
+            except Exception as e:
+                return self._structured_tool_result("acquire_workspace_lock", False, summary="Workspace lock metadata JSON was invalid.", errors=[str(e)], data={"metadata_json": raw_metadata[:1000]})
+        goal = None
+        if str(goal_id or "").strip():
+            goal = next((item for item in self.active_goals() if str(item.get("id", "") or "").strip() == str(goal_id).strip()), None)
+        lock_id, conflict = self._acquire_workspace_lock(
+            area,
+            str(holder or "operator").strip() or "operator",
+            goal=goal,
+            reason=str(reason or "manual").strip(),
+            metadata=metadata,
+            ttl_seconds=int(ttl_seconds),
+        )
+        if not lock_id:
+            return self._structured_tool_result("acquire_workspace_lock", False, summary="Workspace area is already locked.", errors=["Workspace area is already locked."], data={"area": str(area), "conflict": conflict or {}})
+        lock = next((asdict(item) for item in self.state.workspace_locks() if str(item.id) == lock_id), {})
+        return self._structured_tool_result("acquire_workspace_lock", True, summary=f"Acquired workspace lock {lock_id}.", data={"lock": lock})
+
+    def tool_release_workspace_lock(self, lock_id: str = ""):
+        if not str(lock_id or "").strip():
+            return self._structured_tool_result("release_workspace_lock", False, summary="Workspace lock id is required.", errors=["lock_id is required."])
+        released = bool(self.state.release_workspace_lock(str(lock_id).strip())) if hasattr(self.state, "release_workspace_lock") else False
+        if not released:
+            return self._structured_tool_result("release_workspace_lock", False, summary="Workspace lock not found.", errors=[f"No workspace lock found for id '{lock_id}'."], data={"lock_id": str(lock_id).strip()})
+        return self._structured_tool_result("release_workspace_lock", True, summary=f"Released workspace lock {lock_id}.", data={"lock_id": str(lock_id).strip()})
+
+    def tool_clear_workspace_locks(self):
+        if not hasattr(self.state, "clear_workspace_locks"):
+            return self._structured_tool_result("clear_workspace_locks", False, summary="Workspace lock state is unavailable.", errors=["Workspace lock state is unavailable."])
+        self.state.clear_workspace_locks()
+        return self._structured_tool_result("clear_workspace_locks", True, summary="Cleared workspace locks.", data={"locks": [], "count": 0})
+
     def tool_remember(self, tag: str, content: str):
         # Legacy compat: Use KV cache as structured memory
         current = self.state.recall(tag) or []
@@ -11595,10 +12144,16 @@ class FlexiBot:
         lowered = str(tag or "").strip().lower()
         if lowered in {"project", "project_memory"}:
             return self.tool_project_memory()
+        if lowered in {"brief", "project_brief"}:
+            return self.tool_project_brief(refresh=False)
         if lowered in {"task", "task_memory"}:
             return self.tool_task_memory()
+        if lowered in {"graph", "task_graph"}:
+            return self.tool_task_graph(refresh=False)
         if lowered in {"failure", "failure_memory"}:
             return self.tool_failure_memory()
+        if lowered in {"locks", "workspace_locks"}:
+            return self.tool_workspace_locks()
         items = self.state.recall(tag)
         if not items:
             return self._structured_tool_result("recall", False, summary="No memory found.", errors=[f"No memory found for tag '{tag}'"], data={"tag": tag})
@@ -13068,8 +13623,8 @@ if __name__ == "__main__":
             "   - **Web/Docs**: `fetch_webpage(url)`, `extract_web_structure(url)`, `extract_doc_section(url, query)`, `summarize_web_reference(url)`, `research_web(query, urls=None)`.\n"
             "   - **Utility**: `to_clip(text)`, `from_clip()`.\n"
             "   - **State**: Variables persist; `remember(tag, txt)`, `recall(tag)`, `search_memory(query)`, `project_memory()`, `task_memory()`, `failure_memory()`.\n"
-            "   - **Search**: `search_workspace(query, root='.', pattern='*')`, `find_symbol(name, root='.', pattern='*.py')`, `find_references(name, root='.', patterns='')`, `find_implementations(name, root='.', patterns='')`, `preview_symbol_rename(old, new, root='.', patterns='')`, `grep(pattern, file)`, `find_files(glob)`, `tree(root)`.\n"
-            "   - **Filesystem**: `read_file(path)`, `read_range(path, start, end)`, `write(path, content)`, `create_file(path, content, overwrite=False)`, `move_file(src, dst)`, `delete_file(path)`, `patch(path, old, new)`, `edit_lines(path, s, e, txt)`, `peek(file)`, `inspect_file_chunk(path, start_line=1, chunk_lines=120)`.\n"
+            "   - **Search**: `search_workspace(query, root='.', pattern='*')`, `find_symbol(name, root='.', pattern='*.py')`, `find_references(name, root='.', patterns='')`, `find_implementations(name, root='.', patterns='')`, `preview_symbol_rename(old, new, root='.', patterns='')`, `grep(pattern, file)`, `find_files(pattern='*', root='.')`, `tree(root='.')`.\n"
+            "   - **Filesystem**: `read_file(filepath)`, `read_range(filepath, start_line=1, end_line=100)`, `write(path, content)`, `create_file(path, content, overwrite=False)`, `move_file(src, dst)`, `delete_file(path)`, `patch(path, old, new)`, `edit_lines(path, s, e, txt)`, `peek(filepath, start_line=0, end_line=30)`, `inspect_file_chunk(filepath, start_line=1, chunk_lines=120)`.\n"
             "   - **Inspection Guidance**: For inspection, prefer `safe_inspect(...)`, `inspect_file_chunk(...)`, `read_range(...)`, or `peek(...)` over printing giant module dumps, large JSON blobs, or full file contents in one turn.\n"
             "   - **Validation**: `validate_python(filepath='', code='')`, `validate_python_snippet(code, mode='exec')`, `validate_json(filepath='', content='')`, `run_tests(command='')`, `verify_work(script_path)`.\n"
             "   - **Recursion**: `subagent(task, agent_type='generic')` spawns a bot. Types: [" + available_agents + "].\n"
@@ -13114,6 +13669,7 @@ if __name__ == "__main__":
 
         try:
             self._turn_active = True
+            self._suppress_next_repl_output = False
             # Periodic Summary Check
             if self.state.total_tokens > TOKEN_THRESHOLD:
                 self.compress_context()
@@ -13177,18 +13733,34 @@ if __name__ == "__main__":
                     final_prompt = [{"role": "system", "content": self.get_system_prompt()}] + recent_context
                     
                     try:
-                        resp_data = self.client.chat(final_prompt)
+                        resp_data = self._chat_with_optional_streaming(final_prompt)
                         resp = resp_data["choices"][0]["message"]["content"]
                     except Exception as e:
                         # If we still hit a 400 even with truncated history, it's likely the generated response *request* 
                         # or a specific massive message in the last 12.
                         print(f"[System]: Context Error ({e}). Retrying with minimal context.")
                         # Extreme fallback: Just the system prompt and the very last message
-                        resp_data = self.client.chat([
+                        resp_data = self._chat_with_optional_streaming([
                             {"role": "system", "content": self.get_system_prompt()},
                             self.state.history[-1]
                         ])
                         resp = resp_data["choices"][0]["message"]["content"]
+
+                    forbidden_markers = self._forbidden_cli_response_markers(resp)
+                    if forbidden_markers:
+                        marker_list = ", ".join(forbidden_markers)
+                        obs = (
+                            f"System Error: Fabricated tool/output markup detected ({marker_list}). "
+                            "Use only <plan>, <bash>, <python>, <ack_observation>, and <consensus>; do not invent execute or tool-output blocks."
+                        )
+                        self.last_observation = obs
+                        self.state.log_event("system", obs)
+                        self._append_response_trace(
+                            "fabricated_tool_output_blocked",
+                            markers=forbidden_markers,
+                            response=resp[:2000],
+                        )
+                        continue
 
                     # 1. Extract Tools
                     bash = re.findall(r"<bash>(.*?)</bash>", resp, re.S)
@@ -13196,16 +13768,20 @@ if __name__ == "__main__":
                     plan = re.findall(r"<plan>(.*?)</plan>", resp, re.S)
                     ack = "<ack_observation>" in resp
                     pending_consensus = self._extract_consensus_text(resp) if "<consensus>" in resp else ""
+                    direct_consensus = bool(pending_consensus) and not bool(bash or py)
                     normalized_bash = [self._normalize_tool_payload(item) for item in bash]
                     normalized_py = [self._normalize_tool_payload(item) for item in py]
                     strategy_families = self._infer_strategy_families(plan, bash, py, pending_consensus)
-                    self._render_cli_response_sections(
-                        resp,
-                        plan_blocks=plan,
-                        bash_payloads=bash,
-                        python_payloads=py,
-                        consensus_text=pending_consensus,
-                    )
+                    if not direct_consensus:
+                        self._render_cli_response_sections(
+                            resp,
+                            plan_blocks=plan,
+                            bash_payloads=bash,
+                            python_payloads=py,
+                            consensus_text=pending_consensus,
+                            skip_thought=bool(getattr(self, "_last_streamed_visible_output", False)),
+                            skip_consensus=bool(bash or py),
+                        )
                     self._append_response_trace(
                         "llm_response",
                         response=resp,
@@ -13235,7 +13811,7 @@ if __name__ == "__main__":
                             obs_prefix = "System Notice: You provided <consensus> with tools. The consensus will be accepted if the tool results succeed.\n"
                         else:
                             # Valid pure consensus
-                            draft = pending_consensus
+                            draft = self._sanitize_user_facing_text(pending_consensus)
                             draft, trimmed_menu = self._trim_menu_heavy_followup(draft, user_input)
                             if trimmed_menu:
                                 self._append_response_trace(
@@ -13253,6 +13829,9 @@ if __name__ == "__main__":
                             # no tools used for pure consensus
                             self.logger.log_turn(turn_num, resp, self.state.calculate_diff(turn_start_data, self.state.data), ["consensus"], duration=dur, meta=meta)
                             # Final response should not include the user label prefix
+                            if self._should_suppress_repl_echo(draft):
+                                self._suppress_next_repl_output = True
+                                return ""
                             return self._format_final_answer_block(draft)
                     else:
                         obs_prefix = ""
@@ -13500,6 +14079,9 @@ if __name__ == "__main__":
                         except Exception:
                             pass
                         if return_to_user:
+                            if self._should_suppress_repl_echo(finalized):
+                                self._suppress_next_repl_output = True
+                                return ""
                             return self._format_final_answer_block(finalized)
                         continue
 
@@ -13531,16 +14113,13 @@ if __name__ == "__main__":
                     obs = f"System Error during turn execution: {inner_e}. Please retry."
                     self.state.log_event("system", obs)
             
-            stop_msg = "Stopped after max turns without consensus."
-            if self.last_observation:
-                stop_msg += f"\nLast observation:\n{self.last_observation[:1500]}"
             self._append_response_trace(
                 "turn_limit_abort",
                 observation=self.last_observation,
                 repetition_count=self.repetition_count,
             )
             recovery = self._recover_from_turn_limit("Maximum internal turns reached before consensus")
-            return f"{stop_msg}\n\n{recovery}"
+            return self._format_final_answer_block(recovery)
         except Exception as outer_e:
             return f"\n{Colors.RED}[CRITICAL HANDLER FAILURE]: {outer_e}{Colors.ENDC}\n{traceback.format_exc()}"
         finally:
@@ -13667,8 +14246,7 @@ def _format_repl_output_block(message: Any) -> str:
 def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, input_ready: threading.Event, log_step, idle_timeout: int = 300):
     stdin_closed = False
     log_step("enter input loop")
-    # Respect both an explicit bot attribute and a module-level environment-controlled toggle.
-    effective_idle = bot.idle_proposal_interval_seconds if (getattr(bot, 'idle_proposal_enabled', False) or globals().get("AUTO_IDLE_PROPOSAL_ENABLED", False)) else idle_timeout
+    effective_idle = bot.idle_proposal_interval_seconds if getattr(bot, 'idle_proposal_enabled', False) else idle_timeout
     while True:
         log_step("loop iteration start")
         bot._update_runtime_heartbeat(current_mode="interactive", current_phase="awaiting_input", persist=True)
@@ -13692,7 +14270,8 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, input_ready: t
                         # Run the workflow only when explicitly allowed; invoke in a background thread to avoid blocking the input loop.
                         if idle_block_reason:
                             ConsoleOutput.debug(f"Idle workflow skipped: {idle_block_reason}.")
-                        elif (getattr(bot, "idle_proposal_enabled", False) or globals().get("AUTO_IDLE_PROPOSAL_ENABLED", False)) and getattr(bot, "idle_proposal_interval_seconds", 0) > 0:
+                        elif getattr(bot, "idle_proposal_enabled", False) and getattr(bot, "idle_proposal_interval_seconds", 0) > 0:
+                            setattr(bot, "_idle_skip_notice_emitted", False)
                             bot._update_runtime_heartbeat(current_mode="idle", current_phase="idle", persist=True)
                             ConsoleOutput.warning(f"User idle for {effective_idle}s. Resuming...")
                             import threading
@@ -13723,7 +14302,9 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, input_ready: t
                             t = threading.Thread(target=_run_idle_workflow_bg, daemon=True)
                             t.start()
                         else:
-                            ConsoleOutput.system("Idle proposal workflow disabled or misconfigured; skipping automated run.")
+                            if not bool(getattr(bot, "_idle_skip_notice_emitted", False)):
+                                ConsoleOutput.system("Idle proposal workflow disabled; staying in interactive mode.")
+                                setattr(bot, "_idle_skip_notice_emitted", True)
 
                         if not input_ready.is_set():
                             input_ready.set()
@@ -13747,6 +14328,7 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, input_ready: t
             continue
 
         stripped_input = user_input.strip()
+        setattr(bot, "_idle_skip_notice_emitted", False)
         if stripped_input.startswith(OPERATOR_COMMAND_PREFIX):
             try:
                 bot._update_runtime_heartbeat(current_mode="interactive", current_phase="operator_command", last_user_input_at=time.time(), persist=True)
@@ -13763,7 +14345,10 @@ def run_interactive_loop(bot: FlexiBot, input_queue: queue.Queue, input_ready: t
 
         try:
             result = bot.handle_turn(user_input)
-            ConsoleOutput.user_output(_format_repl_output_block(result), end="")
+            if bool(getattr(bot, "_suppress_next_repl_output", False)):
+                bot._suppress_next_repl_output = False
+            elif str(result or "").strip():
+                ConsoleOutput.user_output(_format_repl_output_block(result), end="")
         except Exception as e:
             bot._note_runtime_error(f"Fatal runtime error: {e}", current_phase="blocked", persist=True)
             ConsoleOutput.error(f"FATAL ERROR: {e}")
